@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY qwen-telephony/requirements.txt /app/qwen-telephony/requirements.txt
+RUN pip install --no-cache-dir -r /app/qwen-telephony/requirements.txt
+
+COPY qwen-telephony/agent /app/qwen-telephony/agent
+COPY qwen-telephony/config /app/qwen-telephony/config
+
+WORKDIR /app/qwen-telephony/agent
+
+CMD ["python", "phone_agent.py", "dev"]
