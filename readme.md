@@ -7,6 +7,7 @@
 - 使用 `tools/microsip/MicroSIP.exe` 作为本地 SIP 电话客户端。
 - 使用 Docker 启动本地 LiveKit Server、LiveKit SIP 和 Redis。
 - 使用 LiveKit Agents Python 进程接听 SIP room job。
+- 提供 AI 电话运营台，用于管理外呼任务、客户名单、通话队列和业务统计。
 - 使用 Qwen/DashScope：
   - Realtime ASR：`qwen3-omni-flash-realtime` + `qwen3-asr-flash-realtime`
   - LLM：默认 `qwen-plus`
@@ -30,7 +31,11 @@ qwen-telephony/
     start-agent-wsl.sh    # 前台启动 Agent
     start-agent-bg-wsl.sh # 后台启动 Agent
     health-start-wsl.sh   # 健康检查与自启动
+    start-ops-wsl.sh      # 启动运营台 Web 服务
     stop-infra-wsl.sh     # 停止 Docker 基础设施
+  server/
+    main.py               # FastAPI 运营台 API
+    static/               # 运营台前端页面
 tools/
   microsip/
     MicroSIP.exe          # SIP 客户端
@@ -111,6 +116,35 @@ LiveKit: ws://127.0.0.1:7880
 SIP: sip:1000@127.0.0.1:5066
 ```
 
+## 启动运营台
+
+运营台用于管理外呼任务、客户名单、通话队列和统计分析。
+
+设计方案见：
+
+```text
+docs/ai-call-ops-ui.md
+```
+
+```powershell
+cd F:\ai-login-replica\agent
+.\qwen-telephony\scripts\start-ops.ps1
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8090
+```
+
+首次启动会创建本地 SQLite 数据库：
+
+```text
+qwen-telephony/data/ops.sqlite3
+```
+
+该数据库是运行态数据，不提交到 Git。
+
 ## 手动启动
 
 如需分步启动：
@@ -175,6 +209,35 @@ powershell -ExecutionPolicy Bypass -File qwen-telephony\scripts\test-microsip-gr
 ```
 
 测试通过时会看到 `RESULT direct_first_frame_after_job=...`。
+
+## 运营台 API
+
+常用接口：
+
+```text
+GET  /api/health
+GET  /api/dashboard
+GET  /api/campaigns
+POST /api/campaigns
+GET  /api/contacts
+POST /api/contacts
+GET  /api/calls
+POST /api/calls
+POST /api/campaigns/{campaign_id}/enqueue
+POST /api/calls/{call_id}/dial
+POST /api/calls/{call_id}/simulate
+```
+
+当前 `/api/calls/{call_id}/dial` 是 MVP 占位动作，会把通话状态改为 `dialing` 并生成 room 名称。接入真实 outbound SIP trunk 后，可在该接口中调用 LiveKit SIP `CreateSIPParticipant` 发起真实外呼。
+
+没有真实 outbound SIP 线路时，可以在运营台使用 MicroSIP 模拟测试：
+
+1. 在“通话队列”点击“拨号”，状态进入 `dialing`。
+2. 点击“模拟接听”，状态进入 `active`，等价于 MicroSIP 接通。
+3. 点击“模拟挂断”，状态进入 `completed`，统计数据会随刷新更新。
+4. 也可以点击“无人接听”或“忙线”，验证失败分支和统计。
+
+该模拟只覆盖运营台业务流程和状态机，不产生真实 SIP 信令或 RTP 音频。真实语音链路仍需 MicroSIP 拨入 `sip:1000@127.0.0.1:5066`，或配置 outbound SIP trunk 后由 `/api/calls/{call_id}/dial` 发起真实外呼。
 
 ## 停止服务
 

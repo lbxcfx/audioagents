@@ -11,6 +11,7 @@ from time import perf_counter
 import wave
 
 from dotenv import load_dotenv
+import httpx
 from livekit import rtc
 from livekit.agents import (
     Agent,
@@ -29,6 +30,7 @@ from livekit.agents import (
 from livekit.plugins import openai, silero
 from openai import AsyncOpenAI
 
+from dialogue_llm import ScriptFirstLLM
 from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS
 
 
@@ -38,7 +40,7 @@ load_dotenv(ROOT / "qwen-telephony" / "config" / "local.env", override=False)
 
 logger = logging.getLogger("qwen-phone-agent")
 
-GREETING_TEXT = "您好，我是语音电话助手，现在可以开始通话了。"
+GREETING_TEXT = "Hello, I am your voice assistant. We can start the call now."
 GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
 GREETING_TELEPHONY_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_8k.wav"
 GREETING_AUDIO_LOCK_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav.lock"
@@ -298,6 +300,87 @@ async def play_greeting_audio_direct(room: rtc.Room) -> None:
         await source.aclose()
 
 
+async def fetch_dialogue_opening_text(session_id: str) -> str | None:
+    if os.getenv("QWEN_NLU_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
+        return None
+
+    scene_id = int(os.getenv("QWEN_DIALOGUE_SCENE_ID", "0")) or None
+    turn_url = os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn")
+    start_url = turn_url.rsplit("/", 1)[0] + "/start"
+    payload: dict[str, object] = {"session_id": session_id}
+    if scene_id:
+        payload["scene_id"] = scene_id
+
+    try:
+        async with httpx.AsyncClient(timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8"))) as client:
+            response = await client.post(start_url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+    except Exception:
+        logger.exception("Dialogue opening fetch failed, using static greeting")
+        return None
+
+    if body.get("handled") and body.get("text"):
+        logger.info(
+            "Dialogue opening selected: scene=%s node=%s",
+            body.get("scene_id"),
+            body.get("next_node_id"),
+        )
+        return str(body["text"])
+    logger.info("Dialogue opening unavailable, route=%s reason=%s", body.get("route_type"), body.get("reason"))
+    return None
+
+
+async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
+    started = perf_counter()
+    qwen_tts = QwenTTS()
+    try:
+        audio_bytes, _, _ = await qwen_tts.synthesize_audio_bytes(text)
+        normalized = _normalize_wav_bytes(audio_bytes)
+        telephony_audio = _convert_wav_to_sample_rate(normalized, TELEPHONY_SAMPLE_RATE)
+    finally:
+        await qwen_tts.aclose()
+
+    source = rtc.AudioSource(
+        TELEPHONY_SAMPLE_RATE,
+        QwenTTS.num_channels_count,
+        queue_size_ms=5000,
+    )
+    track = rtc.LocalAudioTrack.create_audio_track("dialogue-opening-audio", source)
+    publication = await room.local_participant.publish_track(track)
+
+    frame_count = 0
+    audio_duration = 0.0
+    try:
+        with wave.open(io.BytesIO(telephony_audio), "rb") as reader:
+            sample_rate = reader.getframerate()
+            channels = reader.getnchannels()
+            sample_width = reader.getsampwidth()
+            samples_per_frame = sample_rate // 50
+            while True:
+                pcm = reader.readframes(samples_per_frame)
+                if not pcm:
+                    break
+                samples = len(pcm) // (sample_width * channels)
+                frame = rtc.AudioFrame(pcm, sample_rate, channels, samples)
+                frame_count += 1
+                audio_duration += samples / sample_rate
+                await source.capture_frame(frame)
+
+        await source.wait_for_playout()
+        logger.info(
+            "Dialogue opening playback completed: frames=%d audio_duration=%.3fs elapsed=%.3fs",
+            frame_count,
+            audio_duration,
+            perf_counter() - started,
+        )
+    finally:
+        sid = getattr(publication, "sid", "")
+        if sid:
+            await room.local_participant.unpublish_track(sid)
+        await source.aclose()
+
+
 async def warm_up_qwen_llm_after_greeting() -> None:
     await asyncio.sleep(0.5)
     await warm_up_qwen_llm()
@@ -332,7 +415,7 @@ async def warm_up_qwen_llm() -> None:
     try:
         await client.chat.completions.create(
             model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
-            messages=[{"role": "user", "content": "请只回复：好"}],
+            messages=[{"role": "user", "content": "just warm up"}],
             temperature=0,
             max_tokens=1,
             timeout=10,
@@ -348,10 +431,11 @@ class PhoneAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "你是一个中文语音电话助手。用户通过电话和你交流。"
-                "回答要简洁、自然、适合语音播放，每次优先控制在一到两句话。"
-                "不要输出 Markdown、表情符号、星号、项目符号或难以朗读的格式。"
-                "如果听不清，请礼貌地请用户重复。"
+                "你是一个中文语音电话助手，负责直接回答用户问题。"
+                "回答要准确、简洁、自然，适合电话语音播报。"
+                "优先给出结论，再补充必要说明。"
+                "如果没有听清用户问题，只回答：我没有听清，请再说一遍。"
+                "通常不超过三句话，除非用户明确要求详细解释。"
             )
         )
 
@@ -363,16 +447,21 @@ server = AgentServer(
     port=int(os.getenv("QWEN_AGENT_PORT", "18081")),
     http_proxy=None,
     setup_fnc=prewarm_process,
+    load_threshold=float(os.getenv("QWEN_AGENT_LOAD_THRESHOLD", "0.95")),
 )
 
 
-@server.rtc_session()
+@server.rtc_session(agent_name=os.getenv("QWEN_AGENT_EXPLICIT_NAME", os.getenv("LIVEKIT_AGENT_NAME", "")))
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     ctx.log_context_fields = {"room": ctx.room.name}
 
     start_llm_warmup_background_thread()
-    await play_greeting_audio_direct(ctx.room)
+    opening_text = await fetch_dialogue_opening_text(ctx.room.name)
+    if opening_text:
+        await play_text_audio_direct(ctx.room, opening_text)
+    else:
+        await play_greeting_audio_direct(ctx.room)
 
     dashscope_key = os.getenv("DASHSCOPE_API_KEY")
     qwen_base_url = os.getenv(
@@ -406,10 +495,16 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(
         stt=asr_provider,
-        llm=openai.LLM(
-            model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
-            api_key=dashscope_key,
-            base_url=qwen_base_url,
+        llm=ScriptFirstLLM(
+            upstream=openai.LLM(
+                model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
+                api_key=dashscope_key,
+                base_url=qwen_base_url,
+            ),
+            session_id=ctx.room.name,
+            scene_id=int(os.getenv("QWEN_DIALOGUE_SCENE_ID", "0")) or None,
+            dialogue_url=os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn"),
+            timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8")),
         ),
         tts=QwenTTS(),
         turn_handling=TurnHandlingOptions(

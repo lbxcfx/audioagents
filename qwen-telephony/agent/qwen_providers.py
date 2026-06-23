@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
+import logging
 import os
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -22,6 +25,7 @@ DEFAULT_DASHSCOPE_GENERATION_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 )
 DEFAULT_DASHSCOPE_REALTIME_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+logger = logging.getLogger("qwen-phone-agent.qwen")
 
 
 def _dashscope_key() -> str:
@@ -361,6 +365,44 @@ class QwenTTSOptions:
     use_sse: bool
 
 
+def _tts_cache_dir() -> Path:
+    return Path(
+        os.getenv(
+            "QWEN_TTS_CACHE_DIR",
+            str(Path(__file__).resolve().parents[1] / "cache" / "tts"),
+        )
+    )
+
+
+def _tts_cache_enabled() -> bool:
+    return os.getenv("QWEN_TTS_CACHE_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _tts_cache_key(text: str, opts: QwenTTSOptions) -> str:
+    payload = json.dumps(
+        {
+            "model": opts.model,
+            "voice": opts.voice,
+            "format": opts.format,
+            "language_type": opts.language_type,
+            "text": text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _tts_cache_path(text: str, opts: QwenTTSOptions) -> Path:
+    suffix = opts.format.lower().strip() or "wav"
+    return _tts_cache_dir() / f"{_tts_cache_key(text, opts)}.{suffix}"
+
+
 class QwenTTS(tts.TTS):
     """DashScope/Qwen TTS wrapped as a LiveKit TTS provider."""
 
@@ -403,7 +445,31 @@ class QwenTTS(tts.TTS):
     def provider(self) -> str:
         return "dashscope-qwen"
 
+    def cached_audio_bytes(self, text: str) -> tuple[bytes, str, str] | None:
+        if not _tts_cache_enabled() or not text.strip():
+            return None
+        path = _tts_cache_path(text, self._opts)
+        if not path.exists() or path.stat().st_size <= 44:
+            return None
+        request_id = f"tts_cache_{path.stem[:12]}"
+        logger.info("TTS cache hit: key=%s bytes=%d", path.stem[:12], path.stat().st_size)
+        return path.read_bytes(), _format_to_mime(self._opts.format), request_id
+
+    def _write_audio_cache(self, text: str, audio_bytes: bytes) -> None:
+        if not _tts_cache_enabled() or not text.strip() or not audio_bytes:
+            return
+        path = _tts_cache_path(text, self._opts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_bytes(audio_bytes)
+        tmp_path.replace(path)
+        logger.info("TTS cache write: key=%s bytes=%d", path.stem[:12], len(audio_bytes))
+
     async def synthesize_audio_bytes(self, text: str) -> tuple[bytes, str, str]:
+        cached = self.cached_audio_bytes(text)
+        if cached:
+            return cached
+
         payload = {
             "model": self._opts.model,
             "input": {
@@ -438,7 +504,9 @@ class QwenTTS(tts.TTS):
                         audio_bytes.extend(base64.b64decode(encoded))
 
             if audio_bytes:
-                return bytes(audio_bytes), _format_to_mime(self._opts.format), request_id or str(uuid.uuid4())
+                output = bytes(audio_bytes)
+                self._write_audio_cache(text, output)
+                return output, _format_to_mime(self._opts.format), request_id or str(uuid.uuid4())
 
         response = await self._client.post(self._opts.endpoint, json=payload)
         response.raise_for_status()
@@ -455,6 +523,7 @@ class QwenTTS(tts.TTS):
                 audio_response = await download_client.get(download_url)
                 audio_response.raise_for_status()
                 content_type = audio_response.headers.get("content-type", "").split(";")[0].strip()
+                self._write_audio_cache(text, audio_response.content)
                 return audio_response.content, content_type or _format_to_mime(self._opts.format), request_id
 
         if "data" in audio:
@@ -464,7 +533,9 @@ class QwenTTS(tts.TTS):
                 mime_type = header.split(":", 1)[1].split(";", 1)[0]
             else:
                 mime_type = _format_to_mime(self._opts.format)
-            return base64.b64decode(encoded), mime_type, request_id
+            output = base64.b64decode(encoded)
+            self._write_audio_cache(text, output)
+            return output, mime_type, request_id
 
         raise RuntimeError(f"DashScope TTS response did not contain audio url/data: {body}")
 
@@ -516,6 +587,19 @@ class _QwenTTSChunkedStream(tts.ChunkedStream):
         self._qwen_tts = tts
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        cached = self._qwen_tts.cached_audio_bytes(self.input_text)
+        if cached:
+            audio_bytes, mime_type, request_id = cached
+            output_emitter.initialize(
+                request_id=request_id,
+                sample_rate=QwenTTS.sample_rate_hz,
+                num_channels=QwenTTS.num_channels_count,
+                mime_type=mime_type,
+            )
+            output_emitter.push(audio_bytes)
+            output_emitter.flush()
+            return
+
         if self._qwen_tts._opts.use_sse:
             output_emitter.initialize(
                 request_id=str(uuid.uuid4()),

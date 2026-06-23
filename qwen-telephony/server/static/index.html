@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f8fb8" />
+    <title>话术管理工作台</title>
+    <link rel="stylesheet" href="/static/styles.css?v=decoupled-v6" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <div>
+          <strong>话术管理</strong>
+          <small>LiveKit Script Engine · decoupled-v6</small>
+        </div>
+      </div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-view="scripts">流程编排</button>
+        <button class="nav-item" data-view="knowledge">知识库</button>
+        <button class="nav-item" data-view="labels">意向标签</button>
+        <button class="nav-item" data-view="learning">问题学习</button>
+        <button class="nav-item" data-view="training">训练测试</button>
+        <button class="nav-item" data-view="runtime">运行参数</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="dot online"></span>
+        <span id="healthText">API checking</span>
+      </div>
+    </aside>
+
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">ASR -> NLU/状态机 -> LLM fallback -> TTS</p>
+          <h1 id="pageTitle">流程编排</h1>
+        </div>
+        <div class="actions">
+          <label class="switch">
+            <input id="nluSwitch" type="checkbox" />
+            <span></span>
+            <strong>启用 NLU/状态机</strong>
+          </label>
+          <button id="refreshBtn" type="button" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+          <button id="setDefaultBtn" type="button" class="secondary">设为默认</button>
+          <button id="microSipTestBtn" type="button" class="secondary">MicroSIP测试</button>
+          <button id="publishBtn" type="button" class="primary">发布话术</button>
+        </div>
+      </header>
+
+      <section id="scripts" class="view active">
+        <div class="script-workbench">
+          <aside class="scene-rail">
+            <div class="rail-head">
+              <button id="newSceneBtn" class="primary small">新建话术</button>
+              <button id="copySceneBtn" class="secondary small">复制</button>
+            </div>
+            <input id="sceneSearch" placeholder="搜索话术名称" />
+            <select id="industryFilter">
+              <option value="">全部行业</option>
+              <option value="企业服务">企业服务</option>
+              <option value="金融">金融</option>
+              <option value="教育">教育</option>
+              <option value="其他">其他</option>
+            </select>
+            <div id="sceneList" class="scene-list"></div>
+          </aside>
+
+          <aside class="node-palette">
+            <div class="section-head compact">
+              <h2>节点库</h2>
+              <button id="addNodeBtn" class="primary small">添加</button>
+            </div>
+            <button class="palette-item" data-node-template="scene">场景节点</button>
+            <button class="palette-item" data-node-template="llm_fallback">LLM 兜底</button>
+            <button class="palette-item" data-node-template="end">挂机/结束</button>
+            <button class="palette-item" data-node-template="common">公共节点</button>
+          </aside>
+
+          <section class="canvas-shell">
+            <div class="canvas-toolbar">
+              <button id="saveFlowBtn" class="primary small">保存</button>
+              <button id="validateFlowBtn" class="secondary small">校验</button>
+              <button id="zoomFitBtn" class="secondary small">全屏布局</button>
+              <span id="activeSceneMeta"></span>
+            </div>
+            <div id="flowCanvas" class="flow-canvas"></div>
+          </section>
+
+          <aside class="inspector">
+            <div class="section-head compact">
+              <h2>节点属性</h2>
+              <button id="deleteNodeBtn" class="secondary small">删除</button>
+            </div>
+            <form id="nodeForm" class="form">
+              <label>节点 ID<input name="id" readonly /></label>
+              <label>节点名称<input name="name" required /></label>
+              <label>节点类型<select name="type">
+                <option value="scene">场景节点</option>
+                <option value="llm_fallback">LLM 兜底</option>
+                <option value="end">结束/挂机</option>
+                <option value="common">公共节点</option>
+              </select></label>
+              <label>机器人话术<textarea name="text" rows="5"></textarea></label>
+              <div class="route-grid">
+                <label>肯定<select name="positive"></select></label>
+                <label>肯定关键词<input name="positive_keywords" placeholder="有兴趣,可以,想了解" /></label>
+                <label>否定<select name="negative"></select></label>
+                <label>否定关键词<input name="negative_keywords" placeholder="不需要,没兴趣,暂时不考虑" /></label>
+                <label>拒绝<select name="reject"></select></label>
+                <label>拒绝关键词<input name="reject_keywords" placeholder="别打了,挂了,拉黑" /></label>
+                <label>中性<select name="neutral"></select></label>
+                <label>中性关键词<input name="neutral_keywords" placeholder="多少钱,在哪里,怎么做" /></label>
+                <label>未识别<select name="unknown"></select></label>
+              </div>
+              <button class="primary" type="submit">更新节点</button>
+            </form>
+          </aside>
+        </div>
+      </section>
+
+      <section id="knowledge" class="view">
+        <section class="panel">
+          <div class="section-head">
+            <div>
+              <h2>知识库</h2>
+              <span>流程外问题优先命中知识库，未命中再进入 LLM fallback。</span>
+            </div>
+            <button id="newKnowledgeBtn" class="primary small">新增知识</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>标题</th>
+                  <th>排序</th>
+                  <th>话术</th>
+                  <th>关键词</th>
+                  <th>命中</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="knowledgeRows"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="labels" class="view">
+        <section class="panel">
+          <div class="section-head">
+            <div>
+              <h2>意向标签</h2>
+              <span>按知识库命中、肯定、拒绝等计数自动标记 A/B/C 类客户。</span>
+            </div>
+            <button id="newLabelBtn" class="primary small">新增规则</button>
+          </div>
+          <div id="labelRules" class="rule-list"></div>
+        </section>
+      </section>
+
+      <section id="learning" class="view">
+        <section class="panel">
+          <div class="section-head">
+            <div>
+              <h2>问题学习</h2>
+              <span>用户说过但流程和知识库都没命中的问题会沉淀到这里。</span>
+            </div>
+            <button id="reloadLearningBtn" class="secondary small">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>用户原话</th>
+                  <th>出现次数</th>
+                  <th>状态</th>
+                  <th>最近出现</th>
+                </tr>
+              </thead>
+              <tbody id="unresolvedRows"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="training" class="view">
+        <section class="panel training-panel">
+          <div>
+            <div class="section-head">
+              <div>
+                <h2>训练测试</h2>
+                <span>先由机器人发起开场白，再逐轮输入用户回答。</span>
+              </div>
+            </div>
+            <button id="startTrainingBtn" class="primary" type="button">开始会话 / 重置</button>
+            <div id="trainingChat" class="chat-box"></div>
+            <form id="trainingForm" class="form">
+              <label>测试话术<select id="trainingSceneSelect" name="scene_id"></select></label>
+              <label>用户回答<textarea name="text" required rows="4" placeholder="例如：有兴趣，可以了解一下"></textarea></label>
+              <label>Session ID<input name="session_id" value="studio-test" /></label>
+              <button class="primary" type="submit">发送回答</button>
+            </form>
+          </div>
+          <pre id="trainingResult" class="result-box">等待测试输入</pre>
+        </section>
+      </section>
+
+      <section id="runtime" class="view">
+        <section class="panel settings-grid">
+          <div>
+            <h2>运行参数</h2>
+            <p>NLU/状态机关闭时，LiveKit Agent 会跳过 dialogue-service，保持原来的 ASR + LLM + TTS 链路。</p>
+          </div>
+          <dl>
+            <dt>最小说话时间</dt><dd>100 ms</dd>
+            <dt>最大说话时间</dt><dd>10000 ms</dd>
+            <dt>打断持续时间</dt><dd>300 ms</dd>
+            <dt>静音过滤</dt><dd>1.0 s</dd>
+            <dt>最小停顿时间</dt><dd>500 ms</dd>
+            <dt>最大停顿时间</dt><dd>800 ms</dd>
+            <dt>LiveKit Agent</dt><dd><code>ScriptFirstLLM</code> 包装 Qwen LLM</dd>
+          </dl>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="knowledgeDialog">
+      <form id="knowledgeForm" class="form modal-form">
+        <div class="modal-head">
+          <h2>知识配置</h2>
+          <button type="button" class="icon-button" data-close-dialog>×</button>
+        </div>
+        <input name="id" type="hidden" />
+        <label>标题<input name="title" required /></label>
+        <label>答案<textarea name="answer" required rows="5"></textarea></label>
+        <label>关键词<input name="keywords" placeholder="多个关键词用英文逗号分隔" /></label>
+        <div class="form-row">
+          <label>排序<input name="sort_order" type="number" value="10" /></label>
+          <label>状态<select name="enabled"><option value="true">启用</option><option value="false">停用</option></select></label>
+        </div>
+        <button class="primary" type="submit">保存知识</button>
+      </form>
+    </dialog>
+
+    <dialog id="sceneDialog">
+      <form id="sceneForm" class="form modal-form">
+        <div class="modal-head">
+          <h2>新建话术</h2>
+          <button type="button" class="icon-button" data-close-dialog>×</button>
+        </div>
+        <label>话术名称<input name="name" required /></label>
+        <label>行业<input name="industry" value="企业服务" /></label>
+        <label>业务类型<input name="business_type" value="售前咨询" /></label>
+        <button class="primary" type="submit">创建</button>
+      </form>
+    </dialog>
+
+    <dialog id="labelDialog">
+      <form id="labelForm" class="form modal-form">
+        <div class="modal-head">
+          <h2>新增标签规则</h2>
+          <button type="button" class="icon-button" data-close-dialog>×</button>
+        </div>
+        <label>标签<input name="label" required placeholder="A类" /></label>
+        <div class="form-row">
+          <label>优先级<input name="priority" type="number" value="10" /></label>
+          <label>知识命中数<input name="knowledge_hit_count" type="number" value="1" /></label>
+        </div>
+        <div class="form-row">
+          <label>肯定次数<input name="positive_count" type="number" value="0" /></label>
+          <label>拒绝次数<input name="reject_count" type="number" value="0" /></label>
+        </div>
+        <button class="primary" type="submit">保存规则</button>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js?v=decoupled-v6"></script>
+  </body>
+</html>

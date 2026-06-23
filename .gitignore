@@ -12,6 +12,10 @@ qwen-telephony/.venv-win/
 qwen-telephony/.docker/
 qwen-telephony/cache/
 qwen-telephony/logs/
+qwen-telephony/data/
+qwen-telephony/node_modules/
+qwen-telephony/playwright-report/
+qwen-telephony/test-results/
 qwen-telephony/config/local.env
 qwen-telephony/agent/__pycache__/
 qwen-telephony/scripts/__pycache__/
