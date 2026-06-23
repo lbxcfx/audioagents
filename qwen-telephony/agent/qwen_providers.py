@@ -4,10 +4,12 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import io
 import logging
 import os
 import json
 import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -173,8 +175,8 @@ class QwenRealtimeASR(stt.STT):
             endpoint=os.getenv("QWEN_REALTIME_ENDPOINT", DEFAULT_DASHSCOPE_REALTIME_URL),
             language=language,
             vad_threshold=float(os.getenv("QWEN_REALTIME_VAD_THRESHOLD", "0.45")),
-            silence_duration_ms=int(os.getenv("QWEN_REALTIME_SILENCE_MS", "300")),
-            prefix_padding_ms=int(os.getenv("QWEN_REALTIME_PREFIX_MS", "200")),
+            silence_duration_ms=int(os.getenv("QWEN_REALTIME_SILENCE_MS", "200")),
+            prefix_padding_ms=int(os.getenv("QWEN_REALTIME_PREFIX_MS", "100")),
         )
 
     @property
@@ -403,6 +405,32 @@ def _tts_cache_path(text: str, opts: QwenTTSOptions) -> Path:
     return _tts_cache_dir() / f"{_tts_cache_key(text, opts)}.{suffix}"
 
 
+def _normalize_wav_container(audio_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        num_channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        sample_rate = reader.getframerate()
+        pcm = reader.readframes(reader.getnframes())
+
+    output = io.BytesIO()
+    with wave.open(output, "wb") as writer:
+        writer.setnchannels(num_channels)
+        writer.setsampwidth(sample_width)
+        writer.setframerate(sample_rate)
+        writer.writeframes(pcm)
+    return output.getvalue()
+
+
+def _maybe_normalize_tts_audio(audio_bytes: bytes, opts: QwenTTSOptions) -> bytes:
+    if opts.format.lower().strip() != "wav":
+        return audio_bytes
+    try:
+        return _normalize_wav_container(audio_bytes)
+    except Exception:
+        logger.exception("TTS WAV normalization failed; using original bytes")
+        return audio_bytes
+
+
 class QwenTTS(tts.TTS):
     """DashScope/Qwen TTS wrapped as a LiveKit TTS provider."""
 
@@ -451,13 +479,21 @@ class QwenTTS(tts.TTS):
         path = _tts_cache_path(text, self._opts)
         if not path.exists() or path.stat().st_size <= 44:
             return None
+        original_bytes = path.read_bytes()
+        audio_bytes = _maybe_normalize_tts_audio(original_bytes, self._opts)
+        if audio_bytes != original_bytes:
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_bytes(audio_bytes)
+            tmp_path.replace(path)
+            logger.info("TTS cache normalized: key=%s bytes=%d", path.stem[:12], len(audio_bytes))
         request_id = f"tts_cache_{path.stem[:12]}"
-        logger.info("TTS cache hit: key=%s bytes=%d", path.stem[:12], path.stat().st_size)
-        return path.read_bytes(), _format_to_mime(self._opts.format), request_id
+        logger.info("TTS cache hit: key=%s bytes=%d", path.stem[:12], len(audio_bytes))
+        return audio_bytes, _format_to_mime(self._opts.format), request_id
 
     def _write_audio_cache(self, text: str, audio_bytes: bytes) -> None:
         if not _tts_cache_enabled() or not text.strip() or not audio_bytes:
             return
+        audio_bytes = _maybe_normalize_tts_audio(audio_bytes, self._opts)
         path = _tts_cache_path(text, self._opts)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(path.suffix + ".tmp")

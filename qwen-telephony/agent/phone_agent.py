@@ -42,9 +42,9 @@ logger = logging.getLogger("qwen-phone-agent")
 
 GREETING_TEXT = "Hello, I am your voice assistant. We can start the call now."
 GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
-GREETING_TELEPHONY_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_8k.wav"
+GREETING_ROOM_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_24k.wav"
 GREETING_AUDIO_LOCK_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav.lock"
-TELEPHONY_SAMPLE_RATE = 8000
+ROOM_AUDIO_SAMPLE_RATE = int(os.getenv("QWEN_ROOM_AUDIO_SAMPLE_RATE", str(QwenTTS.sample_rate_hz)))
 
 
 def _normalize_wav_bytes(audio_bytes: bytes) -> bytes:
@@ -93,10 +93,10 @@ def _is_valid_greeting_audio_cache() -> bool:
     return _wav_cache_is_valid(GREETING_AUDIO_PATH, sample_rate=QwenTTS.sample_rate_hz)
 
 
-def _is_valid_telephony_greeting_audio_cache() -> bool:
+def _is_valid_room_greeting_audio_cache() -> bool:
     return _wav_cache_is_valid(
-        GREETING_TELEPHONY_AUDIO_PATH,
-        sample_rate=TELEPHONY_SAMPLE_RATE,
+        GREETING_ROOM_AUDIO_PATH,
+        sample_rate=ROOM_AUDIO_SAMPLE_RATE,
     )
 
 
@@ -122,27 +122,27 @@ def _convert_wav_to_sample_rate(audio_bytes: bytes, sample_rate: int) -> bytes:
     return output.getvalue()
 
 
-def _ensure_telephony_greeting_audio_cache() -> bool:
-    if _is_valid_telephony_greeting_audio_cache():
+def _prepare_wav_for_room_playback(audio_bytes: bytes) -> bytes:
+    normalized = _normalize_wav_bytes(audio_bytes)
+    return _convert_wav_to_sample_rate(normalized, ROOM_AUDIO_SAMPLE_RATE)
+
+
+def _ensure_room_greeting_audio_cache() -> bool:
+    if _is_valid_room_greeting_audio_cache():
         return True
     if not _is_valid_greeting_audio_cache() and not _repair_greeting_audio_cache():
         return False
 
     try:
-        GREETING_TELEPHONY_AUDIO_PATH.write_bytes(
-            _convert_wav_to_sample_rate(
-                GREETING_AUDIO_PATH.read_bytes(),
-                TELEPHONY_SAMPLE_RATE,
-            )
-        )
+        GREETING_ROOM_AUDIO_PATH.write_bytes(_prepare_wav_for_room_playback(GREETING_AUDIO_PATH.read_bytes()))
         logger.info(
-            "Greeting telephony audio cache generated: %s",
-            GREETING_TELEPHONY_AUDIO_PATH,
+            "Greeting room audio cache generated: %s",
+            GREETING_ROOM_AUDIO_PATH,
         )
-        return _is_valid_telephony_greeting_audio_cache()
+        return _is_valid_room_greeting_audio_cache()
     except Exception:
-        logger.exception("Greeting telephony audio cache generation failed")
-        GREETING_TELEPHONY_AUDIO_PATH.unlink(missing_ok=True)
+        logger.exception("Greeting room audio cache generation failed")
+        GREETING_ROOM_AUDIO_PATH.unlink(missing_ok=True)
         return False
 
 
@@ -162,7 +162,7 @@ def _repair_greeting_audio_cache() -> bool:
 
 
 async def ensure_greeting_audio_cache() -> None:
-    if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_telephony_greeting_audio_cache():
+    if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_room_greeting_audio_cache():
         return
 
     GREETING_AUDIO_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -175,7 +175,7 @@ async def ensure_greeting_audio_cache() -> None:
             )
             break
         except FileExistsError:
-            if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_telephony_greeting_audio_cache():
+            if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_room_greeting_audio_cache():
                 return
             await asyncio.sleep(0.1)
 
@@ -186,14 +186,12 @@ async def ensure_greeting_audio_cache() -> None:
     started = perf_counter()
     qwen_tts = QwenTTS()
     try:
-        if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_telephony_greeting_audio_cache():
+        if (_is_valid_greeting_audio_cache() or _repair_greeting_audio_cache()) and _ensure_room_greeting_audio_cache():
             return
         audio_bytes, _, _ = await qwen_tts.synthesize_audio_bytes(GREETING_TEXT)
         normalized = _normalize_wav_bytes(audio_bytes)
         GREETING_AUDIO_PATH.write_bytes(normalized)
-        GREETING_TELEPHONY_AUDIO_PATH.write_bytes(
-            _convert_wav_to_sample_rate(normalized, TELEPHONY_SAMPLE_RATE)
-        )
+        GREETING_ROOM_AUDIO_PATH.write_bytes(_prepare_wav_for_room_playback(normalized))
         logger.info(
             "Greeting audio cache generated in %.2fs: %s",
             perf_counter() - started,
@@ -218,7 +216,7 @@ async def _logged_audio_frames_from_file(file_path: str):
     frame_count = 0
     async for frame in utils.audio.audio_frames_from_file(
         file_path,
-        sample_rate=TELEPHONY_SAMPLE_RATE,
+        sample_rate=ROOM_AUDIO_SAMPLE_RATE,
         num_channels=QwenTTS.num_channels_count,
     ):
         if frame_count == 0:
@@ -242,13 +240,13 @@ async def _logged_audio_frames_from_file(file_path: str):
 
 
 async def play_greeting_audio_direct(room: rtc.Room) -> None:
-    if not _ensure_telephony_greeting_audio_cache():
-        logger.warning("Greeting direct playback skipped: telephony cache missing")
+    if not _ensure_room_greeting_audio_cache():
+        logger.warning("Greeting direct playback skipped: room audio cache missing")
         return
 
     started = perf_counter()
     source = rtc.AudioSource(
-        TELEPHONY_SAMPLE_RATE,
+        ROOM_AUDIO_SAMPLE_RATE,
         QwenTTS.num_channels_count,
         queue_size_ms=5000,
     )
@@ -258,12 +256,12 @@ async def play_greeting_audio_direct(room: rtc.Room) -> None:
     frame_count = 0
     audio_duration = 0.0
     try:
-        with wave.open(str(GREETING_TELEPHONY_AUDIO_PATH), "rb") as reader:
+        with wave.open(str(GREETING_ROOM_AUDIO_PATH), "rb") as reader:
             sample_rate = reader.getframerate()
             channels = reader.getnchannels()
             sample_width = reader.getsampwidth()
-            if sample_rate != TELEPHONY_SAMPLE_RATE or channels != QwenTTS.num_channels_count or sample_width != 2:
-                raise ValueError("telephony greeting wav has unexpected audio parameters")
+            if sample_rate != ROOM_AUDIO_SAMPLE_RATE or channels != QwenTTS.num_channels_count or sample_width != 2:
+                raise ValueError("room greeting wav has unexpected audio parameters")
 
             samples_per_frame = sample_rate // 50
             while True:
@@ -336,13 +334,12 @@ async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
     qwen_tts = QwenTTS()
     try:
         audio_bytes, _, _ = await qwen_tts.synthesize_audio_bytes(text)
-        normalized = _normalize_wav_bytes(audio_bytes)
-        telephony_audio = _convert_wav_to_sample_rate(normalized, TELEPHONY_SAMPLE_RATE)
+        room_audio = _prepare_wav_for_room_playback(audio_bytes)
     finally:
         await qwen_tts.aclose()
 
     source = rtc.AudioSource(
-        TELEPHONY_SAMPLE_RATE,
+        ROOM_AUDIO_SAMPLE_RATE,
         QwenTTS.num_channels_count,
         queue_size_ms=5000,
     )
@@ -352,7 +349,7 @@ async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
     frame_count = 0
     audio_duration = 0.0
     try:
-        with wave.open(io.BytesIO(telephony_audio), "rb") as reader:
+        with wave.open(io.BytesIO(room_audio), "rb") as reader:
             sample_rate = reader.getframerate()
             channels = reader.getnchannels()
             sample_width = reader.getsampwidth()
@@ -457,11 +454,6 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
     start_llm_warmup_background_thread()
-    opening_text = await fetch_dialogue_opening_text(ctx.room.name)
-    if opening_text:
-        await play_text_audio_direct(ctx.room, opening_text)
-    else:
-        await play_greeting_audio_direct(ctx.room)
 
     dashscope_key = os.getenv("DASHSCOPE_API_KEY")
     qwen_base_url = os.getenv(
@@ -542,11 +534,17 @@ async def entrypoint(ctx: JobContext) -> None:
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(),
             audio_output=room_io.AudioOutputOptions(
-                sample_rate=TELEPHONY_SAMPLE_RATE,
+                sample_rate=ROOM_AUDIO_SAMPLE_RATE,
                 num_channels=QwenTTS.num_channels_count,
             ),
         ),
     )
+
+    opening_text = await fetch_dialogue_opening_text(ctx.room.name)
+    if opening_text:
+        await play_text_audio_direct(ctx.room, opening_text)
+    else:
+        await play_greeting_audio_direct(ctx.room)
 
 
 if __name__ == "__main__":

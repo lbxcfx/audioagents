@@ -230,6 +230,7 @@ function Start-Agent {
   $sceneId = Env-OrDefault "QWEN_DIALOGUE_SCENE_ID" "2"
   $nluEnabled = Env-OrDefault "QWEN_NLU_ENABLED" "true"
   $loadThreshold = Env-OrDefault "QWEN_AGENT_LOAD_THRESHOLD" "0.95"
+  $roomAudioSampleRate = Env-OrDefault "QWEN_ROOM_AUDIO_SAMPLE_RATE" "24000"
 
   Write-Step "Starting LiveKit Agent on 127.0.0.1:18081"
   if ([string]::IsNullOrWhiteSpace($ExplicitAgentName)) {
@@ -250,6 +251,7 @@ Set-Location $(Quote-PS $appRoot)
 `$env:QWEN_NLU_ENABLED = $(Quote-PS $nluEnabled)
 `$env:QWEN_TTS_USE_SSE = 'false'
 `$env:QWEN_TTS_CACHE_ENABLED = 'true'
+`$env:QWEN_ROOM_AUDIO_SAMPLE_RATE = $(Quote-PS $roomAudioSampleRate)
 `$env:QWEN_AGENT_LOAD_THRESHOLD = $(Quote-PS $loadThreshold)
 `$env:QWEN_AGENT_EXPLICIT_NAME = $(Quote-PS $ExplicitAgentName)
 `$env:LIVEKIT_AGENT_NAME = $(Quote-PS $ExplicitAgentName)
@@ -257,6 +259,21 @@ Set-Location $(Quote-PS $appRoot)
 "@
   Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $command) -WindowStyle Hidden | Out-Null
   Wait-Http "http://127.0.0.1:18081/worker" "LiveKit Agent" 60
+}
+
+function Update-MicroSipAudioConfig {
+  $microSipIni = Join-Path $repoRoot.Path "tools\microsip\microsip.ini"
+  if (-not (Test-Path $microSipIni)) {
+    return
+  }
+
+  $preferredCodecs = "G722/16000/1"
+  $content = Get-Content -Raw $microSipIni
+  $content = $content -replace "(?m)^audioCodecs=.*$", "audioCodecs=$preferredCodecs"
+  $content = $content -replace "(?m)^forceCodec=.*$", "forceCodec=1"
+  $content = $content -replace "(?m)^opusStereo=.*$", "opusStereo=0"
+  Set-Content -Path $microSipIni -Value $content -Encoding ASCII
+  Write-Step "MicroSIP audio codecs: $preferredCodecs"
 }
 
 function Start-MicroSIP {
@@ -271,6 +288,7 @@ function Start-MicroSIP {
     return
   }
 
+  Update-MicroSipAudioConfig
   Write-Step "Starting MicroSIP"
   Start-Process -FilePath $microSip -WorkingDirectory (Split-Path $microSip) | Out-Null
 }
@@ -279,6 +297,7 @@ Import-EnvFile (Join-Path $repoRoot.Path ".env") $true
 Import-EnvFile (Join-Path $appRoot "config\local.env") $true
 [Environment]::SetEnvironmentVariable("QWEN_TTS_USE_SSE", "false", "Process")
 [Environment]::SetEnvironmentVariable("QWEN_TTS_CACHE_ENABLED", "true", "Process")
+[Environment]::SetEnvironmentVariable("QWEN_ROOM_AUDIO_SAMPLE_RATE", "24000", "Process")
 
 Write-Step "One-click startup begins"
 Write-Step "Fixes covered: backend process, Windows venv deps, SIP init, auto-dispatch agent mode, cached TTS prewarm"
