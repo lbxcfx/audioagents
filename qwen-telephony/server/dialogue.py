@@ -240,6 +240,27 @@ def end_node_hangup_meta(node: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def node_audio_meta(node: dict[str, Any] | None) -> dict[str, Any]:
+    if not node:
+        return {}
+
+    ui = node.get("ui") or {}
+    audio_url = str(ui.get("audioUrl") or ui.get("audio_url") or "").strip()
+    if not audio_url or ui.get("audioSource") != "recording":
+        return {}
+
+    return {
+        "audio_url": audio_url,
+        "audio": {
+            "url": audio_url,
+            "source": ui.get("audioSource") or "",
+            "record_source": ui.get("audioRecordSource") or "",
+            "record_id": ui.get("audioRecordId") or "",
+            "name": ui.get("audioName") or "",
+        },
+    }
+
+
 def handle_turn(
     *,
     session_id: str,
@@ -307,6 +328,7 @@ def handle_turn(
             "next_node_id": current_node_id,
             "label": session.get("label") or "",
             "nlu": {},
+            **node_audio_meta(current_node),
             **end_node_hangup_meta(current_node),
         }
     nlu = classify_intent(text, current_node)
@@ -475,6 +497,7 @@ def handle_turn(
             "matched_keyword": nlu.matched_keyword,
             "route": route,
         },
+        **node_audio_meta(next_node),
         **end_node_hangup_meta(next_node),
     }
 
@@ -538,6 +561,7 @@ def start_session(*, session_id: str, scene_id: int | None = None) -> dict[str, 
         "next_node_id": entry_node,
         "label": "",
         "nlu": {},
+        **node_audio_meta(node),
     }
 
 

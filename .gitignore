@@ -2,6 +2,8 @@
 *.env
 !*.env.example
 
+backup/
+
 livekit/
 agents/
 sip/

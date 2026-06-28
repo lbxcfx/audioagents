@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import threading
 from time import perf_counter
+from typing import Any
 import wave
 
 from dotenv import load_dotenv
@@ -31,7 +32,7 @@ from livekit.plugins import openai, silero
 from openai import AsyncOpenAI
 
 from dialogue_llm import ScriptFirstLLM
-from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS
+from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS, register_recorded_audio
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -298,7 +299,7 @@ async def play_greeting_audio_direct(room: rtc.Room) -> None:
         await source.aclose()
 
 
-async def fetch_dialogue_opening_text(session_id: str) -> str | None:
+async def fetch_dialogue_opening(session_id: str) -> dict | None:
     if os.getenv("QWEN_NLU_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
         return None
 
@@ -324,7 +325,12 @@ async def fetch_dialogue_opening_text(session_id: str) -> str | None:
             body.get("scene_id"),
             body.get("next_node_id"),
         )
-        return str(body["text"])
+        audio = body.get("audio") if isinstance(body.get("audio"), dict) else {}
+        audio_url = str(body.get("audio_url") or audio.get("url") or "").strip()
+        if audio_url:
+            base_url = turn_url.split("/api/", 1)[0] + "/"
+            register_recorded_audio(str(body["text"]), audio_url, base_url)
+        return body
     logger.info("Dialogue opening unavailable, route=%s reason=%s", body.get("route_type"), body.get("reason"))
     return None
 
@@ -409,6 +415,84 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _dialogue_audio_path(audio_url: str) -> Path | None:
+    if not audio_url.startswith("/static/dialogue-audio/"):
+        return None
+    filename = Path(audio_url).name
+    return ROOT / "qwen-telephony" / "server" / "static" / "dialogue-audio" / filename
+
+
+def _wav_duration_seconds(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as reader:
+            rate = reader.getframerate()
+            if rate <= 0:
+                return None
+            return reader.getnframes() / rate
+    except (wave.Error, OSError, EOFError):
+        return None
+
+
+def estimate_audio_duration_seconds(text: str, audio_url: str = "") -> float:
+    path = _dialogue_audio_path(audio_url)
+    if path and path.exists():
+        duration = _wav_duration_seconds(path)
+        if duration:
+            return duration
+
+    chars_per_second = max(1.0, _env_float("QWEN_INTERRUPT_ESTIMATE_CHARS_PER_SECOND", 4.5))
+    return max(1.0, len(text.strip()) / chars_per_second)
+
+
+def interrupt_gate_percent(result: dict[str, Any]) -> float:
+    interrupt = result.get("interrupt") if isinstance(result.get("interrupt"), dict) else {}
+    raw_percent = interrupt.get("allow_after_percent") or interrupt.get("allowAfterPercent")
+    if raw_percent is None:
+        raw_percent = os.getenv("QWEN_RECORDED_AUDIO_INTERRUPT_AFTER_PERCENT", "50")
+    try:
+        percent = float(raw_percent)
+    except (TypeError, ValueError):
+        percent = 50.0
+    return min(100.0, max(0.0, percent))
+
+
+def schedule_interrupt_gate(speech_handle: Any, *, text: str, audio_url: str, result: dict[str, Any]) -> None:
+    percent = interrupt_gate_percent(result)
+    if percent <= 0:
+        speech_handle.allow_interruptions = True
+        return
+    if percent >= 100:
+        speech_handle.allow_interruptions = False
+        return
+
+    duration = estimate_audio_duration_seconds(text, audio_url)
+    delay_seconds = max(0.0, duration * percent / 100.0)
+    speech_handle.allow_interruptions = False
+    logger.info(
+        "Recorded audio interruption gated: speech=%s percent=%.1f delay=%.2fs duration=%.2fs",
+        getattr(speech_handle, "id", ""),
+        percent,
+        delay_seconds,
+        duration,
+    )
+
+    async def _enable_later() -> None:
+        await asyncio.sleep(delay_seconds)
+        if speech_handle.done() or speech_handle.interrupted:
+            return
+        speech_handle.allow_interruptions = True
+        logger.info("Recorded audio interruption enabled: speech=%s", getattr(speech_handle, "id", ""))
+
+    asyncio.create_task(_enable_later())
 
 
 async def hangup_room_after_dialogue_end(room_name: str, delay_ms: int) -> None:
@@ -542,9 +626,20 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     hangup_task: asyncio.Task[None] | None = None
+    current_speech_handle: Any = None
 
     def on_dialogue_result(result: dict) -> None:
         nonlocal hangup_task
+        audio = result.get("audio") if isinstance(result.get("audio"), dict) else {}
+        audio_url = str(result.get("audio_url") or audio.get("url") or "").strip()
+        if audio_url and current_speech_handle is not None:
+            schedule_interrupt_gate(
+                current_speech_handle,
+                text=str(result.get("text") or ""),
+                audio_url=audio_url,
+                result=result,
+            )
+
         if not result.get("should_hangup"):
             return
         if hangup_task and not hangup_task.done():
@@ -596,6 +691,11 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
         metrics.log_metrics(ev.metrics)
 
+    @session.on("speech_created")
+    def _on_speech_created(ev) -> None:
+        nonlocal current_speech_handle
+        current_speech_handle = ev.speech_handle
+
     async def log_usage() -> None:
         logger.info("Usage: %s", session.usage)
 
@@ -613,9 +713,19 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
     )
 
-    opening_text = await fetch_dialogue_opening_text(ctx.room.name)
-    if opening_text:
-        await play_text_audio_direct(ctx.room, opening_text)
+    opening = await fetch_dialogue_opening(ctx.room.name)
+    if opening and opening.get("text"):
+        audio = opening.get("audio") if isinstance(opening.get("audio"), dict) else {}
+        audio_url = str(opening.get("audio_url") or audio.get("url") or "").strip()
+        speech = session.say(str(opening["text"]), allow_interruptions=not audio_url)
+        if audio_url:
+            schedule_interrupt_gate(
+                speech,
+                text=str(opening["text"]),
+                audio_url=audio_url,
+                result=opening,
+            )
+        await speech.wait_for_playout()
     else:
         await play_greeting_audio_direct(ctx.room)
 

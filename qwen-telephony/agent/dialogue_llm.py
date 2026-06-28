@@ -10,6 +10,8 @@ from livekit.agents import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents import llm as lk_llm
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 
+from qwen_providers import register_recorded_audio
+
 
 logger = logging.getLogger("qwen-phone-agent.dialogue")
 
@@ -25,6 +27,15 @@ def latest_user_text(chat_ctx: lk_llm.ChatContext) -> str:
         if message.role == "user":
             return message.text_content or ""
     return ""
+
+
+def _register_result_audio(text: str, result: dict[str, Any], dialogue_url: str) -> None:
+    audio = result.get("audio") if isinstance(result.get("audio"), dict) else {}
+    audio_url = str(result.get("audio_url") or audio.get("url") or "").strip()
+    if not audio_url:
+        return
+    base_url = dialogue_url.split("/api/", 1)[0] + "/"
+    register_recorded_audio(text, audio_url, base_url)
 
 
 class ScriptFirstLLM(lk_llm.LLM):
@@ -141,6 +152,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
                     response.raise_for_status()
                     result = response.json()
                 if result.get("handled") and result.get("text"):
+                    _register_result_audio(str(result["text"]), result, self._dialogue_url)
                     await self._emit_fixed_reply(result["text"], result)
                     return
                 logger.info(

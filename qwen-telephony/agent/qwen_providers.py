@@ -13,6 +13,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 import websockets
@@ -28,6 +29,35 @@ DEFAULT_DASHSCOPE_GENERATION_URL = (
 )
 DEFAULT_DASHSCOPE_REALTIME_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 logger = logging.getLogger("qwen-phone-agent.qwen")
+
+_RECORDED_AUDIO_BY_TEXT: dict[str, dict[str, str]] = {}
+_RECORDED_AUDIO_CACHE: dict[str, tuple[bytes, str, str]] = {}
+
+
+def register_recorded_audio(text: str, audio_url: str, base_url: str | None = None) -> None:
+    normalized_text = text.strip()
+    normalized_url = audio_url.strip()
+    if not normalized_text or not normalized_url:
+        return
+    _RECORDED_AUDIO_BY_TEXT[normalized_text] = {
+        "url": normalized_url,
+        "base_url": base_url or "",
+    }
+
+
+def _recorded_audio_for_text(text: str) -> dict[str, str] | None:
+    return _RECORDED_AUDIO_BY_TEXT.get(text.strip())
+
+
+def _recorded_audio_mime(url: str, content_type: str = "") -> str:
+    if content_type and "application/octet-stream" not in content_type:
+        return content_type.split(";", 1)[0].strip()
+    lowered = url.lower()
+    if lowered.endswith(".mp3"):
+        return "audio/mpeg"
+    if lowered.endswith(".wav"):
+        return "audio/wav"
+    return "audio/wav"
 
 
 def _dashscope_key() -> str:
@@ -263,7 +293,8 @@ class _QwenRealtimeASRStream(stt.RecognizeStream):
                                 "prefix_padding_ms": opts.prefix_padding_ms,
                                 "silence_duration_ms": opts.silence_duration_ms,
                                 "create_response": False,
-                                "interrupt_response": False,
+                                "interrupt_response": os.getenv("QWEN_ASR_INTERRUPT_RESPONSE", "true").lower()
+                                in {"1", "true", "yes", "on"},
                             },
                         },
                     },
@@ -501,7 +532,39 @@ class QwenTTS(tts.TTS):
         tmp_path.replace(path)
         logger.info("TTS cache write: key=%s bytes=%d", path.stem[:12], len(audio_bytes))
 
+    async def recorded_audio_bytes(self, text: str) -> tuple[bytes, str, str] | None:
+        record = _recorded_audio_for_text(text)
+        if not record:
+            return None
+
+        audio_url = record["url"]
+        base_url = record.get("base_url") or ""
+        absolute_url = audio_url if audio_url.startswith(("http://", "https://")) else urljoin(base_url, audio_url)
+        cached = _RECORDED_AUDIO_CACHE.get(absolute_url)
+        if cached:
+            logger.info("Recorded node audio cache hit: url=%s bytes=%d", absolute_url, len(cached[0]))
+            return cached
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            response = await client.get(absolute_url)
+            response.raise_for_status()
+            audio_bytes = response.content
+
+        if len(audio_bytes) <= 44:
+            raise RuntimeError(f"recorded node audio is empty: {absolute_url}")
+
+        mime_type = _recorded_audio_mime(absolute_url, response.headers.get("content-type", ""))
+        request_id = f"recorded_{hashlib.sha1(absolute_url.encode('utf-8')).hexdigest()[:12]}"
+        result = (audio_bytes, mime_type, request_id)
+        _RECORDED_AUDIO_CACHE[absolute_url] = result
+        logger.info("Recorded node audio fetched: url=%s bytes=%d mime=%s", absolute_url, len(audio_bytes), mime_type)
+        return result
+
     async def synthesize_audio_bytes(self, text: str) -> tuple[bytes, str, str]:
+        recorded = await self.recorded_audio_bytes(text)
+        if recorded:
+            return recorded
+
         cached = self.cached_audio_bytes(text)
         if cached:
             return cached
@@ -623,6 +686,19 @@ class _QwenTTSChunkedStream(tts.ChunkedStream):
         self._qwen_tts = tts
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        recorded = await self._qwen_tts.recorded_audio_bytes(self.input_text)
+        if recorded:
+            audio_bytes, mime_type, request_id = recorded
+            output_emitter.initialize(
+                request_id=request_id,
+                sample_rate=QwenTTS.sample_rate_hz,
+                num_channels=QwenTTS.num_channels_count,
+                mime_type=mime_type,
+            )
+            output_emitter.push(audio_bytes)
+            output_emitter.flush()
+            return
+
         cached = self._qwen_tts.cached_audio_bytes(self.input_text)
         if cached:
             audio_bytes, mime_type, request_id = cached
