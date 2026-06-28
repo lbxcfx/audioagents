@@ -27,7 +27,7 @@ def normalize_text(text: str) -> str:
 
 
 def split_keywords(value: str) -> list[str]:
-    return [item.strip() for item in re.split(r"[,，\n;；]", value or "") if item.strip()]
+    return [item.strip() for item in re.split(r"[,，、\n;；]", value or "") if item.strip()]
 
 
 def classify_intent(text: str, node: dict[str, Any] | None = None) -> NluResult:
@@ -36,15 +36,27 @@ def classify_intent(text: str, node: dict[str, Any] | None = None) -> NluResult:
         return NluResult("unknown", 0.0)
 
     node_keywords = (node or {}).get("intent_keywords") or {}
-    for intent, confidence in (
-        ("reject", 0.94),
-        ("negative", 0.86),
-        ("positive", 0.84),
-        ("neutral", 0.74),
-    ):
-        for word in split_keywords(",".join(node_keywords.get(intent, [])) if isinstance(node_keywords.get(intent), list) else node_keywords.get(intent, "")):
-            if normalize_text(word) in normalized:
-                return NluResult(intent, confidence, word)
+    if isinstance(node_keywords, dict):
+        standard_confidence = {
+            "reject": 0.94,
+            "negative": 0.86,
+            "positive": 0.84,
+            "neutral": 0.74,
+            "unknown": 0.56,
+        }
+        ordered_intents = ["reject", "negative", "positive", "neutral", "unknown"]
+        custom_intents = [intent for intent in node_keywords.keys() if intent not in ordered_intents]
+        for intent in [*ordered_intents, *custom_intents]:
+            raw_keywords = node_keywords.get(intent, [])
+            if isinstance(raw_keywords, list):
+                keywords: list[str] = []
+                for item in raw_keywords:
+                    keywords.extend(split_keywords(str(item or "")))
+            else:
+                keywords = split_keywords(str(raw_keywords or ""))
+            for word in keywords:
+                if normalize_text(word) in normalized:
+                    return NluResult(intent, standard_confidence.get(intent, 0.8), word)
 
     for intent, words, confidence in (
         ("reject", REJECT_WORDS, 0.92),
@@ -213,6 +225,21 @@ def evaluate_label(scene_id: int, session: dict[str, Any]) -> str:
     return session.get("label") or ""
 
 
+def end_node_hangup_meta(node: dict[str, Any] | None) -> dict[str, Any]:
+    if not node or node.get("type") != "end":
+        return {}
+
+    ui = node.get("ui") or {}
+    try:
+        delay_ms = int(ui.get("pauseMs") or 3000)
+    except (TypeError, ValueError):
+        delay_ms = 3000
+    return {
+        "should_hangup": True,
+        "hangup_delay_ms": max(0, delay_ms),
+    }
+
+
 def handle_turn(
     *,
     session_id: str,
@@ -280,6 +307,7 @@ def handle_turn(
             "next_node_id": current_node_id,
             "label": session.get("label") or "",
             "nlu": {},
+            **end_node_hangup_meta(current_node),
         }
     nlu = classify_intent(text, current_node)
     knowledge = match_knowledge(resolved_scene_id, text)
@@ -447,6 +475,7 @@ def handle_turn(
             "matched_keyword": nlu.matched_keyword,
             "route": route,
         },
+        **end_node_hangup_meta(next_node),
     }
 
 
@@ -548,6 +577,7 @@ def get_scene(scene_id: int) -> dict[str, Any] | None:
         ).fetchall()
     data = row_to_dict(scene)
     data["flow"] = json.loads(version["flow_json"]) if version else {}
+    data["ui"] = json.loads(data.get("ui_json") or "{}")
     data["knowledge"] = rows_to_dicts(knowledge)
     data["label_rules"] = rows_to_dicts(labels)
     return data

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import httpx
@@ -39,6 +39,7 @@ class ScriptFirstLLM(lk_llm.LLM):
         dialogue_url: str | None = None,
         enabled: bool | None = None,
         timeout: float = 0.8,
+        on_dialogue_result: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> None:
         super().__init__()
         self._upstream = upstream
@@ -51,6 +52,7 @@ class ScriptFirstLLM(lk_llm.LLM):
         )
         self._enabled = _env_enabled(os.getenv("QWEN_NLU_ENABLED"), True) if enabled is None else enabled
         self._timeout = timeout
+        self._on_dialogue_result = on_dialogue_result
 
     @property
     def model(self) -> str:
@@ -87,6 +89,7 @@ class ScriptFirstLLM(lk_llm.LLM):
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
             extra_kwargs=extra_kwargs,
+            on_dialogue_result=self._on_dialogue_result,
         )
 
 
@@ -107,6 +110,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
         parallel_tool_calls: NotGivenOr[bool],
         tool_choice: NotGivenOr[lk_llm.ToolChoice],
         extra_kwargs: NotGivenOr[dict[str, Any]],
+        on_dialogue_result: Callable[[dict[str, Any]], Awaitable[None] | None] | None,
     ) -> None:
         super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._upstream = upstream
@@ -118,6 +122,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
         self._parallel_tool_calls = parallel_tool_calls
         self._tool_choice = tool_choice
         self._extra_kwargs = extra_kwargs
+        self._on_dialogue_result = on_dialogue_result
 
     async def _run(self) -> None:
         text = latest_user_text(self._chat_ctx).strip()
@@ -173,6 +178,8 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
                         "scene_id": result.get("scene_id"),
                         "next_node_id": result.get("next_node_id"),
                         "label": result.get("label"),
+                        "should_hangup": result.get("should_hangup"),
+                        "hangup_delay_ms": result.get("hangup_delay_ms"),
                     },
                 ),
             )
@@ -187,3 +194,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
                 ),
             )
         )
+        if self._on_dialogue_result:
+            awaitable = self._on_dialogue_result(result)
+            if awaitable is not None:
+                await awaitable

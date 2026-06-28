@@ -13,14 +13,14 @@ mkdir -p "$LOG_DIR"
 if [[ -f "$ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1090
-  source <(sed 's/\r$//' "$ROOT/.env")
+  source <(sed '1s/^\xEF\xBB\xBF//;s/\r$//' "$ROOT/.env")
   set +a
 fi
 
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
-  source <(sed 's/\r$//' "$ENV_FILE")
+  source <(sed '1s/^\xEF\xBB\xBF//;s/\r$//' "$ENV_FILE")
   set +a
 fi
 
@@ -47,6 +47,17 @@ livekit_http_ok() {
 
 agent_process_ok() {
   pgrep -f "python -u phone_agent.py start" >/dev/null 2>&1
+}
+
+agent_proxy_ok() {
+  if [[ -z "${HTTP_PROXY:-${http_proxy:-}}" ]]; then
+    return 0
+  fi
+
+  local pid
+  pid="$(pgrep -f "python -u phone_agent.py start" | head -n 1 || true)"
+  [[ -n "$pid" ]] || return 1
+  tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Eq '^(HTTP_PROXY|http_proxy)='
 }
 
 agent_port_ok() {
@@ -160,6 +171,9 @@ ensure_agent() {
   if ! agent_process_ok; then
     status "Agent process is not running"
     restart=1
+  elif ! agent_proxy_ok; then
+    status "Agent process exists but proxy environment is missing"
+    restart=1
   elif ! agent_port_ok; then
     status "Agent process exists but port 18081 is not reachable"
     restart=1
@@ -176,7 +190,7 @@ ensure_agent() {
   fi
 
   status "Waiting for agent worker registration"
-  for _ in {1..60}; do
+  for _ in {1..120}; do
     if agent_registered_recently_or_running; then
       status "Agent worker registered"
       return

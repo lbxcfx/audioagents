@@ -12,7 +12,7 @@ import wave
 
 from dotenv import load_dotenv
 import httpx
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -395,6 +395,62 @@ def start_llm_warmup_background_thread() -> None:
     thread.start()
 
 
+def _livekit_http_url() -> str:
+    url = os.getenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    if url.startswith("wss://"):
+        return "https://" + url[len("wss://") :]
+    if url.startswith("ws://"):
+        return "http://" + url[len("ws://") :]
+    return url
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+async def hangup_room_after_dialogue_end(room_name: str, delay_ms: int) -> None:
+    delay_seconds = max(0, delay_ms) / 1000
+    logger.info("Dialogue end reached; scheduling LiveKit hangup in %.2fs", delay_seconds)
+    await asyncio.sleep(delay_seconds)
+
+    lkapi = api.LiveKitAPI(
+        url=_livekit_http_url(),
+        api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
+        api_secret=os.getenv("LIVEKIT_API_SECRET", "secret"),
+    )
+    removed: list[str] = []
+    errors: list[str] = []
+    try:
+        try:
+            participants = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
+            identities = [item.identity for item in participants.participants if item.identity]
+        except Exception as exc:
+            identities = []
+            errors.append(f"list_participants failed: {exc}")
+
+        for identity in dict.fromkeys(identities):
+            try:
+                await lkapi.room.remove_participant(api.RoomParticipantIdentity(room=room_name, identity=identity))
+                removed.append(identity)
+            except Exception as exc:
+                errors.append(f"remove_participant {identity} failed: {exc}")
+
+        try:
+            await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as exc:
+            errors.append(f"delete_room failed: {exc}")
+    finally:
+        await lkapi.aclose()
+
+    if errors:
+        logger.warning("Dialogue end hangup completed with errors: removed=%s errors=%s", removed, errors)
+    else:
+        logger.info("Dialogue end hangup completed: removed=%s room=%s", removed, room_name)
+
+
 async def warm_up_qwen_llm() -> None:
     if os.getenv("QWEN_LLM_WARMUP", "true").lower() not in {"1", "true", "yes", "on"}:
         return
@@ -485,6 +541,22 @@ async def entrypoint(ctx: JobContext) -> None:
         "qwen-realtime-websocket" if use_realtime_asr else "qwen-http-vad-adapter",
     )
 
+    hangup_task: asyncio.Task[None] | None = None
+
+    def on_dialogue_result(result: dict) -> None:
+        nonlocal hangup_task
+        if not result.get("should_hangup"):
+            return
+        if hangup_task and not hangup_task.done():
+            logger.info("Dialogue end hangup already scheduled for room=%s", ctx.room.name)
+            return
+        try:
+            delay_ms = int(result.get("hangup_delay_ms") or _env_int("QWEN_DIALOGUE_HANGUP_DELAY_MS", 3500))
+        except (TypeError, ValueError):
+            delay_ms = 3500
+        delay_ms = max(delay_ms, _env_int("QWEN_DIALOGUE_HANGUP_MIN_DELAY_MS", 3500))
+        hangup_task = asyncio.create_task(hangup_room_after_dialogue_end(ctx.room.name, delay_ms))
+
     session = AgentSession(
         stt=asr_provider,
         llm=ScriptFirstLLM(
@@ -497,6 +569,7 @@ async def entrypoint(ctx: JobContext) -> None:
             scene_id=int(os.getenv("QWEN_DIALOGUE_SCENE_ID", "0")) or None,
             dialogue_url=os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn"),
             timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8")),
+            on_dialogue_result=on_dialogue_result,
         ),
         tts=QwenTTS(),
         turn_handling=TurnHandlingOptions(

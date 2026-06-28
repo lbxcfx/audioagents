@@ -55,6 +55,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 campaign_id INTEGER,
                 contact_id INTEGER,
+                scene_id INTEGER,
+                caller_name TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 room_name TEXT NOT NULL DEFAULT '',
@@ -67,7 +69,8 @@ def init_db() -> None:
                 intent_level TEXT NOT NULL DEFAULT 'unknown',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL,
-                FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE SET NULL
+                FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE SET NULL,
+                FOREIGN KEY(scene_id) REFERENCES dialogue_scenes(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS call_messages (
@@ -91,6 +94,10 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 industry TEXT NOT NULL DEFAULT '',
                 business_type TEXT NOT NULL DEFAULT '',
+                script_type TEXT NOT NULL DEFAULT 'common',
+                auto_break TEXT NOT NULL DEFAULT '否',
+                audit_status TEXT NOT NULL DEFAULT '待审核',
+                ui_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'draft',
                 active_version_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -170,6 +177,102 @@ def init_db() -> None:
                 nlu_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS task_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                default_prompt TEXT NOT NULL DEFAULT '',
+                max_concurrency INTEGER NOT NULL DEFAULT 2,
+                retry_limit INTEGER NOT NULL DEFAULT 1,
+                default_scene_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'enabled',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(default_scene_id) REFERENCES dialogue_scenes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dispatch_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER,
+                call_id INTEGER,
+                phone TEXT NOT NULL,
+                contact_name TEXT NOT NULL DEFAULT '',
+                dispatch_type TEXT NOT NULL DEFAULT 'LiveKit队列',
+                status TEXT NOT NULL DEFAULT 'pending',
+                room_name TEXT NOT NULL DEFAULT '',
+                failure_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL,
+                FOREIGN KEY(call_id) REFERENCES calls(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS push_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER,
+                target TEXT NOT NULL DEFAULT '',
+                push_type TEXT NOT NULL DEFAULT 'Webhook',
+                content TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                failure_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL
+            );
+            """
+        )
+        call_columns = {row["name"] for row in conn.execute("PRAGMA table_info(calls)").fetchall()}
+        if "scene_id" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN scene_id INTEGER")
+        if "caller_name" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN caller_name TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE calls SET caller_name = '测试号' WHERE phone = '1000@127.0.0.1:5066' AND caller_name = ''")
+        scene_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dialogue_scenes)").fetchall()}
+        if "script_type" not in scene_columns:
+            conn.execute("ALTER TABLE dialogue_scenes ADD COLUMN script_type TEXT NOT NULL DEFAULT 'common'")
+        if "auto_break" not in scene_columns:
+            conn.execute("ALTER TABLE dialogue_scenes ADD COLUMN auto_break TEXT NOT NULL DEFAULT '否'")
+        if "audit_status" not in scene_columns:
+            conn.execute("ALTER TABLE dialogue_scenes ADD COLUMN audit_status TEXT NOT NULL DEFAULT '待审核'")
+        if "ui_json" not in scene_columns:
+            conn.execute("ALTER TABLE dialogue_scenes ADD COLUMN ui_json TEXT NOT NULL DEFAULT '{}'")
+        template_count = conn.execute("SELECT COUNT(*) AS total FROM task_templates").fetchone()["total"]
+        if not template_count:
+            conn.execute(
+                """
+                INSERT INTO task_templates (name, default_prompt, max_concurrency, retry_limit, status, notes)
+                VALUES (?, ?, 2, 1, 'enabled', ?)
+                """,
+                ("默认外呼模板", "你是电话回访助手，确认客户是否需要产品演示，并记录意向等级。", "系统默认任务模板"),
+            )
+        conn.execute(
+            """
+            INSERT INTO dispatch_records (
+                campaign_id, call_id, phone, contact_name,
+                dispatch_type, status, room_name, failure_reason, created_at, updated_at
+            )
+            SELECT calls.campaign_id,
+                   calls.id,
+                   calls.phone,
+                   COALESCE(contacts.name, calls.caller_name, ''),
+                   'LiveKit队列',
+                   CASE
+                       WHEN calls.status = 'pending' THEN 'pending'
+                       WHEN calls.status IN ('failed', 'no_answer', 'busy') THEN 'failed'
+                       WHEN calls.status IN ('dialing', 'ringing', 'active') THEN 'active'
+                       ELSE 'completed'
+                   END,
+                   calls.room_name,
+                   calls.failure_reason,
+                   calls.created_at,
+                   CURRENT_TIMESTAMP
+            FROM calls
+            LEFT JOIN contacts ON contacts.id = calls.contact_id
+            WHERE calls.campaign_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM dispatch_records WHERE dispatch_records.call_id = calls.id
+              )
             """
         )
 

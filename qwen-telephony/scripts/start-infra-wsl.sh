@@ -17,7 +17,7 @@ export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
-  source <(sed 's/\r$//' "$ENV_FILE")
+  source <(sed '1s/^\xEF\xBB\xBF//;s/\r$//' "$ENV_FILE")
   set +a
 fi
 

@@ -10,8 +10,8 @@ if [[ ! -d "$VENV" ]]; then
 fi
 
 set -a
-[[ -f "$ROOT/.env" ]] && source <(sed 's/\r$//' "$ROOT/.env")
-[[ -f "$APP/config/local.env" ]] && source <(sed 's/\r$//' "$APP/config/local.env")
+[[ -f "$ROOT/.env" ]] && source <(sed '1s/^\xEF\xBB\xBF//;s/\r$//' "$ROOT/.env")
+[[ -f "$APP/config/local.env" ]] && source <(sed '1s/^\xEF\xBB\xBF//;s/\r$//' "$APP/config/local.env")
 set +a
 
 export LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-devkey}"
