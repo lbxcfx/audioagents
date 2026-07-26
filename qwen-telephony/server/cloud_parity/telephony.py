@@ -2492,7 +2492,9 @@ class TelephonyService:
                     """,
                     (call_id,),
                 ).fetchone()
-                claimed.append(self._call(updated, include_lease=True))
+                record = self._call(updated, include_lease=True)
+                record["lease_seconds"] = int(limits["lease_seconds"])
+                claimed.append(record)
         return claimed
 
     def claim_reconciliation(

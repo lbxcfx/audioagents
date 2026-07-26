@@ -88,7 +88,24 @@ def test_dispatcher_marks_dispatching_before_livekit_side_effect() -> None:
     assert request.room == "call-call-1"
     assert metadata["kind"] == "telephony.outbound"
     assert metadata["livekit_trunk_id"] == "ST_primary"
+    assert metadata["lease_seconds"] == 30
+    assert metadata["heartbeat_seconds"] == 10
     assert "service_token" not in metadata
+
+
+def test_dispatcher_derives_heartbeat_from_short_project_lease() -> None:
+    control = FakeControl()
+    livekit = SimpleNamespace(agent_dispatch=FakeAgentDispatch())
+
+    asyncio.run(
+        dispatcher.dispatch_call(
+            _settings(), control, livekit, "project-1", _call(lease_seconds=10)
+        )
+    )
+
+    metadata = json.loads(livekit.agent_dispatch.requests[0].metadata)
+    assert metadata["lease_seconds"] == 10
+    assert metadata["heartbeat_seconds"] == pytest.approx(10 / 3)
 
 
 def test_dispatcher_encrypts_sensitive_livekit_metadata() -> None:

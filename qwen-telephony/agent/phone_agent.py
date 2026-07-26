@@ -45,6 +45,7 @@ load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / "qwen-telephony" / "config" / "local.env", override=False)
 
 logger = logging.getLogger("qwen-phone-agent")
+_telephony_control_client: httpx.AsyncClient | None = None
 
 GREETING_TEXT = os.getenv(
     "QWEN_GREETING_TEXT",
@@ -647,6 +648,33 @@ def _telephony_control_headers() -> dict[str, str]:
     }
 
 
+def _new_telephony_control_client() -> httpx.AsyncClient:
+    timeout = float(os.getenv("CLOUD_PARITY_CONTROL_TIMEOUT_SECONDS", "5"))
+    max_connections = max(
+        4, int(os.getenv("CLOUD_PARITY_CONTROL_MAX_CONNECTIONS", "20"))
+    )
+    max_keepalive = min(
+        max_connections,
+        max(2, int(os.getenv("CLOUD_PARITY_CONTROL_MAX_KEEPALIVE", "10"))),
+    )
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive,
+            keepalive_expiry=30,
+        ),
+    )
+
+
+async def _close_telephony_control_client() -> None:
+    global _telephony_control_client
+    client = _telephony_control_client
+    _telephony_control_client = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
 async def _telephony_control_post(
     path: str,
     payload: dict[str, Any],
@@ -655,9 +683,15 @@ async def _telephony_control_post(
     if not base_url:
         raise RuntimeError("CLOUD_PARITY_CONTROL_URL is required for managed telephony jobs")
     url = f"{base_url}{path}"
-    timeout = float(os.getenv("CLOUD_PARITY_CONTROL_TIMEOUT_SECONDS", "5"))
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    client = _telephony_control_client
+    owns_client = client is None or client.is_closed
+    if owns_client:
+        client = _new_telephony_control_client()
+    try:
         response = await client.post(url, headers=_telephony_control_headers(), json=payload)
+    finally:
+        if owns_client:
+            await client.aclose()
     if response.status_code >= 400:
         raise RuntimeError(
             f"telephony control request failed: path={path.rsplit('/', 1)[-1]} "
@@ -988,8 +1022,35 @@ async def _start_managed_recording(
     return egress_id, storage_uri
 
 
+def _telephony_heartbeat_interval(job: dict[str, Any]) -> float:
+    requested = max(1.0, min(float(job.get("heartbeat_seconds") or 10), 60.0))
+    lease_seconds = max(3.0, float(job.get("lease_seconds") or requested * 3))
+    return max(1.0, min(requested, lease_seconds / 3.0))
+
+
+def _outbound_shutdown_transition(
+    *, answered: bool, reason: str
+) -> tuple[str, str]:
+    normalized = reason.strip().lower()
+    if not answered:
+        return "reconciling", "agent_shutdown_before_answer"
+    failure_markers = (
+        "failed",
+        "error",
+        "exception",
+        "crash",
+        "rejected",
+        "mandatory recording",
+        "worker shutdown",
+        "process shutdown",
+    )
+    if any(marker in normalized for marker in failure_markers):
+        return "failed", "agent_runtime_terminated"
+    return "completed", ""
+
+
 async def _telephony_heartbeat(job: dict[str, Any]) -> None:
-    interval = max(3.0, min(float(job.get("heartbeat_seconds") or 10), 60.0))
+    interval = _telephony_heartbeat_interval(job)
     failures = 0
     while True:
         await asyncio.sleep(interval)
@@ -1204,6 +1265,7 @@ server = AgentServer(
 
 @server.rtc_session(agent_name=os.getenv("QWEN_AGENT_EXPLICIT_NAME", os.getenv("LIVEKIT_AGENT_NAME", "")))
 async def entrypoint(ctx: JobContext) -> None:
+    global _telephony_control_client
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     ctx.log_context_fields = {"room": ctx.room.name}
 
@@ -1216,6 +1278,11 @@ async def entrypoint(ctx: JobContext) -> None:
     console_task: asyncio.Task[None] | None = None
     insights_session_id = ""
     telephony_terminal = False
+    outbound_call_answered = False
+    shutdown_finalizers: list[Any] = []
+    if outbound_job or inbound_config:
+        if _telephony_control_client is None or _telephony_control_client.is_closed:
+            _telephony_control_client = _new_telephony_control_client()
     if outbound_job:
         outbound_job["direction"] = "outbound"
         managed_sip_identity = f"sip-{outbound_job['call_id']}"
@@ -1416,15 +1483,28 @@ async def entrypoint(ctx: JobContext) -> None:
         nonlocal current_speech_handle
         current_speech_handle = ev.speech_handle
 
-    async def log_usage() -> None:
+    async def log_usage(_reason: str = "") -> None:
         logger.info("Usage: %s", session.usage)
 
-    ctx.add_shutdown_callback(log_usage)
+    shutdown_finalizers.append(log_usage)
 
     if managed_job and insights_session_id:
         async def finalize_insights(reason: str) -> None:
             await _cancel_task(console_task)
             try:
+                insights_status = (
+                    "failed"
+                    if "failed" in reason.lower() or "rejected" in reason.lower()
+                    else "completed"
+                )
+                if outbound_job:
+                    shutdown_status, _ = _outbound_shutdown_transition(
+                        answered=outbound_call_answered,
+                        reason=reason,
+                    )
+                    insights_status = (
+                        "completed" if shutdown_status == "completed" else "failed"
+                    )
                 await _insights_record_session_usage(
                     managed_job, insights_session_id, str(session.usage)
                 )
@@ -1437,7 +1517,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 await _insights_close_session(
                     managed_job,
                     insights_session_id,
-                    "failed" if "failed" in reason.lower() or "rejected" in reason.lower() else "completed",
+                    insights_status,
                 )
             except Exception:
                 logger.exception(
@@ -1445,7 +1525,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     insights_session_id,
                 )
 
-        ctx.add_shutdown_callback(finalize_insights)
+        shutdown_finalizers.append(finalize_insights)
 
     if managed_job:
         async def finalize_telephony_call(reason: str) -> None:
@@ -1485,9 +1565,17 @@ async def entrypoint(ctx: JobContext) -> None:
             if telephony_terminal:
                 return
             try:
+                final_status = "completed"
+                failure_code = ""
+                if str(managed_job.get("direction") or "") == "outbound":
+                    final_status, failure_code = _outbound_shutdown_transition(
+                        answered=outbound_call_answered,
+                        reason=reason,
+                    )
                 await _telephony_transition(
                     managed_job,
-                    "completed",
+                    final_status,
+                    failure_code=failure_code,
                     failure_detail=reason[:500],
                 )
                 telephony_terminal = True
@@ -1497,7 +1585,17 @@ async def entrypoint(ctx: JobContext) -> None:
                     managed_job["call_id"],
                 )
 
-        ctx.add_shutdown_callback(finalize_telephony_call)
+        shutdown_finalizers.append(finalize_telephony_call)
+
+    async def finalize_job(reason: str) -> None:
+        try:
+            # Persist call state and stop the lease before slower Insights writes.
+            for finalizer in reversed(shutdown_finalizers):
+                await finalizer(reason)
+        finally:
+            await _close_telephony_control_client()
+
+    ctx.add_shutdown_callback(finalize_job)
 
     await session.start(
         agent=PhoneAgent(
@@ -1575,7 +1673,7 @@ async def entrypoint(ctx: JobContext) -> None:
             heartbeat_task = asyncio.create_task(_telephony_heartbeat(outbound_job))
 
             async def dial_and_activate() -> None:
-                nonlocal call_active
+                nonlocal call_active, outbound_call_answered
                 participant = await ctx.api.sip.create_sip_participant(
                     api.CreateSIPParticipantRequest(
                         room_name=ctx.room.name,
@@ -1610,6 +1708,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     room_name=ctx.room.name,
                 )
                 call_active = True
+                outbound_call_answered = True
 
             amd_enabled = os.getenv("QWEN_AMD_ENABLED", "true").strip().lower() in {
                 "1", "true", "yes", "on"

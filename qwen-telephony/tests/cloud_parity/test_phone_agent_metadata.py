@@ -50,6 +50,27 @@ def test_phone_agent_rejects_tampered_dispatch_metadata(monkeypatch) -> None:
         phone_agent._outbound_job("enc:v1:not-a-valid-fernet-token")
 
 
+def test_phone_agent_heartbeat_stays_safely_inside_lease() -> None:
+    assert phone_agent._telephony_heartbeat_interval(
+        {"heartbeat_seconds": 10, "lease_seconds": 10}
+    ) == pytest.approx(10 / 3)
+    assert phone_agent._telephony_heartbeat_interval(
+        {"heartbeat_seconds": 2, "lease_seconds": 30}
+    ) == 2
+
+
+def test_phone_agent_shutdown_does_not_complete_unanswered_call() -> None:
+    assert phone_agent._outbound_shutdown_transition(
+        answered=False, reason="worker shutdown"
+    ) == ("reconciling", "agent_shutdown_before_answer")
+    assert phone_agent._outbound_shutdown_transition(
+        answered=True, reason="participant disconnected"
+    ) == ("completed", "")
+    assert phone_agent._outbound_shutdown_transition(
+        answered=True, reason="worker shutdown"
+    ) == ("failed", "agent_runtime_terminated")
+
+
 def test_phone_agent_executes_console_dtmf_and_say_commands() -> None:
     sent: list[tuple[int, str]] = []
     spoken: list[str] = []

@@ -110,6 +110,10 @@ class DispatcherSettings:
             raise ValueError("CLOUD_PARITY_TELEPHONY_CLAIM_BATCH must be between 1 and 100")
         if not 0.1 <= self.poll_seconds <= 60:
             raise ValueError("CLOUD_PARITY_TELEPHONY_POLL_SECONDS must be between 0.1 and 60")
+        if not 1 <= self.heartbeat_seconds <= 60:
+            raise ValueError(
+                "CLOUD_PARITY_TELEPHONY_HEARTBEAT_SECONDS must be between 1 and 60"
+            )
         if not 30 <= self.reconciliation_grace_seconds <= 3600:
             raise ValueError(
                 "CLOUD_PARITY_TELEPHONY_RECONCILIATION_GRACE_SECONDS must be between 30 and 3600"
@@ -342,6 +346,10 @@ async def dispatch_call(
         "dispatching",
         room_name=room_name,
     )
+    lease_seconds = max(10.0, float(call.get("lease_seconds") or 30))
+    heartbeat_seconds = max(
+        1.0, min(float(settings.heartbeat_seconds), lease_seconds / 3.0)
+    )
     metadata = json.dumps(
         {
             "kind": "telephony.outbound",
@@ -352,7 +360,8 @@ async def dispatch_call(
             "phone_number": call["destination_number"],
             "source_number": call.get("source_number") or "",
             "livekit_trunk_id": trunk_id,
-            "heartbeat_seconds": settings.heartbeat_seconds,
+            "heartbeat_seconds": heartbeat_seconds,
+            "lease_seconds": lease_seconds,
             "recording_mode": call.get("recording_mode") or "off",
             "recording_disclosure_text": call.get("recording_disclosure_text") or "",
         },

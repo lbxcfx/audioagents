@@ -90,6 +90,14 @@ class ScriptFirstLLM(lk_llm.LLM):
         self._enabled = _env_enabled(os.getenv("QWEN_NLU_ENABLED"), True) if enabled is None else enabled
         self._timeout = timeout
         self._on_dialogue_result = on_dialogue_result
+        self._client = httpx.AsyncClient(
+            timeout=self._timeout,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
 
     @property
     def model(self) -> str:
@@ -100,7 +108,10 @@ class ScriptFirstLLM(lk_llm.LLM):
         return "dialogue-service"
 
     async def aclose(self) -> None:
-        await self._upstream.aclose()
+        try:
+            await self._client.aclose()
+        finally:
+            await self._upstream.aclose()
 
     def chat(
         self,
@@ -115,6 +126,7 @@ class ScriptFirstLLM(lk_llm.LLM):
         return ScriptFirstLLMStream(
             self,
             upstream=self._upstream,
+            client=self._client,
             enabled=self._enabled,
             dialogue_url=self._dialogue_url,
             session_id=self._session_id,
@@ -136,6 +148,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
         llm: ScriptFirstLLM,
         *,
         upstream: lk_llm.LLM,
+        client: httpx.AsyncClient,
         enabled: bool,
         dialogue_url: str,
         session_id: str,
@@ -151,6 +164,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
     ) -> None:
         super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._upstream = upstream
+        self._client = client
         self._enabled = enabled
         self._dialogue_url = dialogue_url
         self._session_id = session_id
@@ -165,19 +179,18 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
         text = latest_user_text(self._chat_ctx).strip()
         if self._enabled and text:
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.post(
-                        self._dialogue_url,
-                        headers=_dialogue_service_headers(),
-                        json={
-                            "session_id": self._session_id,
-                            "scene_id": self._scene_id,
-                            "text": text,
-                            "channel": "livekit_voice",
-                        },
-                    )
-                    response.raise_for_status()
-                    result = response.json()
+                response = await self._client.post(
+                    self._dialogue_url,
+                    headers=_dialogue_service_headers(),
+                    json={
+                        "session_id": self._session_id,
+                        "scene_id": self._scene_id,
+                        "text": text,
+                        "channel": "livekit_voice",
+                    },
+                )
+                response.raise_for_status()
+                result = response.json()
                 if result.get("handled") and result.get("text"):
                     _register_result_audio(str(result["text"]), result, self._dialogue_url)
                     await self._emit_fixed_reply(result["text"], result)
