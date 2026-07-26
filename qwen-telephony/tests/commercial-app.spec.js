@@ -38,6 +38,10 @@ async function authenticateAndMock(page) {
     }
     return route.fulfill({ json: { items: [{ id: "project-1", name: "Commercial", slug: "commercial", role: "owner", retention_days: 30 }] } });
   });
+  await page.route("**/api/platform/deployment-capabilities", (route) => route.fulfill({ json: {
+    build: { enabled: false, driver: "disabled", source_ref_kind: "unavailable", message: "构建驱动未启用，请通过受信任的 CI/CD 发布镜像" },
+    runtime: { enabled: false, driver: "control-plane", supports_instances: false, supports_logs: false, message: "自助发布驱动未启用，当前生产工作负载由外部发布流程管理" },
+  } }));
   await page.route("**/api/platform/projects/project-1/telephony/metrics", (route) => route.fulfill({ json: { states: { "outbound.queued": 7, "inbound.active": 2 }, queue_depth: 7, active_calls: 2, stale_leases: 0, attempts: { total: 20, completed: 18, failed: 2 } } }));
   await page.route(/\/telephony\/calls\?limit=500$/, (route) => route.fulfill({ json: { items: [call] } }));
   await page.route(/\/telephony\/contacts\?.*$/, (route) => route.fulfill({ json: { items: [{ id: "contact-1", external_id: "crm-1", name: "测试客户", phone_number: "+86138****0001", status: "active", updated_at: "2026-07-25T09:00:00Z" }], next_cursor: null } }));
@@ -137,6 +141,29 @@ test("compliance, analytics, agent and integration modules render real API data"
   await page.getByRole("button", { name: "模型与集成" }).click();
   await expect(page.locator(".commercial-list strong", { hasText: "qwen/primary · llm" })).toBeVisible();
   await expect(page.getByText("website · support")).toBeVisible();
+});
+
+test("deployment capabilities fail closed and inference uses the selected route contract", async ({ page }) => {
+  await authenticateAndMock(page);
+  let inferencePayload = null;
+  await page.route("**/api/platform/projects/project-1/inference", (route) => {
+    inferencePayload = route.request().postDataJSON();
+    return route.fulfill({ json: { descriptor: "qwen/primary", modality: "llm", output: { text: "ok" } } });
+  });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Agent 与部署" }).click();
+  await expect(page.getByRole("button", { name: "构建", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "部署", exact: true })).toBeDisabled();
+  await expect(page.getByText(/受信任的 CI\/CD/)).toBeVisible();
+
+  await page.getByRole("button", { name: "模型与集成" }).click();
+  const testForm = page.locator("form", { has: page.getByRole("heading", { name: "受控模型调用测试" }) });
+  await expect(testForm.locator('input[value="LLM"]')).toBeVisible();
+  await expect(testForm.locator('textarea[name="input"]')).toContainText('"messages"');
+  await testForm.getByRole("button", { name: "执行测试" }).click();
+  await expect.poll(() => inferencePayload?.modality).toBe("llm");
+  expect(inferencePayload.input.messages[0].content).toBe("你好");
 });
 
 test("production navigation hides replica-only modules and viewer actions are disabled", async ({ page }) => {

@@ -54,6 +54,11 @@ SecretResolver = Callable[[str], dict[str, str]]
 class DockerRuntimeExecutor:
     """Blue/green Docker runtime with health gating and SIGTERM-based draining."""
 
+    driver_name = "docker"
+    enabled = True
+    supports_instances = True
+    supports_logs = True
+
     def __init__(
         self,
         store: PlatformStore,

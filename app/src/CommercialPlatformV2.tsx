@@ -200,6 +200,16 @@ type InferenceRoute = {
   enabled: boolean;
   config: JsonObject;
 };
+type DeploymentCapabilities = {
+  build: { enabled: boolean; driver: string; source_ref_kind: string; message: string };
+  runtime: {
+    enabled: boolean;
+    driver: string;
+    supports_instances: boolean;
+    supports_logs: boolean;
+    message: string;
+  };
+};
 type Tab =
   | "overview"
   | "calls"
@@ -218,6 +228,22 @@ const emptyMetrics: Metrics = {
   active_calls: 0,
   stale_leases: 0,
   attempts: { total: 0, completed: 0, failed: 0 },
+};
+
+const unavailableDeploymentCapabilities: DeploymentCapabilities = {
+  build: {
+    enabled: false,
+    driver: "unavailable",
+    source_ref_kind: "unavailable",
+    message: "无法确认构建能力，已安全禁用",
+  },
+  runtime: {
+    enabled: false,
+    driver: "unavailable",
+    supports_instances: false,
+    supports_logs: false,
+    message: "无法确认运行时发布能力，已安全禁用",
+  },
 };
 
 const tabLabels: Record<Tab, string> = {
@@ -241,6 +267,16 @@ function errorMessage(value: unknown): string {
   return value instanceof Error ? value.message : "操作失败，请稍后重试";
 }
 
+class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 function displayTime(value?: string): string {
   if (!value) return "—";
   const parsed = new Date(value);
@@ -259,6 +295,32 @@ function parseJson(value: FormDataEntryValue | null, fallback: JsonObject = {}):
     throw new Error("JSON 配置必须是对象");
   }
   return parsed as JsonObject;
+}
+
+function inferenceInputExample(modality: string): JsonObject {
+  if (modality === "stt") {
+    return { audio_base64: "", mime_type: "audio/wav", duration_seconds: 0 };
+  }
+  if (modality === "tts") return { text: "你好" };
+  return { messages: [{ role: "user", content: "你好" }] };
+}
+
+function validateInferenceInput(modality: string, input: JsonObject): void {
+  if (modality === "llm" && (!Array.isArray(input.messages) || input.messages.length === 0)) {
+    throw new Error("LLM 输入必须包含非空 messages 数组");
+  }
+  if (modality === "stt") {
+    const audioBase64 = input.audio_base64;
+    if (typeof audioBase64 !== "string") {
+      throw new Error("STT 输入必须包含 audio_base64 字符串");
+    }
+    if (!audioBase64.trim()) {
+      throw new Error("请填写不含 data URL 前缀的 Base64 音频");
+    }
+  }
+  if (modality === "tts" && (typeof input.text !== "string" || !input.text.trim())) {
+    throw new Error("TTS 输入必须包含非空 text 字符串");
+  }
 }
 
 function csvRows(input: string): string[][] {
@@ -353,6 +415,10 @@ export default function CommercialPlatformV2({
   const [embedConfigs, setEmbedConfigs] = useState<EmbedConfig[]>([]);
   const [inferenceRoutes, setInferenceRoutes] = useState<InferenceRoute[]>([]);
   const [inferenceResult, setInferenceResult] = useState<JsonObject | null>(null);
+  const [selectedInferenceRouteId, setSelectedInferenceRouteId] = useState("");
+  const [deploymentCapabilities, setDeploymentCapabilities] = useState<DeploymentCapabilities>(
+    unavailableDeploymentCapabilities,
+  );
   const [contactSearch, setContactSearch] = useState("");
   const [contactPage, setContactPage] = useState(1);
   const [contactCursor, setContactCursor] = useState("");
@@ -416,7 +482,7 @@ export default function CommercialPlatformV2({
         } catch {
           // Preserve the HTTP status if an upstream proxy did not return JSON.
         }
-        throw new Error(detail);
+        throw new ApiError(response.status, detail);
       }
       if (response.status === 204) return {} as T;
       const text = await response.text();
@@ -427,8 +493,11 @@ export default function CommercialPlatformV2({
   const optional = useCallback(async <T,>(path: string, fallback: T): Promise<T> => {
     try {
       return await request<T>(path);
-    } catch {
-      return fallback;
+    } catch (value) {
+      if (value instanceof ApiError && (value.status === 403 || value.status === 404)) {
+        return fallback;
+      }
+      throw value;
     }
   }, [request]);
 
@@ -443,6 +512,11 @@ export default function CommercialPlatformV2({
   const canManage = role === "owner" || role === "admin";
   const canAgentWrite = role === "owner" || role === "admin" || role === "member";
   const canConsole = role === "owner" || role === "admin" || role === "member";
+  const enabledInferenceRoutes = inferenceRoutes.filter((route) => route.enabled);
+  const selectedInferenceRoute =
+    enabledInferenceRoutes.find((route) => route.id === selectedInferenceRouteId)
+    || enabledInferenceRoutes[0]
+    || null;
 
   const loadProjects = useCallback(async () => {
     if (!auth) return;
@@ -551,6 +625,10 @@ export default function CommercialPlatformV2({
         optional<{ items: SecretRecord[] }>(`${prefix}/secrets`, { items: [] }),
         optional<{ items: EmbedConfig[] }>(`${prefix}/embed-configs`, { items: [] }),
         optional<{ items: InferenceRoute[] }>(`${prefix}/inference/routes`, { items: [] }),
+        optional<DeploymentCapabilities>(
+          "/api/platform/deployment-capabilities",
+          unavailableDeploymentCapabilities,
+        ),
       ]);
       if (projectIdRef.current !== requestedProjectId) return;
       setMembers(results[0].items);
@@ -568,6 +646,7 @@ export default function CommercialPlatformV2({
       setSecrets(results[11].items);
       setEmbedConfigs(results[12].items);
       setInferenceRoutes(results[13].items);
+      setDeploymentCapabilities(results[14]);
     } catch (value) {
       if (projectIdRef.current === requestedProjectId) setError(errorMessage(value));
     } finally {
@@ -1214,6 +1293,10 @@ export default function CommercialPlatformV2({
 
   async function buildAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!deploymentCapabilities.build.enabled) {
+      setError(deploymentCapabilities.build.message);
+      return;
+    }
     const form = event.currentTarget;
     const data = formData(event);
     const agentId = String(data.agent_id);
@@ -1229,6 +1312,10 @@ export default function CommercialPlatformV2({
 
   async function createDeployment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!deploymentCapabilities.runtime.enabled) {
+      setError(deploymentCapabilities.runtime.message);
+      return;
+    }
     const form = event.currentTarget;
     const data = formData(event);
     await perform(async () => {
@@ -1247,6 +1334,10 @@ export default function CommercialPlatformV2({
 
   async function rolloutDeployment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!deploymentCapabilities.runtime.enabled) {
+      setError(deploymentCapabilities.runtime.message);
+      return;
+    }
     const data = formData(event);
     await perform(
       () => request(`/api/platform/projects/${projectId}/deployments/${data.deployment_id}/rollout`, {
@@ -1258,6 +1349,10 @@ export default function CommercialPlatformV2({
   }
 
   async function rollbackDeployment(deployment: Deployment) {
+    if (!deploymentCapabilities.runtime.enabled) {
+      setError(deploymentCapabilities.runtime.message);
+      return;
+    }
     if (!window.confirm(`确认回滚部署“${deployment.name}”？`)) return;
     await perform(
       () => request(`/api/platform/projects/${projectId}/deployments/${deployment.id}/rollback`, { method: "POST" }).then(() => undefined),
@@ -1323,12 +1418,18 @@ export default function CommercialPlatformV2({
     event.preventDefault();
     const data = formData(event);
     await perform(async () => {
+      const route = enabledInferenceRoutes.find(
+        (item) => item.id === String(data.route_id || ""),
+      );
+      if (!route) throw new Error("请选择已启用的推理路由");
+      const input = parseJson(data.input);
+      validateInferenceInput(route.modality, input);
       const result = await request<JsonObject>(`/api/platform/projects/${projectId}/inference`, {
         method: "POST",
         body: JSON.stringify({
-          descriptor: data.descriptor,
-          modality: data.modality,
-          input: parseJson(data.input),
+          descriptor: route.descriptor,
+          modality: route.modality,
+          input,
           parameters: parseJson(data.parameters),
           session_id: data.session_id || null,
         }),
@@ -1657,10 +1758,10 @@ export default function CommercialPlatformV2({
               </div>
               <div className="commercial-three-column">
                 <form className="commercial-panel commercial-form" onSubmit={createAgent}><div className="commercial-panel-title"><div><span>AGENT</span><h2>运行 Agent</h2></div></div><label>名称<input name="name" required /></label><label>说明<textarea name="description" rows={3} /></label><button className="commercial-primary" disabled={!canAgentWrite} type="submit">创建 Agent</button><div className="commercial-list compact">{agents.map((agent) => <button key={agent.id} onClick={() => loadVersions(agent.id)} type="button"><span><strong>{agent.name}</strong><small>{agent.status}</small></span></button>)}</div></form>
-                <form className="commercial-panel commercial-form" onSubmit={buildAgent}><div className="commercial-panel-title"><div><span>BUILD</span><h2>构建版本</h2></div></div><label>Agent<select name="agent_id" onChange={(event) => loadVersions(event.target.value)} required><option value="">请选择</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Source Ref<input name="source_ref" required placeholder="git+https://...#commit" /></label><label>Image Ref<input name="image_ref" required placeholder="registry.example.com/voice:v1" /></label><label>构建配置 JSON<textarea name="spec" defaultValue="{}" rows={4} /></label><button className="commercial-primary" disabled={!canAgentWrite} type="submit">构建</button><div className="commercial-list compact">{versions.map((version) => <article key={version.id}><div><strong>v{version.version_number}</strong><span>{version.image_ref}</span></div><small>{version.status}</small></article>)}</div></form>
-                <form className="commercial-panel commercial-form" onSubmit={createDeployment}><div className="commercial-panel-title"><div><span>DEPLOY</span><h2>创建部署</h2></div></div><label>部署名称<input name="name" required /></label><label>Agent<select name="agent_id" required><option value="">请选择</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Version ID<input name="version_id" list="version-ids" required /></label><datalist id="version-ids">{versions.map((version) => <option value={version.id} key={version.id}>v{version.version_number}</option>)}</datalist><label>副本数<input name="desired_replicas" type="number" defaultValue={1} min={0} max={100} /></label><button className="commercial-primary" disabled={!canAgentWrite} type="submit">部署</button></form>
+                <form className="commercial-panel commercial-form" onSubmit={buildAgent}><div className="commercial-panel-title"><div><span>BUILD</span><h2>构建版本</h2></div></div><label>Agent<select name="agent_id" onChange={(event) => loadVersions(event.target.value)} required><option value="">请选择</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Source Ref<input name="source_ref" required placeholder={deploymentCapabilities.build.source_ref_kind === "local_directory" ? "控制面可访问且包含 Dockerfile 的目录" : "由受信任的 CI/CD 提供"} /></label><label>Image Ref<input name="image_ref" required placeholder="registry.example.com/voice:v1" /></label><label>构建配置 JSON<textarea name="spec" defaultValue="{}" rows={4} /></label><button className="commercial-primary" disabled={busy || !canAgentWrite || !deploymentCapabilities.build.enabled} type="submit">构建</button><small>{deploymentCapabilities.build.message} · driver: {deploymentCapabilities.build.driver}</small><div className="commercial-list compact">{versions.map((version) => <article key={version.id}><div><strong>v{version.version_number}</strong><span>{version.image_ref}</span></div><small>{version.status}</small></article>)}</div></form>
+                <form className="commercial-panel commercial-form" onSubmit={createDeployment}><div className="commercial-panel-title"><div><span>DEPLOY</span><h2>创建部署</h2></div></div><label>部署名称<input name="name" required /></label><label>Agent<select name="agent_id" required><option value="">请选择</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Version ID<input name="version_id" list="version-ids" required /></label><datalist id="version-ids">{versions.map((version) => <option value={version.id} key={version.id}>v{version.version_number}</option>)}</datalist><label>副本数<input name="desired_replicas" type="number" defaultValue={1} min={0} max={100} /></label><button className="commercial-primary" disabled={busy || !canAgentWrite || !deploymentCapabilities.runtime.enabled} type="submit">部署</button><small>{deploymentCapabilities.runtime.message} · driver: {deploymentCapabilities.runtime.driver}</small></form>
               </div>
-              <section className="commercial-panel"><div className="commercial-panel-title"><div><span>DEPLOYMENTS</span><h2>生产部署</h2></div><b>{deployments.length}</b></div><form className="commercial-toolbar" onSubmit={rolloutDeployment}><select name="deployment_id" required><option value="">部署</option>{deployments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><input name="version_id" list="version-ids" placeholder="新 Version ID" required /><button disabled={!canAgentWrite} type="submit">滚动发布</button></form><div className="commercial-list">{deployments.map((deployment) => <article key={deployment.id}><div><strong>{deployment.name} · {deployment.status}</strong><span>副本 {deployment.desired_replicas} · active {deployment.active_version_id}</span><small>{displayTime(deployment.updated_at)}</small></div><div><button onClick={() => viewRuntime(deployment)} type="button">实例/日志</button><button disabled={!canAgentWrite || !deployment.previous_version_id} onClick={() => rollbackDeployment(deployment)} type="button">回滚</button></div></article>)}</div>{runtimeView ? <div className="commercial-two-column commercial-runtime"><div><h3>运行实例</h3><pre className="commercial-code">{pretty(runtimeView.instances)}</pre></div><div><h3>最近日志</h3><pre className="commercial-code">{pretty(runtimeView.logs)}</pre></div></div> : null}</section>
+              <section className="commercial-panel"><div className="commercial-panel-title"><div><span>DEPLOYMENTS</span><h2>部署记录</h2></div><b>{deployments.length}</b></div><form className="commercial-toolbar" onSubmit={rolloutDeployment}><select name="deployment_id" required><option value="">部署</option>{deployments.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><input name="version_id" list="version-ids" placeholder="新 Version ID" required /><button disabled={busy || !canAgentWrite || !deploymentCapabilities.runtime.enabled} type="submit">滚动发布</button></form><div className="commercial-list">{deployments.map((deployment) => <article key={deployment.id}><div><strong>{deployment.name} · {deployment.status}</strong><span>副本 {deployment.desired_replicas} · active {deployment.active_version_id || "—"}</span><small>{displayTime(deployment.updated_at)}</small></div><div><button disabled={!deploymentCapabilities.runtime.supports_instances || !deploymentCapabilities.runtime.supports_logs} onClick={() => viewRuntime(deployment)} type="button">实例/日志</button><button disabled={busy || !canAgentWrite || !deploymentCapabilities.runtime.enabled || !deployment.previous_version_id} onClick={() => rollbackDeployment(deployment)} type="button">回滚</button></div></article>)}</div>{runtimeView ? <div className="commercial-two-column commercial-runtime"><div><h3>运行实例</h3><pre className="commercial-code">{pretty(runtimeView.instances)}</pre></div><div><h3>最近日志</h3><pre className="commercial-code">{pretty(runtimeView.logs)}</pre></div></div> : null}</section>
             </div>
           ) : null}
 
@@ -1668,14 +1769,14 @@ export default function CommercialPlatformV2({
             <div className="commercial-stack">
               <div className="commercial-three-column">
                 <form className="commercial-panel commercial-form" onSubmit={saveSecret}><div className="commercial-panel-title"><div><span>SECRETS</span><h2>运行密钥</h2></div></div><label>名称<input name="name" required pattern="[A-Za-z_][A-Za-z0-9_]*" /></label><label>值<input name="value" type="password" autoComplete="new-password" required /></label><button className="commercial-primary" disabled={!canManage} type="submit">加密保存</button><small>密钥值不会从 API 返回。</small><div className="commercial-list compact">{secrets.map((secret) => <article key={secret.name}><strong>{secret.name}</strong><small>{displayTime(secret.updated_at)}</small></article>)}</div></form>
-                <form className="commercial-panel commercial-form" onSubmit={saveInferenceRoute}><div className="commercial-panel-title"><div><span>INFERENCE</span><h2>模型路由</h2></div></div><label>Descriptor<input name="descriptor" required placeholder="qwen/primary" /></label><div className="commercial-inline"><label>模态<select name="modality"><option value="llm">LLM</option><option value="stt">STT</option><option value="tts">TTS</option></select></label><label>优先级<input name="priority" type="number" defaultValue={100} min={0} /></label></div><label>Provider<input name="provider" required /></label><label>Provider Model<input name="provider_model" required /></label><label>超时秒<input name="timeout_seconds" type="number" defaultValue={30} min={1} max={300} /></label><label>配置 JSON<textarea name="config" defaultValue="{}" rows={3} /></label><label className="commercial-check"><input name="enabled" type="checkbox" defaultChecked /> 启用</label><button className="commercial-primary" disabled={!canManage} type="submit">保存路由</button></form>
+                <form className="commercial-panel commercial-form" onSubmit={saveInferenceRoute}><div className="commercial-panel-title"><div><span>INFERENCE</span><h2>模型路由</h2></div></div><label>Descriptor<input name="descriptor" required placeholder="qwen/primary" /></label><div className="commercial-inline"><label>模态<select name="modality"><option value="llm">LLM</option><option value="stt">STT</option><option value="tts">TTS</option></select></label><label>优先级<input name="priority" type="number" defaultValue={100} min={0} /></label></div><label>Provider<select name="provider" defaultValue="qwen" required><option value="qwen">qwen</option></select></label><label>Provider Model<input name="provider_model" required /></label><label>超时秒<input name="timeout_seconds" type="number" defaultValue={30} min={1} max={300} /></label><label>配置 JSON<textarea name="config" defaultValue="{}" rows={3} /></label><label className="commercial-check"><input name="enabled" type="checkbox" defaultChecked /> 启用</label><button className="commercial-primary" disabled={!canManage} type="submit">保存路由</button></form>
                 <form className="commercial-panel commercial-form" onSubmit={saveEmbedConfig}><div className="commercial-panel-title"><div><span>EMBED</span><h2>网页语音组件</h2></div></div><label>配置名称<input name="name" required /></label><label>Agent 名称<input name="agent_name" required /></label><label>Room 前缀<input name="room_prefix" defaultValue="embed" required /></label><label>允许来源<textarea name="allowed_origins" required placeholder="https://www.example.com" rows={3} /></label><div className="commercial-check-row"><label className="commercial-check"><input name="audio" type="checkbox" defaultChecked /> 音频</label><label className="commercial-check"><input name="text" type="checkbox" defaultChecked /> 文本</label><label className="commercial-check"><input name="video" type="checkbox" /> 视频</label><label className="commercial-check"><input name="enabled" type="checkbox" defaultChecked /> 启用</label></div><button className="commercial-primary" disabled={!canManage} type="submit">创建配置</button></form>
               </div>
               <div className="commercial-two-column">
                 <section className="commercial-panel"><div className="commercial-panel-title"><div><span>ROUTES</span><h2>推理路由</h2></div><b>{inferenceRoutes.length}</b></div><div className="commercial-list">{inferenceRoutes.map((route) => <article key={route.id || `${route.descriptor}-${route.modality}`}><div><strong>{route.descriptor} · {route.modality}</strong><span>{route.provider}/{route.provider_model}</span><small>优先级 {route.priority} · {route.timeout_seconds}s</small></div><i className={`commercial-status ${route.enabled ? "active" : "disabled"}`}>{route.enabled ? "enabled" : "disabled"}</i></article>)}</div></section>
                 <section className="commercial-panel"><div className="commercial-panel-title"><div><span>EMBED CONFIGS</span><h2>嵌入配置</h2></div><b>{embedConfigs.length}</b></div><div className="commercial-list">{embedConfigs.map((config) => <article key={config.id}><div><strong>{config.name} · {config.agent_name}</strong><span>{config.allowed_origins.join(", ")}</span><code>{`<qwen-voice-agent config-id="${config.id}"></qwen-voice-agent>`}</code></div><div><i className={`commercial-status ${config.enabled ? "active" : "disabled"}`}>{config.enabled ? "enabled" : "disabled"}</i><button disabled={!canManage} onClick={() => toggleEmbedConfig(config)} type="button">{config.enabled ? "停用" : "启用"}</button></div></article>)}</div></section>
               </div>
-              <form className="commercial-panel commercial-form" onSubmit={invokeInference}><div className="commercial-panel-title"><div><span>INFERENCE TEST</span><h2>受控模型调用测试</h2></div></div><div className="commercial-form-grid"><label>Descriptor<select name="descriptor" required><option value="">请选择</option>{inferenceRoutes.filter((route) => route.enabled).map((route) => <option value={route.descriptor} key={`${route.descriptor}-${route.modality}`}>{route.descriptor} · {route.modality}</option>)}</select></label><label>模态<select name="modality"><option value="llm">LLM</option><option value="stt">STT</option><option value="tts">TTS</option></select></label><label>Session ID<input name="session_id" /></label><label>参数 JSON<textarea name="parameters" defaultValue="{}" rows={4} /></label><label className="full">输入 JSON<textarea name="input" defaultValue={pretty({ text: "你好" })} rows={6} required /></label></div><button className="commercial-primary" disabled={!canOperate || !inferenceRoutes.length} type="submit">执行测试</button>{inferenceResult ? <pre className="commercial-code">{pretty(inferenceResult)}</pre> : null}</form>
+              <form className="commercial-panel commercial-form" onSubmit={invokeInference}><div className="commercial-panel-title"><div><span>INFERENCE TEST</span><h2>受控模型调用测试</h2></div></div><div className="commercial-form-grid"><label>Descriptor<select name="route_id" value={selectedInferenceRoute?.id || ""} onChange={(event) => setSelectedInferenceRouteId(event.target.value)} required><option value="">请选择</option>{enabledInferenceRoutes.map((route) => <option value={route.id} key={route.id}>{route.descriptor} · {route.modality}</option>)}</select></label><label>模态<input value={selectedInferenceRoute?.modality.toUpperCase() || "—"} readOnly /></label><label>Session ID<input name="session_id" /></label><label>参数 JSON<textarea name="parameters" defaultValue="{}" rows={4} /></label><label className="full">输入 JSON<textarea name="input" key={selectedInferenceRoute?.modality || "none"} defaultValue={pretty(inferenceInputExample(selectedInferenceRoute?.modality || "llm"))} rows={6} required /></label></div><button className="commercial-primary" disabled={!canOperate || !enabledInferenceRoutes.length} type="submit">执行测试</button>{inferenceResult ? <pre className="commercial-code">{pretty(inferenceResult)}</pre> : null}</form>
             </div>
           ) : null}
 

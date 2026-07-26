@@ -37,7 +37,12 @@ from .cloud_parity.builder_api import create_builder_router
 from .cloud_parity.config import PlatformSettings
 from .cloud_parity.console import ConsoleService
 from .cloud_parity.console_api import create_console_router
-from .cloud_parity.deployment import DeploymentService, SecretCipher
+from .cloud_parity.deployment import (
+    DeploymentService,
+    DisabledBuildExecutor,
+    DockerBuildExecutor,
+    SecretCipher,
+)
 from .cloud_parity.deployment_api import create_deployment_router
 from .cloud_parity.embed import EmbedService
 from .cloud_parity.embed_api import create_embed_router
@@ -89,7 +94,19 @@ console_service = ConsoleService(platform_store, insights_service)
 platform_cipher = SecretCipher.load_or_create(
     platform_settings.database_path.with_name("cloud-parity.key")
 )
-deployment_service = DeploymentService(platform_store, platform_cipher)
+build_driver = os.getenv(
+    "CLOUD_PARITY_BUILD_DRIVER",
+    "docker" if platform_settings.environment in {"development", "test"} else "disabled",
+).strip().lower()
+if build_driver not in {"disabled", "docker"}:
+    raise ValueError("CLOUD_PARITY_BUILD_DRIVER must be disabled or docker")
+deployment_service = DeploymentService(
+    platform_store,
+    platform_cipher,
+    build_executor=(
+        DockerBuildExecutor() if build_driver == "docker" else DisabledBuildExecutor()
+    ),
+)
 docker_runtime = DockerRuntimeExecutor(
     platform_store,
     deployment_service.resolve_secrets,
@@ -97,7 +114,10 @@ docker_runtime = DockerRuntimeExecutor(
     health_timeout_seconds=float(os.getenv("CLOUD_PARITY_HEALTH_TIMEOUT_SECONDS", "60")),
     drain_timeout_seconds=int(os.getenv("CLOUD_PARITY_DRAIN_TIMEOUT_SECONDS", "3600")),
 )
-if os.getenv("CLOUD_PARITY_RUNTIME_DRIVER", "control-plane").lower() == "docker":
+runtime_driver = os.getenv("CLOUD_PARITY_RUNTIME_DRIVER", "control-plane").strip().lower()
+if runtime_driver not in {"control-plane", "docker"}:
+    raise ValueError("CLOUD_PARITY_RUNTIME_DRIVER must be control-plane or docker")
+if runtime_driver == "docker":
     deployment_service.runtime_executor = docker_runtime
 builder_service = BuilderService(platform_store)
 embed_service = EmbedService(

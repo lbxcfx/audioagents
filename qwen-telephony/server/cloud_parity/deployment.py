@@ -34,8 +34,16 @@ class RuntimeExecutor(Protocol):
     def rollout(self, deployment: dict[str, Any], version: dict[str, Any]) -> RolloutOutcome: ...
 
 
+class DeploymentDriverUnavailableError(RuntimeError):
+    """Raised when an operator-facing deployment action has no active driver."""
+
+
 class DockerBuildExecutor:
     """BuildKit-compatible local Docker adapter used by the MVP API."""
+
+    driver_name = "docker"
+    enabled = True
+    source_ref_kind = "local_directory"
 
     def build(self, source_ref: str, image_ref: str) -> BuildOutcome:
         source = Path(source_ref).resolve()
@@ -55,8 +63,27 @@ class DockerBuildExecutor:
         return BuildOutcome(result.returncode == 0, logs=logs, error="" if result.returncode == 0 else logs[-4000:])
 
 
+class DisabledBuildExecutor:
+    """Fail-closed production default when no isolated image builder is configured."""
+
+    driver_name = "disabled"
+    enabled = False
+    source_ref_kind = "unavailable"
+
+    def build(self, source_ref: str, image_ref: str) -> BuildOutcome:
+        return BuildOutcome(
+            False,
+            error="image build driver is disabled; publish an image through the release pipeline",
+        )
+
+
 class ControlPlaneRuntimeExecutor:
     """Safe default: records a staged release until a Docker/Kubernetes driver is configured."""
+
+    driver_name = "control-plane"
+    enabled = False
+    supports_instances = False
+    supports_logs = False
 
     def rollout(self, deployment: dict[str, Any], version: dict[str, Any]) -> RolloutOutcome:
         return RolloutOutcome(
@@ -112,6 +139,50 @@ class DeploymentService:
         self.cipher = cipher
         self.build_executor = build_executor or DockerBuildExecutor()
         self.runtime_executor = runtime_executor or ControlPlaneRuntimeExecutor()
+
+    def capabilities(self) -> dict[str, Any]:
+        build_enabled = bool(getattr(self.build_executor, "enabled", True))
+        runtime_enabled = bool(getattr(self.runtime_executor, "enabled", True))
+        return {
+            "build": {
+                "enabled": build_enabled,
+                "driver": str(
+                    getattr(self.build_executor, "driver_name", type(self.build_executor).__name__)
+                ),
+                "source_ref_kind": str(
+                    getattr(self.build_executor, "source_ref_kind", "driver_defined")
+                ),
+                "message": (
+                    "构建驱动已启用"
+                    if build_enabled
+                    else "构建驱动未启用，请通过受信任的 CI/CD 发布镜像"
+                ),
+            },
+            "runtime": {
+                "enabled": runtime_enabled,
+                "driver": str(
+                    getattr(self.runtime_executor, "driver_name", type(self.runtime_executor).__name__)
+                ),
+                "supports_instances": bool(
+                    getattr(self.runtime_executor, "supports_instances", runtime_enabled)
+                ),
+                "supports_logs": bool(
+                    getattr(self.runtime_executor, "supports_logs", runtime_enabled)
+                ),
+                "message": (
+                    "运行时发布驱动已启用"
+                    if runtime_enabled
+                    else "自助发布驱动未启用，当前生产工作负载由外部发布流程管理"
+                ),
+            },
+        }
+
+    @staticmethod
+    def _require_driver(driver: Any, operation: str) -> None:
+        if not bool(getattr(driver, "enabled", True)):
+            raise DeploymentDriverUnavailableError(
+                f"{operation} driver is not configured"
+            )
 
     def create_agent(
         self, *, project_id: str, actor_id: str, name: str, description: str = ""
@@ -199,6 +270,7 @@ class DeploymentService:
         spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.store.require_permission(project_id, actor_id, "project.manage")
+        self._require_driver(self.build_executor, "image build")
         build_id = str(uuid.uuid4())
         now = _utc_now()
         with self.store.transaction() as conn:
@@ -283,6 +355,7 @@ class DeploymentService:
         desired_replicas: int = 1,
     ) -> dict[str, Any]:
         self.store.require_permission(project_id, actor_id, "project.manage")
+        self._require_driver(self.runtime_executor, "runtime deployment")
         if not 0 <= desired_replicas <= 100:
             raise ValueError("desired_replicas must be between 0 and 100")
         deployment_id = str(uuid.uuid4())
@@ -316,6 +389,7 @@ class DeploymentService:
         operation: str = "rollout",
     ) -> dict[str, Any]:
         self.store.require_permission(project_id, actor_id, "project.manage")
+        self._require_driver(self.runtime_executor, "runtime deployment")
         revision_id = str(uuid.uuid4())
         now = _utc_now()
         with self.store.transaction() as conn:

@@ -266,6 +266,16 @@ class InferenceGateway:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         self.store.require_permission(project_id, actor_id, "inference.invoke")
+        if modality == "llm":
+            messages = input_data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("LLM input requires a non-empty messages list")
+        elif modality == "stt":
+            if not str(input_data.get("audio_base64") or "").strip():
+                raise ValueError("STT input requires audio_base64")
+        elif modality == "tts":
+            if not str(input_data.get("text") or "").strip():
+                raise ValueError("TTS input requires text")
         routes = self._resolve_routes(project_id, descriptor, modality)
         credentials = self.deployment.resolve_secrets(project_id)
         errors: list[dict[str, str]] = []

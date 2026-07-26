@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .api import _translate_error
 from .auth import require_user_id
-from .deployment import DeploymentService
+from .deployment import DeploymentDriverUnavailableError, DeploymentService
 
 
 class AgentCreate(BaseModel):
@@ -38,6 +38,12 @@ class SecretPut(BaseModel):
 
 def create_deployment_router(service: DeploymentService) -> APIRouter:
     router = APIRouter(prefix="/api/platform", tags=["cloud-parity-deployment"])
+
+    @router.get("/deployment-capabilities")
+    def deployment_capabilities(
+        _x_user_id: str = Depends(require_user_id),
+    ) -> dict:
+        return service.capabilities()
 
     @router.post("/projects/{project_id}/agents", status_code=201)
     def create_agent(
@@ -88,6 +94,8 @@ def create_deployment_router(service: DeploymentService) -> APIRouter:
                 agent_id=agent_id,
                 **payload.model_dump(),
             )
+        except DeploymentDriverUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise _translate_error(exc) from exc
 
@@ -101,6 +109,8 @@ def create_deployment_router(service: DeploymentService) -> APIRouter:
             return service.create_deployment(
                 project_id=project_id, actor_id=x_user_id, **payload.model_dump()
             )
+        except DeploymentDriverUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise _translate_error(exc) from exc
 
@@ -140,6 +150,8 @@ def create_deployment_router(service: DeploymentService) -> APIRouter:
                 deployment_id=deployment_id,
                 version_id=payload.version_id,
             )
+        except DeploymentDriverUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise _translate_error(exc) from exc
 
@@ -155,6 +167,8 @@ def create_deployment_router(service: DeploymentService) -> APIRouter:
                 actor_id=x_user_id,
                 deployment_id=deployment_id,
             )
+        except DeploymentDriverUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise _translate_error(exc) from exc
 

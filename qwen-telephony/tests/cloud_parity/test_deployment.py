@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -12,10 +14,14 @@ if str(PROJECT_DIR) not in sys.path:
 
 from server.cloud_parity.deployment import (
     BuildOutcome,
+    DeploymentDriverUnavailableError,
     DeploymentService,
+    DisabledBuildExecutor,
     RolloutOutcome,
     SecretCipher,
 )
+from server.cloud_parity.auth import DevelopmentAuthenticator, install_authenticator
+from server.cloud_parity.deployment_api import create_deployment_router
 from server.cloud_parity.store import PlatformStore
 
 
@@ -153,3 +159,68 @@ def test_secrets_are_encrypted_and_never_return_plaintext(deployment_stack) -> N
         stored = conn.execute("SELECT ciphertext FROM encrypted_secrets").fetchone()["ciphertext"]
     assert "very-secret-value" not in stored
     assert service.resolve_secrets(project["id"]) == {"QWEN_API_KEY": "very-secret-value"}
+
+
+def test_disabled_production_drivers_fail_closed_and_report_capabilities(
+    tmp_path: Path,
+) -> None:
+    store = PlatformStore(tmp_path / "disabled-deploy.sqlite3")
+    store.initialize()
+    project = store.create_project(name="Deploy", slug="disabled-deploy", owner_id="owner")
+    service = DeploymentService(
+        store,
+        SecretCipher.generate(),
+        build_executor=DisabledBuildExecutor(),
+    )
+    agent = service.create_agent(
+        project_id=project["id"], actor_id="owner", name="external-release-agent"
+    )
+
+    capabilities = service.capabilities()
+    assert capabilities["build"] == {
+        "enabled": False,
+        "driver": "disabled",
+        "source_ref_kind": "unavailable",
+        "message": "构建驱动未启用，请通过受信任的 CI/CD 发布镜像",
+    }
+    assert capabilities["runtime"]["enabled"] is False
+    assert capabilities["runtime"]["supports_instances"] is False
+    with pytest.raises(DeploymentDriverUnavailableError, match="image build"):
+        service.build_version(
+            project_id=project["id"],
+            actor_id="owner",
+            agent_id=agent["id"],
+            source_ref="/untrusted/source",
+            image_ref="registry/agent:v1",
+        )
+    with store.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS count FROM agent_builds").fetchone()
+    assert count["count"] == 0
+
+    app = FastAPI()
+    install_authenticator(app, DevelopmentAuthenticator())
+    app.include_router(create_deployment_router(service))
+    client = TestClient(app)
+    headers = {"X-User-ID": "owner"}
+    response = client.get("/api/platform/deployment-capabilities", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["build"]["enabled"] is False
+    response = client.post(
+        f"/api/platform/projects/{project['id']}/agents/{agent['id']}/builds",
+        headers=headers,
+        json={"source_ref": "/untrusted/source", "image_ref": "registry/agent:v1"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "image build driver is not configured"
+    response = client.post(
+        f"/api/platform/projects/{project['id']}/deployments",
+        headers=headers,
+        json={
+            "agent_id": agent["id"],
+            "version_id": "external-version",
+            "name": "production",
+            "desired_replicas": 3,
+        },
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "runtime deployment driver is not configured"

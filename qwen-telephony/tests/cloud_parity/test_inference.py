@@ -110,6 +110,31 @@ def test_missing_descriptor_is_rejected(gateway_stack) -> None:
         ))
 
 
+@pytest.mark.parametrize(
+    ("modality", "input_data", "message"),
+    [
+        ("llm", {"text": "wrong shape"}, "messages"),
+        ("stt", {"audio_base64": ""}, "audio_base64"),
+        ("tts", {"text": ""}, "text"),
+    ],
+)
+def test_invalid_inference_inputs_fail_before_provider_attempt(
+    gateway_stack, modality, input_data, message
+) -> None:
+    _, gateway, _, project, _, primary, _ = gateway_stack
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            gateway.invoke(
+                project_id=project["id"],
+                actor_id="owner",
+                descriptor="voice/default-llm",
+                modality=modality,
+                input_data=input_data,
+            )
+        )
+    assert primary.calls == []
+
+
 def test_route_configuration_is_project_scoped(gateway_stack) -> None:
     store, gateway, _, project, _, primary, _ = gateway_stack
     primary.fail = False

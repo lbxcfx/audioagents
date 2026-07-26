@@ -2,6 +2,8 @@
 
 本手册部署应用侧的四个无状态组件：商用 Web Console、Cloud-Parity 控制面、电话 Dispatcher 和 LiveKit Agent。PostgreSQL、LiveKit Server/SIP/Egress、对象存储、企业 IdP、入口 TLS/WAF、Prometheus/Alertmanager 由目标基础设施提供。
 
+清单默认将 `CLOUD_PARITY_BUILD_DRIVER=disabled`、`CLOUD_PARITY_RUNTIME_DRIVER=control-plane`：生产镜像及工作负载由受信任的 CI/CD 和本清单发布，Web Console 会显示该能力边界并禁用不能真正生效的自助构建/发布按钮。只有在隔离的构建节点上才可显式启用 `CLOUD_PARITY_BUILD_DRIVER=docker`；此驱动的 `source_ref` 是控制面主机可访问且包含 Dockerfile 的本地目录，不接受 Git URL。单机开发可用 `CLOUD_PARITY_RUNTIME_DRIVER=docker`，Kubernetes 生产环境不得把它误当作集群发布控制器。
+
 ## 1. 构建不可变镜像
 
 后端三个 Dockerfile 的构建上下文是 `agent` 目录；前端镜像的上下文是 `app`。使用提交哈希或发布版本作为不可变标签，不要在生产使用 `latest`。
