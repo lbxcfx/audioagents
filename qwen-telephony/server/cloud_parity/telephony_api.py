@@ -865,6 +865,14 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         participant = event.participant
         room = event.room
         attributes = dict(participant.attributes) if participant is not None else {}
+        participant_kind = ""
+        if participant is not None:
+            try:
+                participant_kind = livekit_api.ParticipantInfo.Kind.Name(
+                    int(participant.kind)
+                )
+            except (TypeError, ValueError):
+                participant_kind = str(participant.kind)
         created_at = (
             datetime.fromtimestamp(int(event.created_at), tz=timezone.utc)
             if int(event.created_at or 0) > 0
@@ -876,6 +884,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
             event_type=str(event.event),
             room_name=str(room.name) if room is not None else "",
             participant_identity=str(participant.identity) if participant is not None else "",
+            participant_kind=participant_kind,
             participant_metadata=str(participant.metadata) if participant is not None else "",
             attributes=attributes,
             disconnect_reason=(

@@ -843,6 +843,98 @@ def test_production_campaign_pause_resume_and_trunk_cps(telephony_stack) -> None
     assert len(second) == 1
 
 
+def test_encrypted_campaign_source_number_materializes_calls(telephony_stack) -> None:
+    store, _, project_id = telephony_stack
+    service = TelephonyService(store, phone_cipher=SecretCipher.generate())
+    trunk = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="encrypted-caller-id",
+        direction="outbound",
+        provider="carrier",
+        livekit_trunk_id="ST_encrypted",
+        numbers=["+8610000000000"],
+    )
+    contact = service.upsert_contact(
+        project_id=project_id,
+        user_id="owner",
+        external_id="encrypted-campaign-contact",
+        phone_number="+8613800000199",
+    )
+    campaign = service.create_campaign(
+        project_id=project_id,
+        user_id="owner",
+        name="Encrypted caller ID campaign",
+        agent_name="commercial-agent",
+        trunk_id=trunk["id"],
+        source_number="+8610000000000",
+    )
+    service.add_campaign_contacts(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        contact_ids=[contact["id"]],
+    )
+
+    started = service.set_campaign_status(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        status="running",
+    )
+
+    assert started["enqueue_result"] == {"queued": 1, "blocked": 0}
+    with store.connect() as conn:
+        raw = conn.execute(
+            "SELECT source_number FROM call_jobs WHERE campaign_id = ?",
+            (campaign["id"],),
+        ).fetchone()
+    assert raw is not None
+    assert str(raw["source_number"]).startswith("enc:v1:")
+
+
+def test_non_sip_participant_left_does_not_end_outbound_call(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+    _limits(service, project_id, total=2, outbound=2, inbound=2, rate=100)
+    queued = _enqueue(service, project_id, "observer-left", "+8613800000162")
+    leased = service.claim_outbound(
+        project_id=project_id,
+        user_id="owner",
+        worker_id="observer-worker",
+    )[0]
+    current = leased
+    for status in ("dispatching", "dialing", "active"):
+        current = service.transition_call(
+            project_id=project_id,
+            user_id="owner",
+            call_id=queued["id"],
+            worker_id="observer-worker",
+            lease_token=current["lease_token"],
+            status=status,
+            room_name="observer-room" if status == "dispatching" else "",
+        )
+
+    webhook = service.ingest_livekit_event(
+        event_id="observer-left-event",
+        event_type="participant_left",
+        room_name="observer-room",
+        participant_identity="supervisor-observer",
+        participant_kind="STANDARD",
+        participant_metadata='{"call_id":"' + queued["id"] + '"}',
+        disconnect_reason="CLIENT_INITIATED",
+    )
+
+    assert webhook["outcome"] == "observed"
+    call = service.get_call(
+        project_id=project_id, user_id="owner", call_id=queued["id"]
+    )
+    assert call["status"] == "active"
+    cdr = service.get_cdr(
+        project_id=project_id, user_id="owner", call_id=queued["id"]
+    )
+    assert cdr["ended_at"] is None
+
+
 def test_campaign_start_is_bounded_and_dispatcher_materializes_remainder(
     telephony_stack,
 ) -> None:

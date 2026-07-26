@@ -1278,7 +1278,7 @@ class TelephonyService:
                         user_id=user_id,
                         idempotency_key=f"campaign:{current_campaign_id}:{contact_id}",
                         destination_number=self._reveal_phone(contact["phone_number"]),
-                        source_number=str(contact["source_number"] or ""),
+                        source_number=self._reveal_phone(contact["source_number"]),
                         agent_name=str(contact["agent_name"]),
                         trunk_id=contact["trunk_id"],
                         campaign_id=current_campaign_id,
@@ -2764,6 +2764,7 @@ class TelephonyService:
         event_type: str,
         room_name: str = "",
         participant_identity: str = "",
+        participant_kind: str = "",
         participant_metadata: str = "",
         attributes: dict[str, Any] | None = None,
         disconnect_reason: str = "",
@@ -2835,11 +2836,17 @@ class TelephonyService:
 
             project_id = str(call["project_id"]) if call is not None else None
             call_id = str(call["id"]) if call is not None else None
-            is_terminal_event = normalized_event_type in {
-                "participant_left",
-                "participant_connection_aborted",
-                "room_finished",
-            }
+            normalized_participant_kind = participant_kind.strip().upper()
+            is_sip_participant = (
+                normalized_participant_kind == "SIP"
+                or bool(provider_call_id)
+                or bool(sip_call_id)
+            )
+            is_terminal_event = normalized_event_type == "room_finished" or (
+                normalized_event_type
+                in {"participant_left", "participant_connection_aborted"}
+                and is_sip_participant
+            )
             outcome = "unmatched"
             if call is not None and call_id and project_id:
                 self._upsert_cdr(
@@ -2955,6 +2962,7 @@ class TelephonyService:
             payload = {
                 "room_name": room_name.strip()[:200],
                 "participant_identity": participant_identity.strip()[:200],
+                "participant_kind": normalized_participant_kind[:40],
                 "disconnect_reason": disconnect_reason.strip()[:200],
                 "attributes": safe_attributes,
                 "egress_id": egress_id.strip()[:200],
