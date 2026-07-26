@@ -42,7 +42,9 @@ docker push "$REGISTRY/voice-console:$VERSION"
 
 从 [`deploy/kubernetes/secrets.example.yaml`](../deploy/kubernetes/secrets.example.yaml) 创建真实 Secret 时，通过 Vault、KMS 或 External Secrets 注入，禁止提交真实值。`CLOUD_PARITY_MASTER_KEY` 与 `CLOUD_PARITY_DISPATCH_METADATA_KEY` 必须是两个不同的 Fernet Key；后者只用于保护 LiveKit Agent Dispatch 中的号码和租约信息。
 
-服务 Token 以文件挂载。Dispatcher 和 Agent 每次请求都重新读取文件，因此 Secret Controller 可以无重启轮换短期 Token。创建项目后，需要将该服务主体加入项目并授予同时包含 `telephony.operate` 与 `session.write` 的 `member`（或更高）角色。
+服务 Token 以文件挂载。Dispatcher 和 Agent 每次请求都重新读取文件，因此 Secret Controller 可以无重启轮换短期 Token。创建项目后，需要将专用 Client Credentials 服务主体以 `worker` 角色加入项目；不要给人类账号分配该角色，也不要让 Agent/Dispatcher 复用 owner、admin 或 member 令牌。`worker` 仅具有呼叫租约执行与会话写入权限。
+
+录音持久引用优先使用 `s3://bucket/object`。如果 Egress/Webhook 必须回传可直接访问的 HTTPS URL，生产环境必须用逗号分隔的 `CLOUD_PARITY_RECORDING_HTTPS_HOSTS` 配置精确主机白名单；HTTP URL、URL 内嵌凭据及未列入白名单的主机会被拒绝。
 
 ## 3. 部署 Kubernetes 参考栈
 

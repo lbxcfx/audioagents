@@ -228,6 +228,16 @@ def _telephony_error(exc: Exception) -> HTTPException:
 def create_telephony_router(service: TelephonyService) -> APIRouter:
     router = APIRouter(prefix="/api/platform", tags=["cloud-parity-telephony"])
 
+    def require_worker_user_id(
+        project_id: str,
+        user_id: str = Depends(require_user_id),
+    ) -> str:
+        try:
+            service.store.require_role(project_id, user_id, {"worker"})
+        except Exception as exc:
+            raise _telephony_error(exc) from exc
+        return user_id
+
     @router.get("/projects/{project_id}/telephony/limits")
     def get_limits(
         project_id: str,
@@ -467,7 +477,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
     def materialize_campaigns(
         project_id: str,
         payload: TelephonyCampaignMaterialize,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.materialize_campaigns(
@@ -573,7 +583,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
     def admit_inbound_call(
         project_id: str,
         payload: InboundCallAdmission,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.admit_inbound(
@@ -588,7 +598,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
     def claim_dispatch(
         project_id: str,
         payload: DispatchClaim,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return {
@@ -605,7 +615,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
     def claim_reconciliation(
         project_id: str,
         payload: DispatchClaim,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return {
@@ -623,7 +633,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: CallObservation,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.observe_call(
@@ -640,7 +650,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: CallTransferCreate,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.request_transfer(
@@ -660,7 +670,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         call_id: str,
         transfer_id: str,
         payload: CallTransferTransition,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.transition_transfer(
@@ -693,7 +703,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: LeaseHeartbeat,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.heartbeat(
@@ -710,7 +720,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: CallTransition,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.transition_call(
@@ -769,7 +779,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: CallResultUpdate,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.record_call_result(
@@ -786,7 +796,7 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
         project_id: str,
         call_id: str,
         payload: CallRecordingUpdate,
-        user_id: str = Depends(require_user_id),
+        user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.record_call_recording(

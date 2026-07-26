@@ -22,7 +22,7 @@ class ProjectCreate(BaseModel):
 
 class MembershipUpsert(BaseModel):
     user_id: str = Field(min_length=1, max_length=120)
-    role: Literal["owner", "admin", "member", "viewer"]
+    role: Literal["owner", "admin", "member", "viewer", "worker"]
 
 
 class TokenRevokeRequest(BaseModel):

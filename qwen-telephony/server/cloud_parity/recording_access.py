@@ -11,6 +11,36 @@ def _sign(key: bytes, value: str) -> bytes:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
 
 
+def validate_recording_storage_uri(storage_uri: str) -> str:
+    uri = storage_uri.strip()
+    if not uri:
+        return ""
+    if len(uri) > 1000 or any(ord(char) < 32 for char in uri):
+        raise ValueError("invalid recording storage URI")
+    parsed = urlparse(uri)
+    if parsed.scheme == "s3":
+        if not parsed.netloc or not parsed.path.strip("/") or parsed.query or parsed.fragment:
+            raise ValueError("recording S3 URI must identify one object")
+        return uri
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("recording storage URI must use https or s3")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("recording HTTPS URI must not contain credentials or fragments")
+    allowed_hosts = {
+        host.strip().lower()
+        for host in os.getenv("CLOUD_PARITY_RECORDING_HTTPS_HOSTS", "").split(",")
+        if host.strip()
+    }
+    environment = os.getenv("CLOUD_PARITY_ENV", "development").strip().lower()
+    if environment in {"staging", "production"} and not allowed_hosts:
+        raise ValueError(
+            "direct HTTPS recording URIs require CLOUD_PARITY_RECORDING_HTTPS_HOSTS"
+        )
+    if allowed_hosts and parsed.hostname.lower() not in allowed_hosts:
+        raise ValueError("recording HTTPS host is not allowlisted")
+    return uri
+
+
 def presign_recording_uri(
     storage_uri: str,
     *,
@@ -19,8 +49,8 @@ def presign_recording_uri(
 ) -> str:
     """Return a short-lived GET URL for HTTPS or an S3-compatible object URI."""
 
-    uri = storage_uri.strip()
-    if uri.startswith(("https://", "http://")):
+    uri = validate_recording_storage_uri(storage_uri)
+    if uri.startswith("https://"):
         return uri
     parsed = urlparse(uri)
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):

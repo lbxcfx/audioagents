@@ -41,11 +41,21 @@ class UsageCreate(BaseModel):
 def create_insights_router(service: InsightsService) -> APIRouter:
     router = APIRouter(prefix="/api/platform", tags=["cloud-parity-insights"])
 
+    def require_worker_user_id(
+        project_id: str,
+        user_id: str = Depends(require_user_id),
+    ) -> str:
+        try:
+            service.store.require_role(project_id, user_id, {"worker"})
+        except Exception as exc:
+            raise _translate_error(exc) from exc
+        return user_id
+
     @router.post("/projects/{project_id}/sessions", status_code=201)
     def create_session(
         project_id: str,
         payload: SessionCreate,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.create_session(
@@ -91,7 +101,7 @@ def create_insights_router(service: InsightsService) -> APIRouter:
         project_id: str,
         session_id: str,
         payload: EventCreate,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.append_event(
@@ -108,7 +118,7 @@ def create_insights_router(service: InsightsService) -> APIRouter:
         project_id: str,
         session_id: str,
         payload: UsageCreate,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.record_usage(
@@ -125,7 +135,7 @@ def create_insights_router(service: InsightsService) -> APIRouter:
         project_id: str,
         session_id: str,
         payload: SessionClose,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.close_session(

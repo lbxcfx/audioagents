@@ -161,6 +161,23 @@ def test_projects_are_isolated_and_roles_are_enforced(store: PlatformStore) -> N
             role="admin",
         )
 
+    store.add_membership(
+        project_id=alpha["id"],
+        actor_id="owner-a",
+        user_id="agent-worker",
+        role="worker",
+    )
+    assert store.require_permission(
+        alpha["id"], "agent-worker", "telephony.work"
+    ) == "worker"
+    assert store.require_permission(
+        alpha["id"], "agent-worker", "session.write"
+    ) == "worker"
+    with pytest.raises(AccessDeniedError):
+        store.require_permission(alpha["id"], "agent-worker", "telephony.operate")
+    with pytest.raises(AccessDeniedError):
+        store.require_permission(alpha["id"], "agent-worker", "project.manage")
+
 
 def test_management_operations_create_audit_logs(store: PlatformStore) -> None:
     project = store.create_project(name="Audit", slug="audit", owner_id="owner")

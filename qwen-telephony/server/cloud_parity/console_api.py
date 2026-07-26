@@ -34,6 +34,16 @@ class ConsoleCommandComplete(BaseModel):
 def create_console_router(service: ConsoleService) -> APIRouter:
     router = APIRouter(prefix="/api/platform", tags=["cloud-parity-console"])
 
+    def require_worker_user_id(
+        project_id: str,
+        user_id: str = Depends(require_user_id),
+    ) -> str:
+        try:
+            service.store.require_role(project_id, user_id, {"worker"})
+        except Exception as exc:
+            raise _translate_error(exc) from exc
+        return user_id
+
     @router.get("/projects/{project_id}/sessions/{session_id}/console/events")
     def console_events(
         project_id: str,
@@ -93,7 +103,7 @@ def create_console_router(service: ConsoleService) -> APIRouter:
         project_id: str,
         session_id: str,
         payload: ConsoleCommandClaim,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return {
@@ -115,7 +125,7 @@ def create_console_router(service: ConsoleService) -> APIRouter:
         session_id: str,
         command_id: str,
         payload: ConsoleCommandComplete,
-        x_user_id: str = Depends(require_user_id),
+        x_user_id: str = Depends(require_worker_user_id),
     ) -> dict:
         try:
             return service.complete_command(

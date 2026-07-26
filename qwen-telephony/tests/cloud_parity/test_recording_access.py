@@ -12,7 +12,10 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from server.cloud_parity.recording_access import presign_recording_uri
+from server.cloud_parity.recording_access import (
+    presign_recording_uri,
+    validate_recording_storage_uri,
+)
 
 
 def test_https_recording_uri_is_already_browser_accessible() -> None:
@@ -20,6 +23,22 @@ def test_https_recording_uri_is_already_browser_accessible() -> None:
         presign_recording_uri("https://media.example.com/calls/1.ogg")
         == "https://media.example.com/calls/1.ogg"
     )
+
+
+def test_recording_uri_rejects_insecure_or_untrusted_direct_links(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="https or s3"):
+        validate_recording_storage_uri("http://media.example.com/calls/1.ogg")
+
+    monkeypatch.setenv("CLOUD_PARITY_ENV", "production")
+    with pytest.raises(ValueError, match="CLOUD_PARITY_RECORDING_HTTPS_HOSTS"):
+        validate_recording_storage_uri("https://media.example.com/calls/1.ogg")
+    monkeypatch.setenv("CLOUD_PARITY_RECORDING_HTTPS_HOSTS", "media.example.com")
+    assert (
+        validate_recording_storage_uri("https://media.example.com/calls/1.ogg")
+        == "https://media.example.com/calls/1.ogg"
+    )
+    with pytest.raises(ValueError, match="not allowlisted"):
+        validate_recording_storage_uri("https://evil.example.com/calls/1.ogg")
 
 
 def test_s3_recording_uri_gets_short_lived_sigv4_url(monkeypatch) -> None:

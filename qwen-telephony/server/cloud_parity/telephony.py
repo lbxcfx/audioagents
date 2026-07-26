@@ -11,7 +11,7 @@ import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .store import PlatformStore, ResourceNotFoundError, _row, _utc_now
-from .recording_access import presign_recording_uri
+from .recording_access import presign_recording_uri, validate_recording_storage_uri
 
 
 ACTIVE_STATUSES = frozenset(
@@ -1207,7 +1207,9 @@ class TelephonyService:
         campaign_id: str | None = None,
     ) -> dict[str, int]:
         """Turn a bounded number of campaign contacts into durable call jobs."""
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_any_permission(
+            project_id, user_id, {"telephony.operate", "telephony.work"}
+        )
         safe_limit = max(1, min(int(limit), 500))
         parameters: list[Any] = [project_id]
         campaign_filter = ""
@@ -1588,7 +1590,7 @@ class TelephonyService:
         idempotency_key: str,
         context_summary: str = "",
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         destination = _validate_identifier(destination_name, "transfer destination name")
         key = _validate_identifier(idempotency_key, "transfer idempotency_key")
         summary = context_summary.strip()
@@ -1677,7 +1679,7 @@ class TelephonyService:
         failure_code: str = "",
         failure_detail: str = "",
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         if status not in {"transferring", "completed", "failed", "canceled"}:
             raise ValueError("invalid transfer status")
         now = _utc_now()
@@ -2095,7 +2097,7 @@ class TelephonyService:
         metadata: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         provider_name = _validate_identifier(provider.lower(), "provider")
         external_id = _validate_identifier(provider_call_id, "provider_call_id")
         worker = _validate_identifier(worker_id, "worker_id")
@@ -2226,7 +2228,7 @@ class TelephonyService:
         limit: int = 1,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         worker = _validate_identifier(worker_id, "worker_id")
         batch_limit = max(1, min(limit, 100))
         current = _now(now)
@@ -2506,7 +2508,7 @@ class TelephonyService:
         limit: int = 10,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         worker = _validate_identifier(worker_id, "worker_id")
         batch_limit = max(1, min(limit, 100))
         current = _now(now)
@@ -2665,7 +2667,7 @@ class TelephonyService:
         ended: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         timestamp = _timestamp(now)
         with self.store.transaction() as conn:
             row = self._owned_call(conn, project_id, call_id, worker_id, lease_token)
@@ -2781,6 +2783,7 @@ class TelephonyService:
         normalized_event_type = _validate_identifier(event_type, "webhook event type")
         timestamp = _timestamp(observed_at)
         safe_attributes = self._safe_sip_attributes(attributes)
+        safe_egress_storage_uri = validate_recording_storage_uri(egress_storage_uri)
         provider_call_id = str(
             safe_attributes.get("sip.callIDFull")
             or safe_attributes.get("sip.twilio.callSid")
@@ -2904,8 +2907,8 @@ class TelephonyService:
                         (
                             egress_id.strip(),
                             recording_status,
-                            egress_storage_uri.strip(),
-                            egress_storage_uri.strip(),
+                            safe_egress_storage_uri,
+                            safe_egress_storage_uri,
                             timestamp,
                             call_id,
                         ),
@@ -3004,7 +3007,7 @@ class TelephonyService:
         lease_token: str,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         current = _now(now)
         timestamp = _timestamp(current)
         with self.store.transaction() as conn:
@@ -3035,7 +3038,7 @@ class TelephonyService:
         answering_machine_category: str = "",
         disposition: str = "",
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         category = answering_machine_category.strip()
         allowed_categories = {
             "", "human", "machine-ivr", "machine-vm", "machine-unavailable", "uncertain"
@@ -3084,13 +3087,11 @@ class TelephonyService:
         status: str,
         storage_uri: str = "",
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         normalized_egress_id = _validate_identifier(egress_id, "recording egress id")
         if status not in {"starting", "active", "stopping", "completed", "failed"}:
             raise ValueError("invalid recording status")
-        uri = storage_uri.strip()
-        if len(uri) > 1000 or any(ord(char) < 32 for char in uri):
-            raise ValueError("invalid recording storage URI")
+        uri = validate_recording_storage_uri(storage_uri)
         timestamp = _utc_now()
         with self.store.transaction() as conn:
             owned = self._owned_call(conn, project_id, call_id, worker_id, lease_token)
@@ -3137,7 +3138,7 @@ class TelephonyService:
         retry_delay_seconds: int = 30,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        self.store.require_permission(project_id, user_id, "telephony.operate")
+        self.store.require_permission(project_id, user_id, "telephony.work")
         if status not in set().union(*TRANSITIONS.values()):
             raise ValueError("invalid call status")
         if not 0 <= retry_delay_seconds <= 86400:

@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 import uuid
 
 from .database import ConnectionLike, create_database_adapter
@@ -29,7 +29,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "project.read", "project.manage", "audit.read", "session.read",
             "session.write", "console.control", "console.observe", "agent.read", "agent.write",
             "inference.invoke", "inference.manage", "analytics.read", "analytics.export",
-            "telephony.read", "telephony.manage", "telephony.operate",
+            "telephony.read", "telephony.manage", "telephony.operate", "telephony.work",
         }
     ),
     "admin": frozenset(
@@ -37,7 +37,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             "project.read", "project.manage", "audit.read", "session.read",
             "session.write", "console.control", "console.observe", "agent.read", "agent.write",
             "inference.invoke", "inference.manage", "analytics.read", "analytics.export",
-            "telephony.read", "telephony.manage", "telephony.operate",
+            "telephony.read", "telephony.manage", "telephony.operate", "telephony.work",
         }
     ),
     "member": frozenset(
@@ -51,6 +51,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "viewer": frozenset(
         {"project.read", "session.read", "agent.read", "analytics.read", "telephony.read"}
     ),
+    "worker": frozenset({"session.write", "telephony.work"}),
 }
 
 
@@ -1348,6 +1349,43 @@ class PlatformStore:
         if row is None or permission not in ROLE_PERMISSIONS.get(row["role"], frozenset()):
             raise AccessDeniedError(f"missing permission: {permission}")
         return str(row["role"])
+
+    def require_role(
+        self, project_id: str, user_id: str, allowed_roles: Iterable[str]
+    ) -> str:
+        allowed = frozenset(str(role) for role in allowed_roles)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT role FROM project_memberships
+                WHERE project_id = ? AND user_id = ?
+                """,
+                (project_id, user_id),
+            ).fetchone()
+        role = str(row["role"]) if row is not None else ""
+        if role not in allowed:
+            raise AccessDeniedError("project role is not allowed for this operation")
+        return role
+
+    def require_any_permission(
+        self, project_id: str, user_id: str, permissions: Iterable[str]
+    ) -> str:
+        required = frozenset(str(permission) for permission in permissions)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT role FROM project_memberships
+                WHERE project_id = ? AND user_id = ?
+                """,
+                (project_id, user_id),
+            ).fetchone()
+        role = str(row["role"]) if row is not None else ""
+        granted = ROLE_PERMISSIONS.get(role, frozenset())
+        if row is None or not required.intersection(granted):
+            raise AccessDeniedError(
+                f"missing any permission: {', '.join(sorted(required))}"
+            )
+        return role
 
     def _lock_project_and_require_permission(
         self,

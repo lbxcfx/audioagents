@@ -719,6 +719,12 @@ def test_inbound_capacity_can_overflow_to_an_allowlisted_human_destination(
 
 def test_telephony_api_hides_lease_tokens_from_read_endpoints(telephony_stack) -> None:
     store, service, project_id = telephony_stack
+    store.add_membership(
+        project_id=project_id,
+        actor_id="owner",
+        user_id="telephony-worker",
+        role="worker",
+    )
     app = FastAPI()
     install_authenticator(app, DevelopmentAuthenticator())
     app.include_router(create_telephony_router(service))
@@ -737,6 +743,12 @@ def test_telephony_api_hides_lease_tokens_from_read_endpoints(telephony_stack) -
     claim = client.post(
         f"/api/platform/projects/{project_id}/telephony/dispatch/claim",
         headers={"X-User-ID": "owner"},
+        json={"worker_id": "api-worker", "limit": 1},
+    )
+    assert claim.status_code == 403
+    claim = client.post(
+        f"/api/platform/projects/{project_id}/telephony/dispatch/claim",
+        headers={"X-User-ID": "telephony-worker"},
         json={"worker_id": "api-worker", "limit": 1},
     )
     assert claim.status_code == 200
