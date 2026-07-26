@@ -109,6 +109,9 @@ nav {
   padding: 10px 12px;
   border-radius: 8px;
   text-align: left;
+  text-decoration: none;
+  display: flex;
+  align-items: center;
 }
 
 .nav-item:hover,

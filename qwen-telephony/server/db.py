@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = ROOT / "qwen-telephony" / "data" / "ops.sqlite3"
+DB_PATH = Path(
+    os.getenv(
+        "QWEN_TELEPHONY_OPS_DATABASE_PATH",
+        str(ROOT / "qwen-telephony" / "data" / "ops.sqlite3"),
+    )
+).expanduser().resolve()
 
 
 def connect() -> sqlite3.Connection:

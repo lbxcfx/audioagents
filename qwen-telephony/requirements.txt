@@ -1,9 +1,17 @@
-python-dotenv>=1.0.1
-httpx>=0.27.0
-openai>=1.99.0
-livekit-api>=1.0.0
-livekit-agents>=1.2.0
-livekit-plugins-openai>=1.2.0
-livekit-plugins-silero>=1.2.0
-fastapi>=0.115.0
-uvicorn>=0.30.0
+python-dotenv==1.2.2
+httpx==0.28.1
+openai==2.43.0
+# Keep the LiveKit SDK family aligned. livekit-agents pins the native SDK exactly.
+livekit==1.1.13
+livekit-api==1.2.0
+livekit-agents==1.6.6
+livekit-plugins-openai==1.6.6
+livekit-plugins-silero==1.6.6
+fastapi==0.138.0
+uvicorn==0.49.0
+cryptography==49.0.0
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+PyJWT[crypto]==2.13.0
+# Explicit security floor for the image codec pulled in by LiveKit local inference.
+pillow==12.3.0

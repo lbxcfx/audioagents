@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    FORWARDED_ALLOW_IPS=127.0.0.1
+
+WORKDIR /app/qwen-telephony
+
+RUN addgroup --system cloudparity \
+    && adduser --system --ingroup cloudparity --home /app/qwen-telephony cloudparity
+
+COPY qwen-telephony/requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir -r requirements.lock && pip check
+
+COPY qwen-telephony/server ./server
+COPY qwen-telephony/agent ./agent
+COPY qwen-telephony/scripts ./scripts
+COPY qwen-telephony/config ./config
+RUN mkdir -p data cache logs \
+    && chown -R cloudparity:cloudparity data cache logs
+
+USER cloudparity
+EXPOSE 8091
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/api/platform/health/ready', timeout=3)" || exit 1
+
+CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8091", "--proxy-headers"]

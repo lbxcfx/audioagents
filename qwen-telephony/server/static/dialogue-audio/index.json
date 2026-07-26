@@ -1,0 +1,344 @@
+[
+  {
+    "id": "tts-662112d2750a4b858f81fa5b49ca9675",
+    "name": "合成音频-谢谢您的关注，再见",
+    "text": "谢谢您的关注，再见",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-662112d2750a4b858f81fa5b49ca9675.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "0084cc59-40ed-915e-9316-a04e41dfa590",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 99884,
+    "created_at": "2026-06-28T10:49:19.100126+00:00"
+  },
+  {
+    "id": "tts-cd68aa468e414b47a14357424fbc137c",
+    "name": "合成音频-请问您有自己的电瓶车吗？",
+    "text": "请问您有自己的电瓶车吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-cd68aa468e414b47a14357424fbc137c.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "8fd3cb6d-29e8-9aa7-9821-27951bd1fdfc",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 107564,
+    "created_at": "2026-06-28T10:48:44.565579+00:00"
+  },
+  {
+    "id": "tts-f107b92451b34c0ab9a3e1a28054c163",
+    "name": "合成音频-请问您期望在哪个区域进行工作呢？例如",
+    "text": "请问您期望在哪个区域进行工作呢？例如朝阳，海淀，丰台等",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-f107b92451b34c0ab9a3e1a28054c163.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "c07609c8-c348-9fc8-9083-f75f89c10896",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 311084,
+    "created_at": "2026-06-28T10:48:27.426895+00:00"
+  },
+  {
+    "id": "tts-01e3b464788f462d86a1f869524c6245",
+    "name": "合成音频-您好，工作地点在上海。",
+    "text": "您好，工作地点在上海。",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-01e3b464788f462d86a1f869524c6245.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "f4189bc6-3360-996a-b8bc-9efcc233874c",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 111404,
+    "created_at": "2026-06-28T10:41:41.649109+00:00"
+  },
+  {
+    "id": "tts-dda8689307fd493d93e6db0f942a1480",
+    "name": "合成音频-工作地点",
+    "text": "工作地点",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-dda8689307fd493d93e6db0f942a1480.wav",
+    "mime_type": "audio/wav",
+    "request_id": "tts_cache_816fad0e7e9d",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 49964,
+    "created_at": "2026-06-28T10:41:40.005646+00:00"
+  },
+  {
+    "id": "tts-545668ffeab64c29902c83769ccca189",
+    "name": "合成音频-工作地点在哪里？",
+    "text": "工作地点在哪里？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-545668ffeab64c29902c83769ccca189.wav",
+    "mime_type": "audio/wav",
+    "request_id": "tts_cache_047ab67f7f17",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 73004,
+    "created_at": "2026-06-28T10:35:04.733205+00:00"
+  },
+  {
+    "id": "tts-1ae20cedf54b4c5280d373f885fca4dc",
+    "name": "合成音频-工作地点在哪里？",
+    "text": "工作地点在哪里？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-1ae20cedf54b4c5280d373f885fca4dc.wav",
+    "mime_type": "audio/wav",
+    "request_id": "tts_cache_047ab67f7f17",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 73004,
+    "created_at": "2026-06-28T10:30:52.156950+00:00"
+  },
+  {
+    "id": "tts-263f3853f23d440e869510387ef2ac33",
+    "name": "合成音频-您好，我是陌陌公司HR，有个骑手的机",
+    "text": "您好，我是陌陌公司HR，有个骑手的机会分享给您",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-263f3853f23d440e869510387ef2ac33.wav",
+    "mime_type": "audio/wav",
+    "request_id": "tts_cache_1cd927106d05",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 218924,
+    "created_at": "2026-06-28T10:22:13.631173+00:00"
+  },
+  {
+    "id": "tts-bfdf767527b34aadbcee5cbd6df0b225",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-bfdf767527b34aadbcee5cbd6df0b225.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "90db6194-a7e1-92fc-974f-8382dfb43aab",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Maia",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 157484,
+    "created_at": "2026-06-25T07:49:37.255956+00:00"
+  },
+  {
+    "id": "tts-fc10e89e95234b84b5006c04c71ec6a0",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-fc10e89e95234b84b5006c04c71ec6a0.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "d2ab3225-dbad-9b1c-b403-eeafadd18570",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Moon",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 199724,
+    "created_at": "2026-06-25T07:49:29.601876+00:00"
+  },
+  {
+    "id": "tts-d597974c16844d4ea28eebb325a490c7",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-d597974c16844d4ea28eebb325a490c7.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "3d752c30-1159-95c1-aac8-9bfe0e964b14",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Vivian",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 138284,
+    "created_at": "2026-06-25T07:49:23.865070+00:00"
+  },
+  {
+    "id": "tts-469fae93f9ac449a90f16dd3338168ad",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-469fae93f9ac449a90f16dd3338168ad.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "229b9fc5-3f80-97bd-9bb2-65c58095c658",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Momo",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 161324,
+    "created_at": "2026-06-25T07:49:17.558993+00:00"
+  },
+  {
+    "id": "tts-847ae03df3e443f8a3488e84741e9e57",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-847ae03df3e443f8a3488e84741e9e57.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "0f9084b4-bdf3-9db8-804c-e4b4f7d4864d",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Chelsie",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 138284,
+    "created_at": "2026-06-25T07:49:12.291776+00:00"
+  },
+  {
+    "id": "tts-e0773910730d4e209875795812d9df68",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-e0773910730d4e209875795812d9df68.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "3bcb5a4c-2628-9b67-ba78-f8a88d32826d",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Ethan",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 103724,
+    "created_at": "2026-06-25T07:49:08.080631+00:00"
+  },
+  {
+    "id": "tts-22d4aacd34924f79955ed04b2ede4f59",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-22d4aacd34924f79955ed04b2ede4f59.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "d0dd9675-dece-95ef-ad49-5a26b5a7ebf8",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Serena",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 145964,
+    "created_at": "2026-06-25T07:48:59.589615+00:00"
+  },
+  {
+    "id": "tts-ea0edd4a3f1f495d83c5f9a6f2411051",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-ea0edd4a3f1f495d83c5f9a6f2411051.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "8c91f885-d987-90fe-a28a-c6c471c60ef8",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 115244,
+    "created_at": "2026-06-25T07:48:54.359883+00:00"
+  },
+  {
+    "id": "tts-6ae9478838a74995a38c2aef1df0abf6",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-6ae9478838a74995a38c2aef1df0abf6.mp3",
+    "mime_type": "audio/mpeg",
+    "request_id": "0e1af09a-ba85-4cca-be50-ce2a56887fce",
+    "model_config": {
+      "provider": "doubao",
+      "model": "seed-tts-2.0-expressive",
+      "voice": "zh_female_xiaohe_uranus_bigtts",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 19437,
+    "created_at": "2026-06-25T03:57:58.330152+00:00"
+  },
+  {
+    "id": "tts-5022682b4f2549b69ebc6e36c22b7871",
+    "name": "合成音频-您好，请问现在方便沟通吗？",
+    "text": "您好，请问现在方便沟通吗？",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-5022682b4f2549b69ebc6e36c22b7871.mp3",
+    "mime_type": "audio/mpeg",
+    "request_id": "61820ff3-eef9-476e-a5a0-3f0fb2276eda",
+    "model_config": {
+      "provider": "doubao",
+      "model": "seed-tts-2.0-expressive",
+      "voice": "zh_female_xiaohe_uranus_bigtts",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 18093,
+    "created_at": "2026-06-25T03:57:36.336789+00:00"
+  },
+  {
+    "id": "tts-2b31ee975df643b5a7e3a3713cb0814c",
+    "name": "合成音频-你好",
+    "text": "你好",
+    "source": "synthesis",
+    "audio_url": "/static/dialogue-audio/tts-2b31ee975df643b5a7e3a3713cb0814c.wav",
+    "mime_type": "audio/x-wav",
+    "request_id": "1e3dcf25-e389-96d2-9dc2-18deeeaf9aa1",
+    "model_config": {
+      "provider": "qwen",
+      "model": "qwen3-tts-flash",
+      "voice": "Cherry",
+      "emotion": "neutral",
+      "style": "normal"
+    },
+    "size": 34604,
+    "created_at": "2026-06-25T03:12:09.765761+00:00"
+  }
+]

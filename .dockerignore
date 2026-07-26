@@ -1,0 +1,20 @@
+# The production Dockerfiles use this directory as their build context. Keep
+# the context allowlisted so local databases, credentials, recordings, logs,
+# virtual environments, node_modules and test artifacts never reach BuildKit.
+**
+
+!qwen-telephony/
+!qwen-telephony/requirements.lock
+!qwen-telephony/server/
+!qwen-telephony/server/**
+!qwen-telephony/agent/
+!qwen-telephony/agent/**
+!qwen-telephony/scripts/
+!qwen-telephony/scripts/**
+!qwen-telephony/config/
+!qwen-telephony/config/**
+
+qwen-telephony/config/local.env
+qwen-telephony/server/static/dialogue-audio/
+**/__pycache__/
+**/*.py[cod]

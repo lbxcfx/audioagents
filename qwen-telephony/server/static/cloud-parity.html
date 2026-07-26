@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#20292e" />
+    <title>LiveKit Cloud-Parity 控制台</title>
+    <link rel="stylesheet" href="/static/cloud-parity.css?v=1" />
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到主要内容</a>
+    <aside class="cp-sidebar">
+      <a class="cp-brand" href="/cloud-parity" aria-label="Cloud-Parity 首页">
+        <span class="cp-brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>Cloud-Parity</strong><small>Self-hosted Agent Platform</small></span>
+      </a>
+      <nav aria-label="Cloud-Parity 导航">
+        <button class="cp-nav active" data-view="overview"><span>01</span>运行概览</button>
+        <button class="cp-nav" data-view="insights"><span>02</span>Sessions & Insights</button>
+        <button class="cp-nav" data-view="builder"><span>03</span>Agent Builder</button>
+        <button class="cp-nav" data-view="deployments"><span>04</span>构建与部署</button>
+        <button class="cp-nav" data-view="models"><span>05</span>Inference</button>
+        <button class="cp-nav" data-view="embed"><span>06</span>Embed Widget</button>
+        <button class="cp-nav" data-view="telephony"><span>07</span>电话运营</button>
+        <button class="cp-nav" data-view="audit"><span>08</span>安全与审计</button>
+      </nav>
+      <div class="cp-sidebar-foot">
+        <span class="status-dot" id="platformDot"></span>
+        <span><strong id="platformStatus">正在连接</strong><small id="schemaVersion">Schema —</small></span>
+      </div>
+    </aside>
+
+    <main class="cp-shell" id="workspace">
+      <header class="cp-topbar">
+        <div>
+          <p class="eyebrow">LIVEKIT · SELF-HOSTED CONTROL PLANE</p>
+          <h1 id="viewTitle">运行概览</h1>
+        </div>
+        <div class="context-controls">
+          <label>操作用户<input id="userId" value="local-admin" autocomplete="off" /></label>
+          <label>当前项目<select id="projectSelect"><option value="">选择项目</option></select></label>
+          <button class="button secondary" id="newProjectBtn" type="button">新建项目</button>
+          <button class="button icon" id="refreshBtn" type="button" aria-label="刷新当前页面">↻</button>
+        </div>
+      </header>
+
+      <div id="emptyProject" class="empty-state" hidden>
+        <span class="empty-index">00</span>
+        <div><h2>先建立一个隔离项目</h2><p>项目是 Agent、Session、模型路由、部署和用量数据的安全边界。</p></div>
+        <button class="button primary" type="button" data-open-project>创建第一个项目</button>
+      </div>
+
+      <section class="cp-view active" id="overview" aria-labelledby="viewTitle">
+        <div class="metric-strip" id="metricStrip">
+          <article><span>Sessions</span><strong id="metricSessions">—</strong><small>所选时间范围</small></article>
+          <article><span>Active</span><strong id="metricActive">—</strong><small>正在运行</small></article>
+          <article><span>Inference</span><strong id="metricInference">—</strong><small>成功率</small></article>
+          <article><span>Usage</span><strong id="metricCost">—</strong><small>模型费用 USD</small></article>
+        </div>
+        <div class="twelve-grid overview-grid">
+          <article class="surface span-8">
+            <div class="surface-head"><div><p class="kicker">ACTIVITY</p><h2>最近 Agent Sessions</h2></div><button class="text-button" data-go="insights">查看全部 →</button></div>
+            <div class="table-shell"><table><thead><tr><th>Room</th><th>Agent</th><th>状态</th><th>事件</th><th>开始时间</th></tr></thead><tbody id="recentSessionRows"></tbody></table></div>
+          </article>
+          <aside class="surface span-4 capability-panel">
+            <div class="surface-head"><div><p class="kicker">PARITY STATUS</p><h2>MVP 模块</h2></div></div>
+            <ol class="capability-list">
+              <li><span>平台基础与 RBAC</span><b>Ready</b></li>
+              <li><span>Insights / Console</span><b>Ready</b></li>
+              <li><span>Build / Deploy / Secrets</span><b>Ready</b></li>
+              <li><span>Builder / Embed</span><b>Ready</b></li>
+              <li><span>Inference / Analytics</span><b>Ready</b></li>
+            </ol>
+          </aside>
+        </div>
+      </section>
+
+      <section class="cp-view" id="insights">
+        <div class="split-layout">
+          <article class="surface session-browser">
+            <div class="surface-head"><div><p class="kicker">OBSERVABILITY</p><h2>Sessions</h2></div><button class="button secondary compact" id="reloadSessions">刷新</button></div>
+            <div class="table-shell"><table><thead><tr><th>Room / Agent</th><th>状态</th><th>费用</th><th>事件</th><th></th></tr></thead><tbody id="sessionRows"></tbody></table></div>
+          </article>
+          <article class="surface timeline-panel" aria-live="polite">
+            <div class="surface-head"><div><p class="kicker">SESSION TIMELINE</p><h2 id="timelineTitle">选择一个 Session</h2></div><button class="button secondary compact" id="observerBtn" disabled>观察者 Token</button></div>
+            <div class="timeline-summary" id="timelineSummary">从左侧选择 Session，查看转写、模型调用、工具和用量。</div>
+            <ol class="timeline" id="timelineEvents"></ol>
+          </article>
+        </div>
+      </section>
+
+      <section class="cp-view" id="builder">
+        <div class="twelve-grid">
+          <form class="surface span-7 form-stack" id="builderForm">
+            <div class="surface-head"><div><p class="kicker">AGENT SPEC 1.0</p><h2>创建 Agent</h2></div><span class="revision-badge" id="builderRevision">Draft · New</span></div>
+            <div class="form-grid two"><label>Agent 名称<input name="name" value="sales-agent" required pattern="[a-zA-Z][a-zA-Z0-9_-]*" /></label><label>欢迎语<input name="welcome" value="您好，很高兴为您服务。" /></label></div>
+            <label>系统指令<textarea name="instructions" rows="8" required>你是专业的电话客服助手。回答应简洁、自然，并在通话结束前确认用户需求。</textarea></label>
+            <fieldset><legend>实时模型流水线</legend><div class="form-grid three"><label>STT<input name="stt" value="qwen/stt:zh" required /></label><label>LLM<input name="llm" value="qwen/qwen-plus" required /></label><label>TTS<input name="tts" value="qwen/qwen3-tts:Cherry" required /></label></div></fieldset>
+            <label>工具配置 JSON<textarea name="tools" rows="7" spellcheck="false">[]</textarea><small>支持 http、rpc 和 mcp。Secret 使用 {{secrets.SECRET_NAME}}。</small></label>
+            <div class="form-actions"><button class="button primary" type="submit">保存草稿</button><button class="button secondary" id="publishSpecBtn" type="button" disabled>发布</button><button class="button secondary" id="exportSpecBtn" type="button" disabled>导出代码</button></div>
+          </form>
+          <aside class="surface span-5">
+            <div class="surface-head"><div><p class="kicker">SAVED SPECS</p><h2>Agent 列表</h2></div></div>
+            <div class="resource-list" id="agentSpecList"><p class="muted">暂无 AgentSpec</p></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="cp-view" id="deployments">
+        <div class="twelve-grid">
+          <form class="surface span-4 form-stack" id="agentCreateForm"><div class="surface-head"><div><p class="kicker">DEFINITION</p><h2>注册 Agent</h2></div></div><label>名称<input name="name" required placeholder="support-agent" /></label><label>说明<textarea name="description" rows="3"></textarea></label><button class="button primary" type="submit">创建定义</button></form>
+          <form class="surface span-4 form-stack" id="buildForm"><div class="surface-head"><div><p class="kicker">BUILDKIT</p><h2>构建版本</h2></div></div><label>Agent<select name="agent_id" id="buildAgentSelect" required></select></label><label>源码目录<input name="source_ref" required placeholder="/workspace/my-agent" /></label><label>镜像地址<input name="image_ref" required placeholder="registry/agent:v1" /></label><button class="button primary" type="submit">开始构建</button></form>
+          <form class="surface span-4 form-stack" id="deploymentForm"><div class="surface-head"><div><p class="kicker">ROLLING RELEASE</p><h2>创建部署</h2></div></div><label>Agent<select name="agent_id" id="deployAgentSelect" required></select></label><label>Version ID<input name="version_id" required placeholder="成功构建后自动填入" /></label><label>部署名称<input name="name" value="production" required /></label><label>副本数<input name="desired_replicas" type="number" value="1" min="0" max="100" /></label><button class="button primary" type="submit">滚动发布</button></form>
+        </div>
+        <article class="surface section-gap"><div class="surface-head"><div><p class="kicker">DEPLOYMENTS</p><h2>运行版本</h2></div></div><div class="table-shell"><table><thead><tr><th>部署</th><th>Agent</th><th>状态</th><th>副本</th><th>Active Version</th><th>操作</th></tr></thead><tbody id="deploymentRows"></tbody></table></div></article>
+        <article class="surface section-gap"><div class="surface-head"><div><p class="kicker">ENCRYPTED SECRETS</p><h2>运行密钥</h2></div></div><form class="inline-form" id="secretForm"><label>名称<input name="name" placeholder="DASHSCOPE_API_KEY" required /></label><label>值<input name="value" type="password" required /></label><button class="button primary" type="submit">加密保存</button></form><div class="chip-list" id="secretList"></div></article>
+      </section>
+
+      <section class="cp-view" id="models">
+        <div class="twelve-grid">
+          <form class="surface span-5 form-stack" id="routeForm"><div class="surface-head"><div><p class="kicker">MODEL ROUTING</p><h2>添加模型路由</h2></div></div><label>统一 Descriptor<input name="descriptor" value="voice/default-llm" required /></label><div class="form-grid two"><label>模态<select name="modality"><option>llm</option><option>stt</option><option>tts</option></select></label><label>Provider<select name="provider"><option value="qwen">Qwen</option></select></label></div><label>Provider Model<input name="provider_model" value="qwen-plus" required /></label><div class="form-grid two"><label>优先级<input name="priority" type="number" value="100" /></label><label>超时（秒）<input name="timeout_seconds" type="number" value="30" /></label></div><button class="button primary" type="submit">保存路由</button></form>
+          <article class="surface span-7"><div class="surface-head"><div><p class="kicker">ROUTES</p><h2>统一推理目录</h2></div></div><div class="table-shell"><table><thead><tr><th>Descriptor</th><th>模态</th><th>Provider</th><th>模型</th><th>优先级</th></tr></thead><tbody id="routeRows"></tbody></table></div></article>
+        </div>
+      </section>
+
+      <section class="cp-view" id="embed">
+        <div class="twelve-grid">
+          <form class="surface span-5 form-stack" id="embedForm"><div class="surface-head"><div><p class="kicker">TOKEN BROKER</p><h2>发布 Web Widget</h2></div></div><label>配置名称<input name="name" value="website" required /></label><label>Agent 名称<input name="agent_name" value="sales-agent" required /></label><label>Room 前缀<input name="room_prefix" value="embed" required /></label><label>允许的 Origins<textarea name="allowed_origins" rows="4" required>http://localhost:5174
+http://127.0.0.1:8091</textarea><small>每行一个完整 Origin，不允许路径和通配符。</small></label><div class="check-row"><label><input name="text" type="checkbox" checked />文字</label><label><input name="camera" type="checkbox" />摄像头</label><label><input name="screen_share" type="checkbox" />屏幕共享</label></div><button class="button primary" type="submit">创建 Widget</button></form>
+          <article class="surface span-7"><div class="surface-head"><div><p class="kicker">EMBED CONFIGS</p><h2>可嵌入入口</h2></div></div><div class="resource-list" id="embedList"><p class="muted">暂无 Widget</p></div></article>
+        </div>
+      </section>
+
+      <section class="cp-view" id="telephony">
+        <div class="twelve-grid">
+          <article class="surface span-4">
+            <div class="surface-head"><div><p class="kicker">EMERGENCY CONTROL</p><h2>外呼总开关</h2></div><span id="outboundPolicyStatus" class="status">—</span></div>
+            <p class="muted">关闭后将阻止新任务入队、领取和拨号前的最后一步；恢复后可继续暂停中的活动。</p>
+            <button class="button secondary" id="outboundToggle" type="button">正在读取</button>
+          </article>
+          <form class="surface span-4 form-stack" id="contactForm">
+            <div class="surface-head"><div><p class="kicker">CONTACT</p><h2>新增或更新联系人</h2></div></div>
+            <label>外部 ID<input name="external_id" required placeholder="crm-10001" /></label>
+            <label>姓名<input name="name" placeholder="客户姓名" /></label>
+            <label>电话号码（E.164）<input name="phone_number" required placeholder="+8613800000000" /></label>
+            <button class="button primary" type="submit">保存联系人</button>
+          </form>
+          <form class="surface span-4 form-stack" id="campaignForm">
+            <div class="surface-head"><div><p class="kicker">OUTBOUND CAMPAIGN</p><h2>创建外呼活动</h2></div></div>
+            <label>活动名称<input name="name" required placeholder="续费提醒" /></label>
+            <label>Agent 名称<input name="agent_name" required value="commercial-agent" /></label>
+            <label>出局线路<select name="trunk_id" id="campaignTrunk" required><option value="">请选择有效线路</option></select></label>
+            <label>主叫号码<input name="source_number" required placeholder="+8610000000000" /></label>
+            <label>最大并发<input name="max_concurrent_calls" type="number" min="1" max="10000" value="10" /></label>
+            <button class="button primary" type="submit">用已勾选联系人创建</button>
+          </form>
+        </div>
+        <article class="surface section-gap"><div class="surface-head"><div><p class="kicker">AUDIENCE</p><h2>联系人</h2></div></div><div class="table-shell"><table><thead><tr><th>选择</th><th>外部 ID</th><th>姓名</th><th>号码</th><th>状态</th></tr></thead><tbody id="telephonyContactRows"></tbody></table></div></article>
+        <article class="surface section-gap"><div class="surface-head"><div><p class="kicker">CAMPAIGNS</p><h2>外呼活动</h2></div></div><div class="table-shell"><table><thead><tr><th>活动</th><th>Agent / 线路</th><th>状态</th><th>联系人</th><th>进度</th><th>操作</th></tr></thead><tbody id="campaignRows"></tbody></table></div></article>
+      </section>
+
+      <section class="cp-view" id="audit">
+        <article class="surface"><div class="surface-head"><div><p class="kicker">SECURITY TRAIL</p><h2>项目审计日志</h2></div></div><div class="table-shell"><table><thead><tr><th>时间</th><th>操作</th><th>操作者</th><th>资源</th><th>详情</th></tr></thead><tbody id="auditRows"></tbody></table></div></article>
+      </section>
+    </main>
+
+    <dialog id="projectDialog">
+      <form class="dialog-form" id="projectForm"><div class="surface-head"><div><p class="kicker">PROJECT BOUNDARY</p><h2>新建隔离项目</h2></div><button class="button icon" type="button" data-close-dialog aria-label="关闭">×</button></div><label>项目名称<input name="name" required placeholder="AI 客服生产环境" /></label><label>Slug<input name="slug" required pattern="[a-zA-Z0-9-]+" placeholder="ai-support-prod" /></label><label>数据保留天数<input name="retention_days" type="number" value="30" min="1" max="3650" /></label><button class="button primary" type="submit">创建项目</button></form>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/static/cloud-parity.js?v=1" defer></script>
+  </body>
+</html>

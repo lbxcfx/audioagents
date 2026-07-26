@@ -1,0 +1,12 @@
+{
+  "provider": "qwen",
+  "model": "qwen3-tts-flash",
+  "voice": "Cherry",
+  "emotion": "neutral",
+  "style": "normal",
+  "sample_text": "您好，请问现在方便沟通吗？",
+  "speed": 1.0,
+  "pitch": 1.0,
+  "volume": 1.0,
+  "updated_at": "2026-06-25T03:12:26.428250+00:00"
+}

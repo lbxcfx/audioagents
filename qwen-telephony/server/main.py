@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from datetime import datetime, timezone
+import hmac
 from pathlib import Path
 import json
 import logging
@@ -15,18 +16,49 @@ from pathlib import Path
 import uuid
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .dialogue import get_config, get_scene, handle_turn, list_scenes, start_session
 from .db import connect, init_db, row_to_dict, rows_to_dicts, seed_db, seed_dialogue_db
+from .cloud_parity.api import create_platform_router
+from .cloud_parity.analytics import AnalyticsService
+from .cloud_parity.analytics_api import create_analytics_router
+from .cloud_parity.auth import (
+    create_authenticator,
+    install_authenticator,
+    install_legacy_api_auth_boundary,
+)
+from .cloud_parity.builder import BuilderService
+from .cloud_parity.builder_api import create_builder_router
+from .cloud_parity.config import PlatformSettings
+from .cloud_parity.console import ConsoleService
+from .cloud_parity.console_api import create_console_router
+from .cloud_parity.deployment import DeploymentService, SecretCipher
+from .cloud_parity.deployment_api import create_deployment_router
+from .cloud_parity.embed import EmbedService
+from .cloud_parity.embed_api import create_embed_router
+from .cloud_parity.insights import InsightsService
+from .cloud_parity.insights_api import create_insights_router
+from .cloud_parity.inference import InferenceGateway
+from .cloud_parity.inference_api import create_inference_router
+from .cloud_parity.observability import render_prometheus_metrics
+from .cloud_parity.runtime import DockerRuntimeExecutor
+from .cloud_parity.runtime_api import create_runtime_router
+from .cloud_parity.store import PlatformStore
+from .cloud_parity.telephony import TelephonyService
+from .cloud_parity.telephony_api import create_telephony_router
 
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
+LEGACY_SQLITE_ENABLED = os.getenv(
+    "CLOUD_PARITY_ENABLE_LEGACY_SQLITE",
+    "true" if os.getenv("CLOUD_PARITY_ENV", "development").lower() in {"development", "test"} else "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 STATIC_DIR = ROOT / "qwen-telephony" / "server" / "static"
 AUDIO_DIR = STATIC_DIR / "dialogue-audio"
 AUDIO_INDEX = AUDIO_DIR / "index.json"
@@ -41,14 +73,199 @@ if load_dotenv:
     load_dotenv(ROOT / ".env")
     load_dotenv(ROOT / "qwen-telephony" / "config" / "local.env", override=False)
 
+platform_settings = PlatformSettings.from_env(ROOT)
+platform_store = PlatformStore(
+    platform_settings.database_path,
+    default_retention_days=platform_settings.default_retention_days,
+    database_url=platform_settings.database_url,
+    min_pool_size=platform_settings.database_pool_min_size,
+    max_pool_size=platform_settings.database_pool_max_size,
+    pool_timeout_seconds=platform_settings.database_pool_timeout_seconds,
+    connect_timeout_seconds=platform_settings.database_connect_timeout_seconds,
+)
+insights_service = InsightsService(platform_store)
+console_service = ConsoleService(platform_store, insights_service)
+platform_cipher = SecretCipher.load_or_create(
+    platform_settings.database_path.with_name("cloud-parity.key")
+)
+deployment_service = DeploymentService(platform_store, platform_cipher)
+docker_runtime = DockerRuntimeExecutor(
+    platform_store,
+    deployment_service.resolve_secrets,
+    network=os.getenv("CLOUD_PARITY_DOCKER_NETWORK", "qwen-livekit-net"),
+    health_timeout_seconds=float(os.getenv("CLOUD_PARITY_HEALTH_TIMEOUT_SECONDS", "60")),
+    drain_timeout_seconds=int(os.getenv("CLOUD_PARITY_DRAIN_TIMEOUT_SECONDS", "3600")),
+)
+if os.getenv("CLOUD_PARITY_RUNTIME_DRIVER", "control-plane").lower() == "docker":
+    deployment_service.runtime_executor = docker_runtime
+builder_service = BuilderService(platform_store)
+embed_service = EmbedService(
+    platform_store,
+    token_limit_per_minute=platform_settings.embed_tokens_per_minute,
+)
+inference_gateway = InferenceGateway(platform_store, deployment_service, insights_service)
+analytics_service = AnalyticsService(platform_store)
+telephony_service = TelephonyService(
+    platform_store,
+    phone_hash_key=platform_settings.phone_hash_key,
+    phone_cipher=platform_cipher,
+)
+
 app = FastAPI(title="Audio Agents Operations API")
+install_authenticator(
+    app,
+    create_authenticator(
+        platform_settings.authentication,
+        revocation_checker=platform_store.is_access_token_revoked,
+    ),
+)
+install_legacy_api_auth_boundary(app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(platform_settings.cors_allowed_origins),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Origin", "X-User-ID"],
 )
+
+
+@app.middleware("http")
+async def distributed_api_rate_limit(request: Request, call_next):
+    path = request.url.path
+    webhook_path = "/api/platform/telephony/webhooks/livekit"
+    is_webhook = path == webhook_path
+    limit = (
+        platform_settings.webhook_requests_per_minute
+        if is_webhook
+        else platform_settings.api_requests_per_minute
+    )
+    excluded = (
+        request.method == "OPTIONS"
+        or path in {"/api/health", "/api/platform/health", "/api/platform/health/live", "/api/platform/health/ready", "/metrics"}
+        or path.startswith("/static/")
+    )
+    if limit > 0 and not excluded:
+        authorization = request.headers.get("Authorization", "")
+        development_user = request.headers.get("X-User-ID", "")
+        remote = request.client.host if request.client else "unknown"
+        trusted_proxy_user = ""
+        auth_settings = platform_settings.authentication
+        if auth_settings.mode == "trusted-proxy":
+            supplied_secret = request.headers.get(
+                auth_settings.trusted_proxy_secret_header, ""
+            )
+            expected_secret = auth_settings.trusted_proxy_secret or ""
+            if expected_secret and hmac.compare_digest(supplied_secret, expected_secret):
+                trusted_proxy_user = request.headers.get(
+                    auth_settings.trusted_proxy_user_header, ""
+                )
+        identity = remote if is_webhook else (
+            authorization or trusted_proxy_user or development_user or remote
+        )
+        # A per-source ceiling prevents token rotation from creating unbounded
+        # limiter keys. The higher ceiling preserves independent user quotas for
+        # trusted enterprise proxies and NAT gateways.
+        source_limit = limit if is_webhook else min(limit * 4, 1_000_000)
+        source_result = await asyncio.to_thread(
+            platform_store.consume_api_rate_limit,
+            key=f"api-source:{remote}",
+            limit=source_limit,
+        )
+        if not source_result["allowed"]:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "API source rate limit exceeded"},
+                headers={"Retry-After": str(source_result["retry_after"])},
+            )
+        result = await asyncio.to_thread(
+            platform_store.consume_api_rate_limit,
+            key=f"api:{identity}",
+            limit=limit,
+        )
+        if not result["allowed"]:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "API request rate limit exceeded"},
+                headers={
+                    "Retry-After": str(result["retry_after"]),
+                    "X-RateLimit-Limit": str(result["limit"]),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(result["limit"])
+        response.headers["X-RateLimit-Remaining"] = str(result["remaining"])
+        return response
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def legacy_sqlite_production_boundary(request: Request, call_next):
+    path = request.url.path
+    if (
+        not LEGACY_SQLITE_ENABLED
+        and path.startswith("/api/")
+        and not path.startswith("/api/platform/")
+        and not path.startswith("/api/embed/")
+        and path not in {"/api/health", "/api/dialogue/start", "/api/dialogue/turn"}
+    ):
+        return JSONResponse(
+            status_code=410,
+            content={
+                "detail": "legacy single-node API is disabled; use /api/platform"
+            },
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def dynamic_embed_cors(request: Request, call_next):
+    """Apply per-widget CORS without broadening management API origins."""
+    path_parts = request.url.path.split("/")
+    is_embed_token = (
+        len(path_parts) == 5
+        and path_parts[1:3] == ["api", "embed"]
+        and path_parts[4] == "token"
+    )
+    if not is_embed_token:
+        return await call_next(request)
+    origin = request.headers.get("Origin", "").strip()
+    config_id = path_parts[3]
+    allowed = bool(origin) and await asyncio.to_thread(
+        embed_service.is_origin_allowed,
+        config_id=config_id,
+        request_origin=origin,
+    )
+    cors_headers = {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "600",
+        "Vary": "Origin",
+    }
+    if request.method == "OPTIONS":
+        if not allowed:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "origin is not allowed"},
+            )
+        return Response(status_code=204, headers=cors_headers)
+    response = await call_next(request)
+    if allowed:
+        for name, value in cors_headers.items():
+            response.headers[name] = value
+    return response
+
+app.include_router(create_platform_router(platform_store))
+app.include_router(create_insights_router(insights_service))
+app.include_router(create_console_router(console_service))
+app.include_router(create_deployment_router(deployment_service))
+app.include_router(create_builder_router(builder_service))
+app.include_router(create_embed_router(embed_service))
+app.include_router(create_inference_router(inference_gateway))
+app.include_router(create_analytics_router(analytics_service))
+app.include_router(create_runtime_router(docker_runtime))
+app.include_router(create_telephony_router(telephony_service))
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -477,15 +694,33 @@ class PushRecordCreate(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
-    init_db()
-    seed_db()
-    seed_dialogue_db()
+    platform_store.initialize()
+    telephony_service.protect_legacy_phone_data()
+    if LEGACY_SQLITE_ENABLED:
+        init_db()
+        seed_db()
+        seed_dialogue_db()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    platform_store.close()
 
 
 @app.get("/")
-def index() -> FileResponse:
+def index() -> Response:
+    if not LEGACY_SQLITE_ENABLED:
+        return RedirectResponse(url="/cloud-parity", status_code=307)
     return FileResponse(
         STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/cloud-parity")
+def cloud_parity_console() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "cloud-parity.html",
         headers={"Cache-Control": "no-store, max-age=0"},
     )
 
@@ -493,6 +728,25 @@ def index() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics(request: Request) -> Response:
+    expected = platform_settings.metrics_token
+    if expected:
+        authorization = request.headers.get("Authorization", "")
+        supplied = (
+            authorization[len("Bearer ") :]
+            if authorization.startswith("Bearer ")
+            else ""
+        )
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="invalid metrics credentials")
+    return Response(
+        render_prometheus_metrics(platform_store),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/dialogue/config")
@@ -1252,6 +1506,8 @@ def list_unresolved(scene_id: int | None = None) -> list[dict]:
 
 @app.post("/api/dialogue/turn")
 def dialogue_turn(payload: DialogueTurnRequest) -> dict:
+    if not LEGACY_SQLITE_ENABLED:
+        return {"handled": False, "route_type": "llm_fallback", "reason": "legacy_dialogue_disabled"}
     return handle_turn(
         session_id=payload.session_id,
         text=payload.text,
@@ -1263,6 +1519,8 @@ def dialogue_turn(payload: DialogueTurnRequest) -> dict:
 
 @app.post("/api/dialogue/start")
 def dialogue_start(payload: DialogueStartRequest) -> dict:
+    if not LEGACY_SQLITE_ENABLED:
+        return {"handled": False, "route_type": "llm_fallback", "reason": "legacy_dialogue_disabled"}
     return start_session(session_id=payload.session_id, scene_id=payload.scene_id)
 
 

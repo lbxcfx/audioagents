@@ -1,0 +1,74 @@
+groups:
+  - name: cloud-parity-telephony
+    rules:
+      - alert: CloudParityControlPlaneDown
+        expr: up{job="cloud-parity"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Cloud-Parity control plane is unavailable
+
+      - alert: TelephonyOutboundQueueBacklog
+        expr: telephony_queue_depth > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Outbound call queue is above 100 jobs
+
+      - alert: TelephonyOutboundQueueStalled
+        expr: telephony_queue_oldest_age_seconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Oldest outbound call has waited more than five minutes
+
+      - alert: TelephonyStaleLeases
+        expr: telephony_stale_leases > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Expired call leases are not being recovered
+
+      - alert: TelephonyDispatcherNotReady
+        expr: telephony_dispatcher_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Telephony dispatcher cannot poll the control plane
+
+      - alert: TelephonyCallsStuckReconciling
+        expr: telephony_calls{status="reconciling"} > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Calls remain in reconciliation for more than ten minutes
+
+      - alert: TelephonyLiveKitWebhookUnmatched
+        expr: increase(telephony_webhook_events_total{outcome="unmatched"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Signed LiveKit events cannot be matched to calls
+
+      - alert: TelephonyTransferFailures
+        expr: telephony_transfer_failures_recent > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Human call transfers are failing repeatedly
+
+      - alert: TelephonyMandatoryRecordingFailure
+        expr: telephony_recording_failures_recent > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A managed call failed its mandatory recording policy

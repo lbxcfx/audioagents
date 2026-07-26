@@ -1,0 +1,20 @@
+# Values fragment for prometheus-community/prometheus-adapter. These external
+# metrics drive the queue/call based HPA rules in commercial-stack.yaml.
+rules:
+  external:
+    - seriesQuery: 'telephony_queue_depth{namespace!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+      name:
+        matches: '^telephony_queue_depth$'
+        as: telephony_queue_depth
+      metricsQuery: 'sum(max by (project_id) (telephony_queue_depth{<<.LabelMatchers>>}))'
+    - seriesQuery: 'telephony_active_calls{namespace!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+      name:
+        matches: '^telephony_active_calls$'
+        as: telephony_active_calls
+      metricsQuery: 'sum(max by (project_id) (telephony_active_calls{<<.LabelMatchers>>}))'

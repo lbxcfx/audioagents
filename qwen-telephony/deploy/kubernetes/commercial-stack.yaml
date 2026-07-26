@@ -1,0 +1,513 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qwen-telephony
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-parity-config
+  namespace: qwen-telephony
+data:
+  CLOUD_PARITY_ENV: production
+  CLOUD_PARITY_AUTH_MODE: oidc
+  CLOUD_PARITY_OIDC_ISSUER: https://idp.example.com/
+  CLOUD_PARITY_OIDC_AUDIENCE: qwen-telephony
+  CLOUD_PARITY_OIDC_JWKS_URL: https://idp.example.com/.well-known/jwks.json
+  CLOUD_PARITY_API_REQUESTS_PER_MINUTE: "600"
+  CLOUD_PARITY_WEBHOOK_REQUESTS_PER_MINUTE: "6000"
+  CLOUD_PARITY_EMBED_TOKENS_PER_MINUTE: "60"
+  CLOUD_PARITY_DB_POOL_MIN_SIZE: "2"
+  CLOUD_PARITY_DB_POOL_MAX_SIZE: "20"
+  CLOUD_PARITY_CONTROL_URL: http://cloud-parity:8091
+  CONTROL_PLANE_UPSTREAM: http://cloud-parity:8091
+  OIDC_CONNECT_SRC: https://idp.example.com
+  QWEN_DIALOGUE_URL: http://cloud-parity:8091/api/dialogue/turn
+  QWEN_DIALOGUE_TIMEOUT: "2.0"
+  CLOUD_PARITY_TELEPHONY_PROJECT_IDS: replace-with-project-uuid
+  CLOUD_PARITY_TELEPHONY_CLAIM_BATCH: "20"
+  CLOUD_PARITY_TELEPHONY_POLL_SECONDS: "0.5"
+  CLOUD_PARITY_TELEPHONY_HEALTH_PORT: "9091"
+  CLOUD_PARITY_CONSOLE_POLL_SECONDS: "1"
+  QWEN_AGENT_PORT: "18081"
+  QWEN_AGENT_EXPLICIT_NAME: commercial-agent
+  QWEN_AGENT_LOAD_THRESHOLD: "0.80"
+  QWEN_NLU_ENABLED: "false"
+  QWEN_AMD_ENABLED: "true"
+  QWEN_AMD_IVR_DETECTION: "true"
+  QWEN_AMD_WAIT_UNTIL_FINISHED: "true"
+  QWEN_RECORDING_S3_BUCKET: replace-with-recording-bucket
+  QWEN_RECORDING_S3_REGION: ap-southeast-1
+  QWEN_RECORDING_S3_ENDPOINT: https://s3.ap-southeast-1.amazonaws.com
+  QWEN_RECORDING_S3_PREFIX: telephony-recordings
+  QWEN_GREETING_TEXT: 您好，这里是智能语音服务，请问有什么可以帮您？
+  QWEN_AGENT_INSTRUCTIONS: 你是专业的中文电话客服。先确认来电者需求，回答准确、简洁、自然；涉及隐私、付款或高风险操作时必须转人工处理。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-parity
+  namespace: qwen-telephony
+  labels:
+    monitoring: cloud-parity-control
+spec:
+  selector:
+    app: cloud-parity
+  ports:
+    - name: http
+      port: 8091
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-parity
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: cloud-parity
+  template:
+    metadata:
+      labels:
+        app: cloud-parity
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8091"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: cloud-parity}}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: cloud-parity}}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: control-plane
+          image: registry.example.com/qwen-telephony/control-plane:VERSION
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8091
+          envFrom:
+            - configMapRef:
+                name: cloud-parity-config
+            - secretRef:
+                name: cloud-parity-secrets
+          readinessProbe:
+            httpGet:
+              path: /api/platform/health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /api/platform/health/live
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+          startupProbe:
+            httpGet:
+              path: /api/platform/health/live
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: cache
+              mountPath: /app/qwen-telephony/cache
+            - name: logs
+              mountPath: /app/qwen-telephony/logs
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voice-console
+  namespace: qwen-telephony
+spec:
+  selector:
+    app: voice-console
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-console
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: voice-console}
+  template:
+    metadata:
+      labels: {app: voice-console}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: voice-console}}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: console
+          image: registry.example.com/qwen-telephony/voice-console:VERSION
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef: {name: cloud-parity-config}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: nginx-conf, mountPath: /etc/nginx/conf.d}
+            - {name: nginx-cache, mountPath: /var/cache/nginx}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: nginx-conf, emptyDir: {}}
+        - {name: nginx-cache, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telephony-dispatcher
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels:
+      app: telephony-dispatcher
+  template:
+    metadata:
+      labels:
+        app: telephony-dispatcher
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: telephony-dispatcher}}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: telephony-dispatcher}}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: dispatcher
+          image: registry.example.com/qwen-telephony/dispatcher:VERSION
+          ports:
+            - name: health
+              containerPort: 9091
+          envFrom:
+            - configMapRef: {name: cloud-parity-config}
+            - secretRef: {name: cloud-parity-secrets}
+          env:
+            - name: CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE
+              value: /run/secrets/service-token
+          volumeMounts:
+            - name: service-token
+              mountPath: /run/secrets
+              readOnly: true
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: service-token
+          secret:
+            secretName: cloud-parity-service-token
+            defaultMode: 0400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phone-agent
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  progressDeadlineSeconds: 900
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels:
+      app: phone-agent
+  template:
+    metadata:
+      labels:
+        app: phone-agent
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: phone-agent}}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: phone-agent}}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: agent
+          image: registry.example.com/qwen-telephony/agent:VERSION
+          ports:
+            - name: health
+              containerPort: 18081
+          envFrom:
+            - configMapRef: {name: cloud-parity-config}
+            - secretRef: {name: cloud-parity-secrets}
+          env:
+            - name: CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE
+              value: /run/secrets/service-token
+          volumeMounts:
+            - name: service-token
+              mountPath: /run/secrets
+              readOnly: true
+            - name: cache
+              mountPath: /app/qwen-telephony/cache
+            - name: logs
+              mountPath: /app/qwen-telephony/logs
+          readinessProbe:
+            httpGet: {path: /worker, port: health}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /worker, port: health}
+            periodSeconds: 30
+          startupProbe:
+            httpGet: {path: /worker, port: health}
+            periodSeconds: 10
+            failureThreshold: 60
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "4", memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: service-token
+          secret:
+            secretName: cloud-parity-service-token
+            defaultMode: 0400
+        - name: cache
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voice-console
+  namespace: qwen-telephony
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: voice-console}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloud-parity
+  namespace: qwen-telephony
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: cloud-parity}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: telephony-dispatcher
+  namespace: qwen-telephony
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: telephony-dispatcher}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: phone-agent
+  namespace: qwen-telephony
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: phone-agent}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voice-console
+  namespace: qwen-telephony
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: voice-console}
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cloud-parity
+  namespace: qwen-telephony
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: cloud-parity}
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: telephony-dispatcher
+  namespace: qwen-telephony
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: telephony-dispatcher}
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+    - type: External
+      external:
+        metric: {name: telephony_queue_depth}
+        target: {type: AverageValue, averageValue: "20"}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: phone-agent
+  namespace: qwen-telephony
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: phone-agent}
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+    - type: External
+      external:
+        metric: {name: telephony_active_calls}
+        target: {type: AverageValue, averageValue: "10"}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retention-purge
+  namespace: qwen-telephony
+spec:
+  schedule: "17 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+          containers:
+            - name: purge
+              image: registry.example.com/qwen-telephony/control-plane:VERSION
+              command: ["python", "scripts/purge-retention.py"]
+              envFrom:
+                - configMapRef: {name: cloud-parity-config}
+                - secretRef: {name: cloud-parity-secrets}
+              resources:
+                requests: {cpu: 100m, memory: 128Mi}
+                limits: {cpu: 500m, memory: 512Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                capabilities: {drop: ["ALL"]}

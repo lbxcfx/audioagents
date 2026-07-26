@@ -1,0 +1,342 @@
+{
+  "source": "https://help.aliyun.com/zh/model-studio/qwen-tts-voice-list",
+  "voices": [
+    {
+      "id": "Cherry",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250211/tixcef/cherry.wav",
+      "sample_url": "/static/qwen-voice-samples/Cherry.wav",
+      "filename": "Cherry.wav",
+      "bytes": 793004
+    },
+    {
+      "id": "Serena",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250211/bxokea/serena.wav",
+      "sample_url": "/static/qwen-voice-samples/Serena.wav",
+      "filename": "Serena.wav",
+      "bytes": 662444
+    },
+    {
+      "id": "Ethan",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250211/emaqdp/ethan.wav",
+      "sample_url": "/static/qwen-voice-samples/Ethan.wav",
+      "filename": "Ethan.wav",
+      "bytes": 723884
+    },
+    {
+      "id": "Chelsie",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250211/vnpxgw/chelsie.wav",
+      "sample_url": "/static/qwen-voice-samples/Chelsie.wav",
+      "filename": "Chelsie.wav",
+      "bytes": 853484
+    },
+    {
+      "id": "Momo",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/rvzrcx/Momo.wav",
+      "sample_url": "/static/qwen-voice-samples/Momo.wav",
+      "filename": "Momo.wav",
+      "bytes": 249986
+    },
+    {
+      "id": "Vivian",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/eetwkj/Vivian.wav",
+      "sample_url": "/static/qwen-voice-samples/Vivian.wav",
+      "filename": "Vivian.wav",
+      "bytes": 790330
+    },
+    {
+      "id": "Moon",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/bcaqju/Moon.wav",
+      "sample_url": "/static/qwen-voice-samples/Moon.wav",
+      "filename": "Moon.wav",
+      "bytes": 794256
+    },
+    {
+      "id": "Maia",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/fewawx/Maia.wav",
+      "sample_url": "/static/qwen-voice-samples/Maia.wav",
+      "filename": "Maia.wav",
+      "bytes": 497172
+    },
+    {
+      "id": "Kai",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/maiqbf/Kai.wav",
+      "sample_url": "/static/qwen-voice-samples/Kai.wav",
+      "filename": "Kai.wav",
+      "bytes": 846330
+    },
+    {
+      "id": "Nofish",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/xurcmx/Nofish.wav",
+      "sample_url": "/static/qwen-voice-samples/Nofish.wav",
+      "filename": "Nofish.wav",
+      "bytes": 2191272
+    },
+    {
+      "id": "Bella",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/optibu/Bella.wav",
+      "sample_url": "/static/qwen-voice-samples/Bella.wav",
+      "filename": "Bella.wav",
+      "bytes": 225002
+    },
+    {
+      "id": "Jennifer",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/fejjiv/Jennifer.wav",
+      "sample_url": "/static/qwen-voice-samples/Jennifer.wav",
+      "filename": "Jennifer.wav",
+      "bytes": 1487300
+    },
+    {
+      "id": "Ryan",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/wsytum/Ryan.wav",
+      "sample_url": "/static/qwen-voice-samples/Ryan.wav",
+      "filename": "Ryan.wav",
+      "bytes": 2172458
+    },
+    {
+      "id": "Katerina",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/fschpb/Katerina.wav",
+      "sample_url": "/static/qwen-voice-samples/Katerina.wav",
+      "filename": "Katerina.wav",
+      "bytes": 222808
+    },
+    {
+      "id": "Aiden",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/hgxtqi/Aiden.wav",
+      "sample_url": "/static/qwen-voice-samples/Aiden.wav",
+      "filename": "Aiden.wav",
+      "bytes": 1253546
+    },
+    {
+      "id": "Eldric Sage",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/hbvhwj/Eldric+Sage.wav",
+      "sample_url": "/static/qwen-voice-samples/Eldric_Sage.wav",
+      "filename": "Eldric_Sage.wav",
+      "bytes": 1207156
+    },
+    {
+      "id": "Mia",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/gpvlix/Mia.wav",
+      "sample_url": "/static/qwen-voice-samples/Mia.wav",
+      "filename": "Mia.wav",
+      "bytes": 439878
+    },
+    {
+      "id": "Mochi",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/zapcpe/Mochi.wav",
+      "sample_url": "/static/qwen-voice-samples/Mochi.wav",
+      "filename": "Mochi.wav",
+      "bytes": 827684
+    },
+    {
+      "id": "Bellona",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/wztwli/Bellona.wav",
+      "sample_url": "/static/qwen-voice-samples/Bellona.wav",
+      "filename": "Bellona.wav",
+      "bytes": 930606
+    },
+    {
+      "id": "Vincent",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/skfrkq/Vincent.wav",
+      "sample_url": "/static/qwen-voice-samples/Vincent.wav",
+      "filename": "Vincent.wav",
+      "bytes": 1079302
+    },
+    {
+      "id": "Bunny",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/aswewm/Bunny.wav",
+      "sample_url": "/static/qwen-voice-samples/Bunny.wav",
+      "filename": "Bunny.wav",
+      "bytes": 645910
+    },
+    {
+      "id": "Neil",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/ucmfkt/Neil.wav",
+      "sample_url": "/static/qwen-voice-samples/Neil.wav",
+      "filename": "Neil.wav",
+      "bytes": 743798
+    },
+    {
+      "id": "Elias",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/rhbvqx/Elias.wav",
+      "sample_url": "/static/qwen-voice-samples/Elias.wav",
+      "filename": "Elias.wav",
+      "bytes": 1101466
+    },
+    {
+      "id": "Arthur",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/ynqwyu/Arthur.wav",
+      "sample_url": "/static/qwen-voice-samples/Arthur.wav",
+      "filename": "Arthur.wav",
+      "bytes": 1350146
+    },
+    {
+      "id": "Nini",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/lppeba/Nini.wav",
+      "sample_url": "/static/qwen-voice-samples/Nini.wav",
+      "filename": "Nini.wav",
+      "bytes": 785422
+    },
+    {
+      "id": "Seren",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/xlksoe/Seren.wav",
+      "sample_url": "/static/qwen-voice-samples/Seren.wav",
+      "filename": "Seren.wav",
+      "bytes": 933844
+    },
+    {
+      "id": "Pip",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/gqxoub/Pip.wav",
+      "sample_url": "/static/qwen-voice-samples/Pip.wav",
+      "filename": "Pip.wav",
+      "bytes": 733898
+    },
+    {
+      "id": "Stella",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/azikxr/Stella.wav",
+      "sample_url": "/static/qwen-voice-samples/Stella.wav",
+      "filename": "Stella.wav",
+      "bytes": 695794
+    },
+    {
+      "id": "Bodega",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/jxnuap/Bodega.wav",
+      "sample_url": "/static/qwen-voice-samples/Bodega.wav",
+      "filename": "Bodega.wav",
+      "bytes": 926700
+    },
+    {
+      "id": "Sonrisa",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/uywoxb/Sonrisa.wav",
+      "sample_url": "/static/qwen-voice-samples/Sonrisa.wav",
+      "filename": "Sonrisa.wav",
+      "bytes": 1287558
+    },
+    {
+      "id": "Alek",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/wtklus/Alek.wav",
+      "sample_url": "/static/qwen-voice-samples/Alek.wav",
+      "filename": "Alek.wav",
+      "bytes": 874380
+    },
+    {
+      "id": "Dolce",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/pirhim/Dolce.wav",
+      "sample_url": "/static/qwen-voice-samples/Dolce.wav",
+      "filename": "Dolce.wav",
+      "bytes": 345770
+    },
+    {
+      "id": "Sohee",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/wwphft/Sohee.wav",
+      "sample_url": "/static/qwen-voice-samples/Sohee.wav",
+      "filename": "Sohee.wav",
+      "bytes": 4661302
+    },
+    {
+      "id": "Ono Anna",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/mvfbxy/Ono+Anna.wav",
+      "sample_url": "/static/qwen-voice-samples/Ono_Anna.wav",
+      "filename": "Ono_Anna.wav",
+      "bytes": 855510
+    },
+    {
+      "id": "Lenn",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/arnzdt/Lenn.wav",
+      "sample_url": "/static/qwen-voice-samples/Lenn.wav",
+      "filename": "Lenn.wav",
+      "bytes": 513492
+    },
+    {
+      "id": "Emilien",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/qltlde/Emilien.wav",
+      "sample_url": "/static/qwen-voice-samples/Emilien.wav",
+      "filename": "Emilien.wav",
+      "bytes": 433604
+    },
+    {
+      "id": "Andre",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/hhfogy/Andre.wav",
+      "sample_url": "/static/qwen-voice-samples/Andre.wav",
+      "filename": "Andre.wav",
+      "bytes": 1721624
+    },
+    {
+      "id": "Radio Gol",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20251120/vnezxq/Radio+Gol.wav",
+      "sample_url": "/static/qwen-voice-samples/Radio_Gol.wav",
+      "filename": "Radio_Gol.wav",
+      "bytes": 407898
+    },
+    {
+      "id": "Jada",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/qjfmmi/Jada.wav",
+      "sample_url": "/static/qwen-voice-samples/Jada.wav",
+      "filename": "Jada.wav",
+      "bytes": 795378
+    },
+    {
+      "id": "Dylan",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/ultaxm/Dylan.wav",
+      "sample_url": "/static/qwen-voice-samples/Dylan.wav",
+      "filename": "Dylan.wav",
+      "bytes": 847586
+    },
+    {
+      "id": "Li",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250916/frgdes/Li.wav",
+      "sample_url": "/static/qwen-voice-samples/Li.wav",
+      "filename": "Li.wav",
+      "bytes": 399404
+    },
+    {
+      "id": "Marcus",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/dwnnrg/Marcus.wav",
+      "sample_url": "/static/qwen-voice-samples/Marcus.wav",
+      "filename": "Marcus.wav",
+      "bytes": 821708
+    },
+    {
+      "id": "Roy",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/stsfsz/Roy.wav",
+      "sample_url": "/static/qwen-voice-samples/Roy.wav",
+      "filename": "Roy.wav",
+      "bytes": 4170713
+    },
+    {
+      "id": "Peter",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/twvnsp/Peter.wav",
+      "sample_url": "/static/qwen-voice-samples/Peter.wav",
+      "filename": "Peter.wav",
+      "bytes": 1242178
+    },
+    {
+      "id": "Sunny",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/jtrktt/Sunny.wav",
+      "sample_url": "/static/qwen-voice-samples/Sunny.wav",
+      "filename": "Sunny.wav",
+      "bytes": 705446
+    },
+    {
+      "id": "Eric",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/qhbznw/Eric.wav",
+      "sample_url": "/static/qwen-voice-samples/Eric.wav",
+      "filename": "Eric.wav",
+      "bytes": 1108812
+    },
+    {
+      "id": "Rocky",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/kfxxgp/Rocky.wav",
+      "sample_url": "/static/qwen-voice-samples/Rocky.wav",
+      "filename": "Rocky.wav",
+      "bytes": 946562
+    },
+    {
+      "id": "Kiki",
+      "source_url": "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20250910/qwinef/KiKi.wav",
+      "sample_url": "/static/qwen-voice-samples/Kiki.wav",
+      "filename": "Kiki.wav",
+      "bytes": 756824
+    }
+  ],
+  "failed": []
+}

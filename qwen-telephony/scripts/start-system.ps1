@@ -133,7 +133,7 @@ function Ensure-WindowsVenv {
   }
 
   Write-Step "Installing missing Windows Python dependencies"
-  & $python -m pip install -r (Join-Path $appRoot "requirements.txt")
+  & $python -m pip install -r (Join-Path $appRoot "requirements.lock")
   if ($LASTEXITCODE -ne 0) {
     throw "Dependency installation failed"
   }

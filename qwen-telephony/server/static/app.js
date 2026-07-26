@@ -40,9 +40,17 @@ function escapeHtml(value) {
 }
 
 async function api(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const accessToken = localStorage.getItem("cp.accessToken") || "";
+  if (accessToken) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  } else {
+    headers.set("X-User-ID", localStorage.getItem("cp.userId") || "local-admin");
+  }
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
   if (!response.ok) {
     const detail = await response.text();

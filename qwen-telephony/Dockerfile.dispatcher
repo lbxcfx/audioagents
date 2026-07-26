@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app/qwen-telephony
+
+RUN addgroup --system telephony \
+    && adduser --system --ingroup telephony --home /app/qwen-telephony telephony
+
+COPY qwen-telephony/requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir -r requirements.lock && pip check
+
+COPY qwen-telephony/scripts/telephony-dispatcher.py ./scripts/telephony-dispatcher.py
+COPY qwen-telephony/config ./config
+
+USER telephony
+EXPOSE 9091
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9091/ready', timeout=3)" || exit 1
+
+CMD ["python", "scripts/telephony-dispatcher.py"]

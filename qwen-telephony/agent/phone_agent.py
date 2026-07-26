@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import audioop
 import io
+import json
 import logging
 import os
 from pathlib import Path
 import threading
 from time import perf_counter
 from typing import Any
+import uuid
 import wave
 
 from dotenv import load_dotenv
+from google.protobuf.duration_pb2 import Duration
 import httpx
 from livekit import api, rtc
 from livekit.agents import (
+    AMD,
     Agent,
     AgentServer,
     AgentSession,
@@ -23,6 +27,7 @@ from livekit.agents import (
     MetricsCollectedEvent,
     TurnHandlingOptions,
     cli,
+    function_tool,
     metrics,
     room_io,
     stt,
@@ -41,7 +46,10 @@ load_dotenv(ROOT / "qwen-telephony" / "config" / "local.env", override=False)
 
 logger = logging.getLogger("qwen-phone-agent")
 
-GREETING_TEXT = "Hello, I am your voice assistant. We can start the call now."
+GREETING_TEXT = os.getenv(
+    "QWEN_GREETING_TEXT",
+    "Hello, I am your voice assistant. We can start the call now.",
+).strip()
 GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
 GREETING_ROOM_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_24k.wav"
 GREETING_AUDIO_LOCK_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav.lock"
@@ -312,7 +320,11 @@ async def fetch_dialogue_opening(session_id: str) -> dict | None:
 
     try:
         async with httpx.AsyncClient(timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8"))) as client:
-            response = await client.post(start_url, json=payload)
+            response = await client.post(
+                start_url,
+                headers=_telephony_control_headers(),
+                json=payload,
+            )
             response.raise_for_status()
             body = response.json()
     except Exception:
@@ -422,6 +434,11 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_duration(name: str, default: int, *, minimum: int, maximum: int) -> Duration:
+    seconds = max(minimum, min(_env_int(name, default), maximum))
+    return Duration(seconds=seconds)
 
 
 def _dialogue_audio_path(audio_url: str) -> Path | None:
@@ -564,20 +581,617 @@ async def warm_up_qwen_llm() -> None:
         await client.close()
 
 
+def _outbound_job(raw_metadata: str) -> dict[str, Any] | None:
+    if not raw_metadata.strip():
+        return None
+    if raw_metadata.startswith("enc:v1:"):
+        key = os.getenv("CLOUD_PARITY_DISPATCH_METADATA_KEY", "").strip()
+        if not key:
+            raise RuntimeError(
+                "encrypted outbound metadata requires CLOUD_PARITY_DISPATCH_METADATA_KEY"
+            )
+        try:
+            from cryptography.fernet import Fernet
+
+            raw_metadata = Fernet(key.encode("ascii")).decrypt(
+                raw_metadata.removeprefix("enc:v1:").encode("ascii")
+            ).decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError(
+                "outbound telephony job metadata authentication failed"
+            ) from exc
+    try:
+        payload = json.loads(raw_metadata)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring invalid agent job metadata")
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "telephony.outbound":
+        return None
+    required = (
+        "project_id", "call_id", "worker_id", "lease_token",
+        "phone_number", "livekit_trunk_id",
+    )
+    if any(not str(payload.get(key) or "").strip() for key in required):
+        raise RuntimeError("outbound telephony job metadata is incomplete")
+    return payload
+
+
+def _inbound_job(raw_metadata: str) -> dict[str, Any] | None:
+    if not raw_metadata.strip():
+        return None
+    try:
+        payload = json.loads(raw_metadata)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "telephony.inbound":
+        return None
+    if not str(payload.get("project_id") or "").strip():
+        raise RuntimeError("inbound telephony job metadata is incomplete")
+    return payload
+
+
+def _telephony_control_headers() -> dict[str, str]:
+    token = os.getenv("CLOUD_PARITY_SERVICE_BEARER_TOKEN", "").strip()
+    token_file = os.getenv("CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE", "").strip()
+    if token_file:
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError("service bearer token file cannot be read") from exc
+        if not token:
+            raise RuntimeError("service bearer token file is empty")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {
+        "X-User-ID": os.getenv("CLOUD_PARITY_SERVICE_USER_ID", "telephony-worker").strip()
+    }
+
+
+async def _telephony_control_post(
+    path: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    base_url = os.getenv("CLOUD_PARITY_CONTROL_URL", "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("CLOUD_PARITY_CONTROL_URL is required for managed telephony jobs")
+    url = f"{base_url}{path}"
+    timeout = float(os.getenv("CLOUD_PARITY_CONTROL_TIMEOUT_SECONDS", "5"))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, headers=_telephony_control_headers(), json=payload)
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"telephony control request failed: path={path.rsplit('/', 1)[-1]} "
+            f"status={response.status_code}"
+        )
+    return response.json()
+
+
+async def _insights_create_session(
+    job: dict[str, Any], *, room_name: str, agent_name: str
+) -> str:
+    session_id = str(job["call_id"])
+    await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}/sessions",
+        {
+            "session_id": session_id,
+            "room_name": room_name,
+            "agent_name": agent_name,
+            "metadata": {
+                "call_id": job["call_id"],
+                "direction": str(job.get("direction") or ""),
+            },
+        },
+    )
+    return session_id
+
+
+async def _insights_event(
+    job: dict[str, Any],
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}/sessions/{session_id}/events",
+        {
+            "event_type": event_type,
+            "source": "agent",
+            "payload": payload or {},
+        },
+    )
+
+
+async def _insights_record_session_usage(
+    job: dict[str, Any], session_id: str, usage_summary: str
+) -> None:
+    await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}/sessions/{session_id}/usage",
+        {
+            "category": "agent_runtime",
+            "provider": "livekit-agents",
+            "model": os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
+            "quantity": 1,
+            "unit": "session",
+            "cost_usd": 0,
+        },
+    )
+    await _insights_event(
+        job,
+        session_id,
+        "agent.usage",
+        {"summary": usage_summary[:4000]},
+    )
+
+
+async def _insights_close_session(
+    job: dict[str, Any], session_id: str, status: str
+) -> None:
+    await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}/sessions/{session_id}/close",
+        {"status": status},
+    )
+
+
+_DTMF_CODES = {
+    **{str(number): number for number in range(10)},
+    "*": 10,
+    "#": 11,
+    "A": 12,
+    "B": 13,
+    "C": 14,
+    "D": 15,
+}
+
+
+async def _execute_console_command(
+    ctx: JobContext,
+    session: AgentSession,
+    command: dict[str, Any],
+    managed_job: dict[str, Any] | None = None,
+    sip_identity: str = "",
+) -> dict[str, Any]:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    command_type = str(command.get("command_type") or "")
+    if command_type == "dtmf":
+        digits = str(payload.get("digits") or "")
+        for digit in digits:
+            await ctx.room.local_participant.publish_dtmf(
+                code=_DTMF_CODES[digit], digit=digit
+            )
+        return {"digits_sent": len(digits)}
+    if command_type != "rpc":
+        raise ValueError("unsupported console command")
+
+    method = str(payload.get("method") or "").strip()
+    arguments = payload.get("arguments")
+    safe_arguments = arguments if isinstance(arguments, dict) else {}
+    if method == "agent.say":
+        text = str(safe_arguments.get("text") or "").strip()
+        if not text or len(text) > 2000:
+            raise ValueError("agent.say text is required and must not exceed 2000 characters")
+        speech = session.say(
+            text,
+            allow_interruptions=bool(safe_arguments.get("allow_interruptions", True)),
+        )
+        await speech.wait_for_playout()
+        return {"spoken": True}
+    if method == "call.hangup":
+        ctx.shutdown(reason="console requested hangup")
+        return {"hangup_requested": True}
+    if method == "call.transfer":
+        if not managed_job or not sip_identity:
+            raise ValueError("call.transfer requires an active managed SIP call")
+        destination_name = str(safe_arguments.get("destination_name") or "").strip()
+        reason = str(safe_arguments.get("reason") or "operator requested transfer").strip()
+        if not destination_name:
+            raise ValueError("call.transfer destination_name is required")
+        if len(reason) > 2000:
+            raise ValueError("call.transfer reason must not exceed 2000 characters")
+        await _execute_managed_transfer(
+            ctx,
+            managed_job,
+            sip_identity,
+            destination_name,
+            reason,
+        )
+        return {"transfer_completed": True, "destination_name": destination_name}
+
+    destination = str(payload.get("destination_identity") or "").strip()
+    if not destination:
+        raise ValueError("destination_identity is required for remote RPC")
+    response = await ctx.room.local_participant.perform_rpc(
+        destination_identity=destination,
+        method=method,
+        payload=json.dumps(safe_arguments, ensure_ascii=False, separators=(",", ":")),
+        response_timeout=min(30.0, max(1.0, float(payload.get("timeout_seconds") or 10))),
+    )
+    return {"response": str(response)[:16000]}
+
+
+async def _console_command_loop(
+    ctx: JobContext,
+    session: AgentSession,
+    job: dict[str, Any],
+    session_id: str,
+    sip_identity: str,
+) -> None:
+    worker_id = f"agent:{os.getpid()}:{ctx.room.name}"[:200]
+    poll_seconds = min(
+        5.0,
+        max(0.25, float(os.getenv("CLOUD_PARITY_CONSOLE_POLL_SECONDS", "1"))),
+    )
+    claim_path = (
+        f"/api/platform/projects/{job['project_id']}/sessions/{session_id}"
+        "/console/commands/claim"
+    )
+    while True:
+        commands: list[dict[str, Any]] = []
+        try:
+            response = await _telephony_control_post(
+                claim_path,
+                {"worker_id": worker_id, "limit": 10, "lease_seconds": 30},
+            )
+            commands = list(response.get("items") or [])
+            for command in commands:
+                status = "completed"
+                try:
+                    result = await _execute_console_command(
+                        ctx,
+                        session,
+                        command,
+                        managed_job=job,
+                        sip_identity=sip_identity,
+                    )
+                except Exception as exc:
+                    status = "failed"
+                    result = {"error": type(exc).__name__, "detail": str(exc)[:1000]}
+                    logger.exception(
+                        "Console command failed: session_id=%s command_id=%s",
+                        session_id,
+                        command.get("id"),
+                    )
+                await _telephony_control_post(
+                    f"/api/platform/projects/{job['project_id']}/sessions/{session_id}"
+                    f"/console/commands/{command['id']}/complete",
+                    {"worker_id": worker_id, "status": status, "result": result},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Console command polling failed: session_id=%s", session_id)
+        await asyncio.sleep(0 if commands else poll_seconds)
+
+
+async def _telephony_control_request(
+    job: dict[str, Any],
+    endpoint: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}"
+        f"/telephony/calls/{job['call_id']}/{endpoint}",
+        payload,
+    )
+
+
+async def _telephony_transition(
+    job: dict[str, Any],
+    status: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    return await _telephony_control_request(
+        job,
+        "transition",
+        {
+            "status": status,
+            "worker_id": job.get("worker_id", ""),
+            "lease_token": job.get("lease_token", ""),
+            **fields,
+        },
+    )
+
+
+async def _telephony_record_result(
+    job: dict[str, Any],
+    *,
+    answering_machine_category: str = "",
+    disposition: str = "",
+) -> dict[str, Any]:
+    return await _telephony_control_request(
+        job,
+        "result",
+        {
+            "worker_id": job.get("worker_id", ""),
+            "lease_token": job.get("lease_token", ""),
+            "answering_machine_category": answering_machine_category,
+            "disposition": disposition,
+        },
+    )
+
+
+async def _telephony_record_recording(
+    job: dict[str, Any],
+    *,
+    egress_id: str,
+    status: str,
+    storage_uri: str,
+) -> dict[str, Any]:
+    return await _telephony_control_request(
+        job,
+        "recording",
+        {
+            "worker_id": job.get("worker_id", ""),
+            "lease_token": job.get("lease_token", ""),
+            "egress_id": egress_id,
+            "status": status,
+            "storage_uri": storage_uri,
+        },
+    )
+
+
+async def _start_managed_recording(
+    ctx: JobContext,
+    session: AgentSession,
+    job: dict[str, Any],
+) -> tuple[str, str]:
+    if str(job.get("recording_mode") or "off") != "always":
+        return "", ""
+    disclosure = str(job.get("recording_disclosure_text") or "").strip()
+    if not disclosure:
+        raise RuntimeError("recording disclosure text is missing")
+    bucket = os.getenv("QWEN_RECORDING_S3_BUCKET", "").strip()
+    region = os.getenv("QWEN_RECORDING_S3_REGION", "").strip()
+    if not bucket or not region:
+        raise RuntimeError("recording requires QWEN_RECORDING_S3_BUCKET and region")
+    prefix = os.getenv("QWEN_RECORDING_S3_PREFIX", "telephony-recordings").strip(" /")
+    if not prefix or ".." in prefix:
+        raise RuntimeError("invalid QWEN_RECORDING_S3_PREFIX")
+
+    notice = session.say(disclosure, allow_interruptions=False)
+    await notice.wait_for_playout()
+    filepath = f"{prefix}/{job['project_id']}/{job['call_id']}.ogg"
+    upload = api.S3Upload(
+        access_key=os.getenv("QWEN_RECORDING_S3_ACCESS_KEY", "").strip(),
+        secret=os.getenv("QWEN_RECORDING_S3_SECRET", "").strip(),
+        session_token=os.getenv("QWEN_RECORDING_S3_SESSION_TOKEN", "").strip(),
+        region=region,
+        endpoint=os.getenv("QWEN_RECORDING_S3_ENDPOINT", "").strip(),
+        bucket=bucket,
+        force_path_style=os.getenv(
+            "QWEN_RECORDING_S3_FORCE_PATH_STYLE", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"},
+    )
+    info = await ctx.api.egress.start_room_composite_egress(
+        api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            audio_only=True,
+            audio_mixing=api.AudioMixing.DUAL_CHANNEL_AGENT,
+            file_outputs=[
+                api.EncodedFileOutput(
+                    file_type=api.EncodedFileType.OGG,
+                    filepath=filepath,
+                    s3=upload,
+                )
+            ],
+        )
+    )
+    egress_id = str(info.egress_id or "")
+    if not egress_id:
+        raise RuntimeError("LiveKit Egress did not return an egress id")
+    storage_uri = f"s3://{bucket}/{filepath}"
+    await _telephony_record_recording(
+        job,
+        egress_id=egress_id,
+        status="active",
+        storage_uri=storage_uri,
+    )
+    return egress_id, storage_uri
+
+
+async def _telephony_heartbeat(job: dict[str, Any]) -> None:
+    interval = max(3.0, min(float(job.get("heartbeat_seconds") or 10), 60.0))
+    failures = 0
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _telephony_control_request(
+                job,
+                "heartbeat",
+                {"worker_id": job["worker_id"], "lease_token": job["lease_token"]},
+            )
+            failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failures += 1
+            logger.exception(
+                "Telephony lease heartbeat failed: call_id=%s failures=%s",
+                job.get("call_id"),
+                failures,
+            )
+
+
+async def _cancel_task(task: asyncio.Task[Any] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def _sip_failure(exc: Exception) -> tuple[str, str, bool]:
+    try:
+        code = int(getattr(exc, "sip_status_code", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in {486, 600, 603}:
+        return "busy", f"sip_{code}", False
+    if code in {408, 480}:
+        return "no_answer", f"sip_{code}", True
+    return "failed", f"sip_{code}" if code else "sip_error", code >= 500 or code == 0
+
+
+async def _admit_inbound_call(
+    config: dict[str, Any],
+    participant: rtc.RemoteParticipant,
+    room_name: str,
+) -> dict[str, Any]:
+    attributes = dict(participant.attributes or {})
+    provider_call_id = (
+        attributes.get("sip.callID")
+        or attributes.get("sip.callIDFull")
+        or f"{room_name}:{participant.identity}"
+    )
+    project_id = str(config["project_id"])
+    worker_id = str(
+        config.get("worker_id")
+        or os.getenv("CLOUD_PARITY_TELEPHONY_WORKER_ID")
+        or f"agent-{os.getpid()}"
+    )
+    return await _telephony_control_post(
+        f"/api/platform/projects/{project_id}/telephony/calls/inbound",
+        {
+            "provider": str(config.get("provider") or "livekit-sip"),
+            "provider_call_id": str(provider_call_id),
+            "worker_id": worker_id,
+            "source_number": str(attributes.get("sip.phoneNumber") or ""),
+            "destination_number": str(attributes.get("sip.trunkPhoneNumber") or ""),
+            "agent_name": str(
+                config.get("agent_name")
+                or os.getenv("QWEN_AGENT_EXPLICIT_NAME")
+                or os.getenv("LIVEKIT_AGENT_NAME")
+                or "qwen-phone-agent"
+            ),
+            "room_name": room_name,
+            "trunk_id": config.get("trunk_id"),
+            "metadata": {
+                "livekit_participant_identity": participant.identity,
+                "livekit_sip_trunk_id": attributes.get("sip.trunkID", ""),
+                "livekit_dispatch_rule_id": attributes.get("sip.ruleID", ""),
+            },
+        },
+    )
+
+
+async def _execute_managed_transfer(
+    ctx: JobContext,
+    job: dict[str, Any],
+    sip_identity: str,
+    destination_name: str,
+    reason: str,
+) -> None:
+    transfer = await _telephony_control_post(
+        f"/api/platform/projects/{job['project_id']}"
+        f"/telephony/calls/{job['call_id']}/transfers",
+        {
+            "worker_id": job["worker_id"],
+            "lease_token": job["lease_token"],
+            "destination_name": destination_name,
+            "idempotency_key": f"agent-{uuid.uuid4().hex}",
+            "context_summary": reason[:2000],
+        },
+    )
+    transition_path = (
+        f"/api/platform/projects/{job['project_id']}"
+        f"/telephony/calls/{job['call_id']}/transfers/{transfer['id']}/transition"
+    )
+    await _telephony_control_post(
+        transition_path,
+        {
+            "worker_id": job["worker_id"],
+            "lease_token": job["lease_token"],
+            "status": "transferring",
+        },
+    )
+    try:
+        await ctx.api.sip.transfer_sip_participant(
+            api.TransferSIPParticipantRequest(
+                room_name=ctx.room.name,
+                participant_identity=sip_identity,
+                transfer_to=str(transfer["target_uri"]),
+                play_dialtone=True,
+            )
+        )
+    except Exception as exc:
+        try:
+            await _telephony_control_post(
+                transition_path,
+                {
+                    "worker_id": job["worker_id"],
+                    "lease_token": job["lease_token"],
+                    "status": "failed",
+                    "failure_code": "livekit_transfer_failed",
+                    "failure_detail": type(exc).__name__,
+                },
+            )
+        except Exception:
+            logger.exception("Unable to persist human transfer failure")
+        raise
+    await _telephony_control_post(
+        transition_path,
+        {
+            "worker_id": job["worker_id"],
+            "lease_token": job["lease_token"],
+            "status": "completed",
+        },
+    )
+
+
 class PhoneAgent(Agent):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        ctx: JobContext | None = None,
+        managed_job: dict[str, Any] | None = None,
+        sip_identity: str = "",
+    ) -> None:
+        self._job_ctx = ctx
+        self._managed_job = managed_job
+        self._sip_identity = sip_identity
         super().__init__(
-            instructions=(
+            instructions=os.getenv(
+                "QWEN_AGENT_INSTRUCTIONS",
+                (
                 "你是一个中文语音电话助手，负责直接回答用户问题。"
                 "回答要准确、简洁、自然，适合电话语音播报。"
                 "优先给出结论，再补充必要说明。"
                 "如果没有听清用户问题，只回答：我没有听清，请再说一遍。"
                 "通常不超过三句话，除非用户明确要求详细解释。"
-            )
+                ),
+            ).strip()
         )
 
     async def on_enter(self) -> None:
         logger.info("PhoneAgent.on_enter: ready")
+
+    @function_tool(
+        description=(
+            "Transfer the current caller to a configured human service destination. "
+            "Use only after the caller explicitly asks for a human or the issue requires escalation."
+        )
+    )
+    async def transfer_to_human(self, destination_name: str, reason: str) -> str:
+        if not self._job_ctx or not self._managed_job or not self._sip_identity:
+            return "当前通话未接入受管客服转接，请继续协助用户。"
+        job = self._managed_job
+        try:
+            await _execute_managed_transfer(
+                self._job_ctx,
+                job,
+                self._sip_identity,
+                destination_name,
+                reason,
+            )
+            return "已为您转接人工客服，请稍候。"
+        except Exception as exc:
+            logger.exception(
+                "Human transfer failed: call_id=%s destination=%s",
+                job.get("call_id"),
+                destination_name,
+            )
+            return "人工客服暂时无法接通，我会继续为您处理。"
 
 
 server = AgentServer(
@@ -592,6 +1206,91 @@ server = AgentServer(
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     ctx.log_context_fields = {"room": ctx.room.name}
+
+    raw_job_metadata = ctx.job.metadata or ""
+    outbound_job = _outbound_job(raw_job_metadata)
+    inbound_config = _inbound_job(raw_job_metadata)
+    managed_job = outbound_job
+    managed_sip_identity = ""
+    heartbeat_task: asyncio.Task[None] | None = None
+    console_task: asyncio.Task[None] | None = None
+    insights_session_id = ""
+    telephony_terminal = False
+    if outbound_job:
+        outbound_job["direction"] = "outbound"
+        managed_sip_identity = f"sip-{outbound_job['call_id']}"
+
+    if inbound_config:
+        try:
+            sip_participant = await ctx.wait_for_participant(
+                kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+            )
+            admitted = await _admit_inbound_call(
+                inbound_config,
+                sip_participant,
+                ctx.room.name,
+            )
+            managed_job = {
+                "project_id": inbound_config["project_id"],
+                "call_id": admitted["id"],
+                "direction": "inbound",
+                "worker_id": admitted["lease_owner"],
+                "lease_token": admitted["lease_token"],
+                "heartbeat_seconds": inbound_config.get("heartbeat_seconds", 10),
+                "recording_mode": admitted.get("recording_mode", "off"),
+                "recording_disclosure_text": admitted.get(
+                    "recording_disclosure_text", ""
+                ),
+            }
+            managed_sip_identity = sip_participant.identity
+            heartbeat_task = asyncio.create_task(_telephony_heartbeat(managed_job))
+            await _telephony_transition(managed_job, "active", room_name=ctx.room.name)
+            overflow = admitted.get("overflow") if isinstance(admitted, dict) else None
+            if isinstance(overflow, dict) and overflow.get("mode") == "transfer":
+                await _execute_managed_transfer(
+                    ctx,
+                    managed_job,
+                    managed_sip_identity,
+                    str(overflow["destination_name"]),
+                    "Inbound AI concurrency capacity exhausted; overflow routing.",
+                )
+                telephony_terminal = True
+                await _cancel_task(heartbeat_task)
+                ctx.shutdown(reason="inbound call transferred to overflow destination")
+                return
+        except Exception:
+            logger.exception("Inbound call admission failed; rejecting room=%s", ctx.room.name)
+            try:
+                await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+            except Exception:
+                logger.exception("Unable to delete rejected inbound room=%s", ctx.room.name)
+            await _cancel_task(heartbeat_task)
+            ctx.shutdown(reason="inbound admission rejected")
+            return
+
+    if managed_job:
+        try:
+            insights_session_id = await _insights_create_session(
+                managed_job,
+                room_name=ctx.room.name,
+                agent_name=str(
+                    os.getenv("QWEN_AGENT_EXPLICIT_NAME")
+                    or os.getenv("LIVEKIT_AGENT_NAME")
+                    or "qwen-phone-agent"
+                ),
+            )
+            await _insights_event(
+                managed_job,
+                insights_session_id,
+                "agent.started",
+                {"room_name": ctx.room.name, "direction": managed_job.get("direction", "")},
+            )
+        except Exception:
+            insights_session_id = ""
+            logger.exception(
+                "Unable to initialize managed Insights session: call_id=%s",
+                managed_job.get("call_id"),
+            )
 
     start_llm_warmup_background_thread()
 
@@ -627,6 +1326,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     hangup_task: asyncio.Task[None] | None = None
     current_speech_handle: Any = None
+    recording_egress_id = ""
+    recording_storage_uri = ""
 
     def on_dialogue_result(result: dict) -> None:
         nonlocal hangup_task
@@ -687,9 +1388,28 @@ async def entrypoint(ctx: JobContext) -> None:
         aec_warmup_duration=1.0,
     )
 
+    metrics_event_count = 0
+
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
+        nonlocal metrics_event_count
         metrics.log_metrics(ev.metrics)
+        metrics_event_count += 1
+        if managed_job and insights_session_id and metrics_event_count % 10 == 1:
+            sample_number = metrics_event_count
+            sample = str(ev.metrics)[:4000]
+            async def persist_metrics() -> None:
+                try:
+                    await _insights_event(
+                        managed_job,
+                        insights_session_id,
+                        "agent.metrics",
+                        {"sample": sample, "sample_number": sample_number},
+                    )
+                except Exception:
+                    logger.exception("Unable to persist agent metrics sample")
+
+            asyncio.create_task(persist_metrics())
 
     @session.on("speech_created")
     def _on_speech_created(ev) -> None:
@@ -701,8 +1421,90 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(log_usage)
 
+    if managed_job and insights_session_id:
+        async def finalize_insights(reason: str) -> None:
+            await _cancel_task(console_task)
+            try:
+                await _insights_record_session_usage(
+                    managed_job, insights_session_id, str(session.usage)
+                )
+                await _insights_event(
+                    managed_job,
+                    insights_session_id,
+                    "agent.stopped",
+                    {"reason": reason[:1000]},
+                )
+                await _insights_close_session(
+                    managed_job,
+                    insights_session_id,
+                    "failed" if "failed" in reason.lower() or "rejected" in reason.lower() else "completed",
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to finalize Insights session: session_id=%s",
+                    insights_session_id,
+                )
+
+        ctx.add_shutdown_callback(finalize_insights)
+
+    if managed_job:
+        async def finalize_telephony_call(reason: str) -> None:
+            nonlocal telephony_terminal, recording_egress_id
+            await _cancel_task(heartbeat_task)
+            if recording_egress_id:
+                recording_status = "stopping"
+                try:
+                    stopped = await ctx.api.egress.stop_egress(
+                        api.StopEgressRequest(egress_id=recording_egress_id)
+                    )
+                    provider_status = api.EgressStatus.Name(int(stopped.status))
+                    recording_status = {
+                        "EGRESS_COMPLETE": "completed",
+                        "EGRESS_FAILED": "failed",
+                        "EGRESS_ABORTED": "failed",
+                        "EGRESS_LIMIT_REACHED": "failed",
+                    }.get(provider_status, "stopping")
+                except Exception:
+                    logger.exception(
+                        "Recording stop result is uncertain; awaiting Egress webhook: egress_id=%s",
+                        recording_egress_id,
+                    )
+                try:
+                    await _telephony_record_recording(
+                        managed_job,
+                        egress_id=recording_egress_id,
+                        status=recording_status,
+                        storage_uri=recording_storage_uri,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to persist final recording status: call_id=%s",
+                        managed_job["call_id"],
+                    )
+                recording_egress_id = ""
+            if telephony_terminal:
+                return
+            try:
+                await _telephony_transition(
+                    managed_job,
+                    "completed",
+                    failure_detail=reason[:500],
+                )
+                telephony_terminal = True
+            except Exception:
+                logger.exception(
+                    "Unable to finalize managed call: call_id=%s",
+                    managed_job["call_id"],
+                )
+
+        ctx.add_shutdown_callback(finalize_telephony_call)
+
     await session.start(
-        agent=PhoneAgent(),
+        agent=PhoneAgent(
+            ctx=ctx,
+            managed_job=managed_job,
+            sip_identity=managed_sip_identity,
+        ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(),
@@ -712,6 +1514,227 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
         ),
     )
+
+    if managed_job and insights_session_id:
+        console_task = asyncio.create_task(
+            _console_command_loop(
+                ctx,
+                session,
+                managed_job,
+                insights_session_id,
+                managed_sip_identity,
+            )
+        )
+
+    async def ensure_required_recording() -> bool:
+        nonlocal recording_egress_id, recording_storage_uri, telephony_terminal
+        if not managed_job or str(managed_job.get("recording_mode") or "off") != "always":
+            return True
+        if recording_egress_id:
+            return True
+        try:
+            recording_egress_id, recording_storage_uri = await _start_managed_recording(
+                ctx, session, managed_job
+            )
+            return True
+        except Exception as exc:
+            logger.exception(
+                "Mandatory call recording failed to start: call_id=%s",
+                managed_job["call_id"],
+            )
+            try:
+                await _telephony_record_recording(
+                    managed_job,
+                    egress_id=f"setup:{managed_job['call_id']}",
+                    status="failed",
+                    storage_uri="",
+                )
+                await _telephony_transition(
+                    managed_job,
+                    "failed",
+                    failure_code="recording_start_failed",
+                    failure_detail=type(exc).__name__,
+                )
+                telephony_terminal = True
+            except Exception:
+                logger.exception("Unable to persist mandatory recording failure")
+            await _cancel_task(heartbeat_task)
+            ctx.shutdown(reason="mandatory recording failed")
+            return False
+
+    if outbound_job:
+        call_active = False
+        amd_category = ""
+        try:
+            # Persist dialing before causing the external PSTN side effect.
+            await _telephony_transition(
+                outbound_job,
+                "dialing",
+                room_name=ctx.room.name,
+            )
+            heartbeat_task = asyncio.create_task(_telephony_heartbeat(outbound_job))
+
+            async def dial_and_activate() -> None:
+                nonlocal call_active
+                participant = await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=str(outbound_job["livekit_trunk_id"]),
+                        sip_call_to=str(outbound_job["phone_number"]),
+                        sip_number=str(outbound_job.get("source_number") or ""),
+                        participant_identity=managed_sip_identity,
+                        participant_name="AI voice call",
+                        participant_metadata=json.dumps(
+                            {"call_id": outbound_job["call_id"]}, separators=(",", ":")
+                        ),
+                        wait_until_answered=True,
+                        ringing_timeout=_bounded_duration(
+                            "CLOUD_PARITY_TELEPHONY_RINGING_TIMEOUT_SECONDS",
+                            45,
+                            minimum=10,
+                            maximum=120,
+                        ),
+                        max_call_duration=_bounded_duration(
+                            "CLOUD_PARITY_TELEPHONY_MAX_CALL_DURATION_SECONDS",
+                            1800,
+                            minimum=60,
+                            maximum=14400,
+                        ),
+                    )
+                )
+                await ctx.wait_for_participant(identity=managed_sip_identity)
+                await _telephony_transition(
+                    outbound_job,
+                    "active",
+                    provider_call_id=str(participant.sip_call_id or ""),
+                    room_name=ctx.room.name,
+                )
+                call_active = True
+
+            amd_enabled = os.getenv("QWEN_AMD_ENABLED", "true").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            if amd_enabled:
+                detector = AMD(
+                    session,
+                    participant_identity=managed_sip_identity,
+                    ivr_detection=os.getenv("QWEN_AMD_IVR_DETECTION", "true").strip().lower()
+                    in {"1", "true", "yes", "on"},
+                    wait_until_finished=os.getenv(
+                        "QWEN_AMD_WAIT_UNTIL_FINISHED", "true"
+                    ).strip().lower() in {"1", "true", "yes", "on"},
+                )
+                async with detector:
+                    await dial_and_activate()
+                    try:
+                        amd_result = await detector.execute()
+                        amd_category = str(
+                            getattr(amd_result.category, "value", amd_result.category)
+                        )
+                    except Exception:
+                        amd_category = "uncertain"
+                        logger.exception(
+                            "Answering machine detection failed; treating as uncertain: call_id=%s",
+                            outbound_job["call_id"],
+                        )
+            else:
+                await dial_and_activate()
+
+            if amd_category:
+                disposition = {
+                    "machine-vm": "voicemail_detected",
+                    "machine-unavailable": "mailbox_unavailable",
+                    "machine-ivr": "ivr_detected",
+                    "human": "human_answered",
+                    "uncertain": "amd_uncertain",
+                }.get(amd_category, "")
+                await _telephony_record_result(
+                    outbound_job,
+                    answering_machine_category=amd_category,
+                    disposition=disposition,
+                )
+                logger.info(
+                    "Answering machine detection completed: call_id=%s category=%s",
+                    outbound_job["call_id"],
+                    amd_category,
+                )
+            if amd_category == "machine-vm":
+                if not await ensure_required_recording():
+                    return
+                voicemail = os.getenv(
+                    "QWEN_AMD_VOICEMAIL_MESSAGE",
+                    "您好，这里是智能语音服务。稍后我们会再次联系您，谢谢。",
+                ).strip()
+                speech = session.say(voicemail, allow_interruptions=False)
+                await speech.wait_for_playout()
+                await _telephony_transition(
+                    outbound_job,
+                    "completed",
+                    failure_detail="amd:machine-vm",
+                )
+                telephony_terminal = True
+                await _cancel_task(heartbeat_task)
+                ctx.shutdown(reason="amd:machine-vm")
+                return
+            if amd_category == "machine-unavailable":
+                await _telephony_transition(
+                    outbound_job,
+                    "completed",
+                    failure_detail="amd:machine-unavailable",
+                )
+                telephony_terminal = True
+                await _cancel_task(heartbeat_task)
+                ctx.shutdown(reason="amd:machine-unavailable")
+                return
+        except api.SipCallError as exc:
+            status, code, retryable = _sip_failure(exc)
+            await _telephony_transition(
+                outbound_job,
+                status,
+                failure_code=code,
+                failure_detail=str(getattr(exc, "sip_status", ""))[:500],
+                retryable=retryable,
+            )
+            telephony_terminal = True
+            await _cancel_task(heartbeat_task)
+            ctx.shutdown(reason=f"outbound dial failed: {code}")
+            return
+        except Exception as exc:
+            if call_active:
+                logger.exception(
+                    "Post-answer setup failed; continuing without AMD: call_id=%s",
+                    outbound_job["call_id"],
+                )
+                try:
+                    await _telephony_record_result(
+                        outbound_job,
+                        answering_machine_category="uncertain",
+                        disposition="amd_error",
+                    )
+                except Exception:
+                    logger.exception("Unable to persist AMD fallback result")
+            else:
+                logger.exception(
+                    "Outbound call setup result is uncertain; scheduling reconciliation: "
+                    "call_id=%s",
+                    outbound_job["call_id"],
+                )
+                try:
+                    await _telephony_transition(
+                        outbound_job,
+                        "reconciling",
+                        failure_code="sip_setup_result_uncertain",
+                        failure_detail=type(exc).__name__,
+                    )
+                    telephony_terminal = True
+                except Exception:
+                    logger.exception("Unable to persist outbound setup failure")
+                await _cancel_task(heartbeat_task)
+                ctx.shutdown(reason="outbound call setup failed")
+                return
+
+    if not await ensure_required_recording():
+        return
 
     opening = await fetch_dialogue_opening(ctx.room.name)
     if opening and opening.get("text"):

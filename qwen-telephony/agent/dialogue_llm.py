@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -14,6 +15,31 @@ from qwen_providers import register_recorded_audio
 
 
 logger = logging.getLogger("qwen-phone-agent.dialogue")
+
+
+def _dialogue_service_headers() -> dict[str, str]:
+    token = (
+        os.getenv("QWEN_DIALOGUE_SERVICE_BEARER_TOKEN", "").strip()
+        or os.getenv("CLOUD_PARITY_SERVICE_BEARER_TOKEN", "").strip()
+    )
+    token_file = (
+        os.getenv("QWEN_DIALOGUE_SERVICE_BEARER_TOKEN_FILE", "").strip()
+        or os.getenv("CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE", "").strip()
+    )
+    if token_file:
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError("dialogue service bearer token file cannot be read") from exc
+        if not token:
+            raise RuntimeError("dialogue service bearer token file is empty")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {
+        "X-User-ID": os.getenv(
+            "CLOUD_PARITY_SERVICE_USER_ID", "telephony-worker"
+        ).strip()
+    }
 
 
 def _env_enabled(value: str | None, default: bool = True) -> bool:
@@ -142,6 +168,7 @@ class ScriptFirstLLMStream(lk_llm.LLMStream):
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     response = await client.post(
                         self._dialogue_url,
+                        headers=_dialogue_service_headers(),
                         json={
                             "session_id": self._session_id,
                             "scene_id": self._scene_id,

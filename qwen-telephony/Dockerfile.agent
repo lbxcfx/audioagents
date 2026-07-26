@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    XDG_CACHE_HOME=/app/qwen-telephony/cache \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PIP_TRUSTED_HOST=mirrors.aliyun.com
 
@@ -11,12 +12,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY qwen-telephony/requirements.txt /app/qwen-telephony/requirements.txt
-RUN pip install --no-cache-dir -r /app/qwen-telephony/requirements.txt
+COPY qwen-telephony/requirements.lock /app/qwen-telephony/requirements.lock
+RUN pip install --no-cache-dir -r /app/qwen-telephony/requirements.lock && pip check
 
 COPY qwen-telephony/agent /app/qwen-telephony/agent
 COPY qwen-telephony/config /app/qwen-telephony/config
 
 WORKDIR /app/qwen-telephony/agent
 
-CMD ["python", "phone_agent.py", "dev"]
+RUN addgroup --system telephony \
+    && adduser --system --ingroup telephony --home /app/qwen-telephony telephony \
+    && mkdir -p /app/qwen-telephony/cache /app/qwen-telephony/logs \
+    && chown -R telephony:telephony /app/qwen-telephony/cache /app/qwen-telephony/logs
+
+USER telephony
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os, urllib.request; port=os.getenv('QWEN_AGENT_PORT', '18081'); urllib.request.urlopen(f'http://127.0.0.1:{port}/worker', timeout=3)" || exit 1
+
+CMD ["python", "phone_agent.py", "start"]
