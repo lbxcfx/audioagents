@@ -72,6 +72,7 @@ kubectl -n qwen-telephony rollout status deployment/phone-agent
 
 - 将 `config/telephony-alerts.yml` 加载到 Prometheus/Alertmanager。
 - 抓取控制面 `:8091/metrics` 和 Dispatcher `:9091/metrics` 时发送 `Authorization: Bearer <CLOUD_PARITY_METRICS_TOKEN>`；探针 `/live`、`/ready` 不使用该 Token。
+- 管理端、内部 Worker 与 Webhook 使用独立的分布式限流档位。按照峰值活跃通话数核算 `CLOUD_PARITY_WORKER_API_REQUESTS_PER_MINUTE`：每通电话至少预留 `60 / CLOUD_PARITY_CONSOLE_POLL_SECONDS + 60 / heartbeat_seconds` 次/分钟，再为状态、Insights、录音和重试保留不低于 2 倍余量。`CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE` 应覆盖单个 Agent Pod 的最大承载量，但不得高于 Worker 总限额。参考清单的 30000/12000 档位面向百路级受控压测，不替代 WAF 和 NetworkPolicy。
 - 使用 Prometheus Operator 时可直接应用 `deploy/kubernetes/observability.prometheus-operator.yaml`，其 ServiceMonitor 从 Secret 读取指标 Bearer Token，并安装关键电话告警。
 - `commercial-stack.yaml` 的 Dispatcher/Agent HPA 同时使用 CPU 和外部队列/活跃通话指标。先把 `deploy/kubernetes/prometheus-adapter-values.yaml` 合并到 Prometheus Adapter 配置并确认 External Metrics API 可查询，再发布 HPA；没有 Adapter 时删除两条 External 指标，不能让 HPA 长期处于 `FailedGetExternalMetric`。
 - 日志进入集中平台并设置敏感数据检测；业务号码不应出现在控制面返回给 Viewer 的数据、指标或 Dispatch 明文中。

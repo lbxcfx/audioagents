@@ -59,6 +59,17 @@ def test_phone_agent_heartbeat_stays_safely_inside_lease() -> None:
     ) == 2
 
 
+def test_console_polling_is_jittered_and_capacity_safe(monkeypatch) -> None:
+    monkeypatch.setenv("CLOUD_PARITY_CONSOLE_POLL_SECONDS", "2")
+
+    first = phone_agent._console_poll_interval("session-a")
+    second = phone_agent._console_poll_interval("session-b")
+
+    assert 1.7 <= first <= 2.3
+    assert 1.7 <= second <= 2.3
+    assert first != second
+
+
 def test_phone_agent_shutdown_does_not_complete_unanswered_call() -> None:
     assert phone_agent._outbound_shutdown_transition(
         answered=False, reason="worker shutdown"

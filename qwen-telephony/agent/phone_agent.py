@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import hashlib
 import io
 import json
 import logging
@@ -850,10 +851,7 @@ async def _console_command_loop(
     sip_identity: str,
 ) -> None:
     worker_id = f"agent:{os.getpid()}:{ctx.room.name}"[:200]
-    poll_seconds = min(
-        5.0,
-        max(0.25, float(os.getenv("CLOUD_PARITY_CONSOLE_POLL_SECONDS", "1"))),
-    )
+    poll_seconds = _console_poll_interval(session_id)
     claim_path = (
         f"/api/platform/projects/{job['project_id']}/sessions/{session_id}"
         "/console/commands/claim"
@@ -891,9 +889,34 @@ async def _console_command_loop(
                 )
         except asyncio.CancelledError:
             raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                try:
+                    retry_after = float(exc.response.headers.get("Retry-After", "1"))
+                except ValueError:
+                    retry_after = 1.0
+                logger.warning(
+                    "Console command polling rate-limited: session_id=%s retry_after=%s",
+                    session_id,
+                    retry_after,
+                )
+                await asyncio.sleep(max(poll_seconds, min(retry_after, 30.0)))
+                continue
+            logger.exception("Console command polling failed: session_id=%s", session_id)
         except Exception:
             logger.exception("Console command polling failed: session_id=%s", session_id)
         await asyncio.sleep(0 if commands else poll_seconds)
+
+
+def _console_poll_interval(session_id: str) -> float:
+    base = min(
+        5.0,
+        max(0.25, float(os.getenv("CLOUD_PARITY_CONSOLE_POLL_SECONDS", "2"))),
+    )
+    # Deterministic per-session jitter avoids synchronized polling after a pod
+    # rollout without making tests or command latency unpredictable.
+    bucket = hashlib.sha256(session_id.encode("utf-8")).digest()[0] / 255.0
+    return base * (0.85 + bucket * 0.30)
 
 
 async def _telephony_control_request(

@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import threading
+import time
 from typing import Any, Iterable, Mapping
 import uuid
 
@@ -901,6 +903,8 @@ class PlatformStore:
             pool_timeout_seconds=pool_timeout_seconds,
             connect_timeout_seconds=connect_timeout_seconds,
         )
+        self._rate_limit_cleanup_lock = threading.Lock()
+        self._rate_limit_cleanup_after = 0.0
 
     @property
     def backend(self) -> str:
@@ -1086,12 +1090,16 @@ class PlatformStore:
         ).isoformat().replace("+00:00", "Z")
         key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
         lock_suffix = " FOR UPDATE" if self.backend == "postgresql" else ""
+        cleanup_due = self._claim_rate_limit_cleanup(window_seconds)
         with self.transaction() as conn:
-            # Bound storage even when an attacker rotates arbitrary bearer tokens.
-            conn.execute(
-                "DELETE FROM api_rate_limit_windows WHERE updated_at < ?",
-                (stale_before,),
-            )
+            # Keep cleanup off the request hot path. Each control-plane process
+            # performs it at most once per window, while PostgreSQL makes the
+            # delete safe when several replicas become due together.
+            if cleanup_due:
+                conn.execute(
+                    "DELETE FROM api_rate_limit_windows WHERE updated_at < ?",
+                    (stale_before,),
+                )
             conn.execute(
                 """
                 INSERT INTO api_rate_limit_windows (
@@ -1140,6 +1148,14 @@ class PlatformStore:
             "remaining": max(0, limit - count),
             "retry_after": retry_after,
         }
+
+    def _claim_rate_limit_cleanup(self, window_seconds: int) -> bool:
+        current = time.monotonic()
+        with self._rate_limit_cleanup_lock:
+            if current < self._rate_limit_cleanup_after:
+                return False
+            self._rate_limit_cleanup_after = current + max(30, window_seconds)
+            return True
 
     def _purge_project_rows(
         self,

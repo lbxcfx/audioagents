@@ -45,6 +45,7 @@
 - [ ] 以计划峰值的至少 1.5 倍完成 API 入队、Dispatcher 抢占、Agent 并发、数据库连接和 SIP CPS 压测。
 - [ ] `/api/platform/health/live`、`/api/platform/health/ready`、Dispatcher `/live`/`/ready` 已接入编排探针。
 - [ ] 控制面与 Dispatcher `/metrics` 只在受控网络暴露，并使用 `CLOUD_PARITY_METRICS_TOKEN` Bearer；`config/telephony-alerts.yml` 已加载到 Prometheus/Alertmanager。
+- [ ] 以目标峰值并发运行 Agent 控制流量压测；Worker API 无 429、租约无误过期、Console 命令延迟满足 SLA，并据实填写 Worker/Source 限流值：____ / ____ RPM。
 - [ ] 队列积压/停滞、过期租约、长时间对账、Webhook 不匹配和转接失败告警能通知值班人员。
 - [ ] 演练 API/Dispatcher/Agent 单副本崩溃、数据库主从切换、LiveKit 暂时不可用和运营商故障；确认恢复后不重复拨号。
 - [ ] 值班手册包含停呼开关、DNC 紧急导入、失败任务处置、凭据轮换、回滚和事件通报。

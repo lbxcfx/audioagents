@@ -27,6 +27,8 @@ class PlatformSettings:
     )
     metrics_token: str = field(default="", repr=False)
     api_requests_per_minute: int = 600
+    worker_api_requests_per_minute: int = 30_000
+    worker_source_requests_per_minute: int = 12_000
     webhook_requests_per_minute: int = 6000
     embed_tokens_per_minute: int = 60
     authentication: AuthenticationSettings = field(
@@ -92,6 +94,24 @@ class PlatformSettings:
             )
         if environment == "production" and api_requests_per_minute == 0:
             raise ValueError("API rate limiting cannot be disabled in production")
+        worker_api_requests_per_minute = int(
+            os.getenv("CLOUD_PARITY_WORKER_API_REQUESTS_PER_MINUTE", "30000")
+        )
+        worker_source_requests_per_minute = int(
+            os.getenv("CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE", "12000")
+        )
+        if not 1 <= worker_api_requests_per_minute <= 1_000_000:
+            raise ValueError(
+                "CLOUD_PARITY_WORKER_API_REQUESTS_PER_MINUTE must be between 1 and 1000000"
+            )
+        if not 1 <= worker_source_requests_per_minute <= 1_000_000:
+            raise ValueError(
+                "CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE must be between 1 and 1000000"
+            )
+        if worker_source_requests_per_minute > worker_api_requests_per_minute:
+            raise ValueError(
+                "CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE cannot exceed the worker API limit"
+            )
         webhook_requests_per_minute = int(
             os.getenv("CLOUD_PARITY_WEBHOOK_REQUESTS_PER_MINUTE", "6000")
         )
@@ -175,6 +195,8 @@ class PlatformSettings:
             phone_hash_key=phone_hash_key,
             metrics_token=metrics_token,
             api_requests_per_minute=api_requests_per_minute,
+            worker_api_requests_per_minute=worker_api_requests_per_minute,
+            worker_source_requests_per_minute=worker_source_requests_per_minute,
             webhook_requests_per_minute=webhook_requests_per_minute,
             embed_tokens_per_minute=embed_tokens_per_minute,
             authentication=AuthenticationSettings.from_env(environment),

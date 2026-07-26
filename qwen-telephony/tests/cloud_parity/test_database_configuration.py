@@ -22,6 +22,8 @@ DATABASE_ENV = (
     "CLOUD_PARITY_PHONE_HASH_KEY",
     "CLOUD_PARITY_METRICS_TOKEN",
     "CLOUD_PARITY_API_REQUESTS_PER_MINUTE",
+    "CLOUD_PARITY_WORKER_API_REQUESTS_PER_MINUTE",
+    "CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE",
     "CLOUD_PARITY_EMBED_TOKENS_PER_MINUTE",
     "CLOUD_PARITY_RETENTION_DAYS",
     "CLOUD_PARITY_DB_POOL_MIN_SIZE",
@@ -60,6 +62,8 @@ def test_development_defaults_to_sqlite(monkeypatch: pytest.MonkeyPatch, tmp_pat
         tmp_path / "qwen-telephony" / "data" / "cloud-parity.sqlite3"
     ).resolve()
     assert settings.authentication.mode == "development"
+    assert settings.worker_api_requests_per_minute == 30_000
+    assert settings.worker_source_requests_per_minute == 12_000
     assert "http://127.0.0.1:8090" in settings.cors_allowed_origins
 
 
@@ -176,3 +180,19 @@ def test_invalid_pool_sizes_are_rejected(
 
     with pytest.raises(ValueError, match="pool size"):
         PlatformSettings.from_env(tmp_path)
+
+
+def test_worker_rate_limits_are_bounded_and_source_scoped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_database_env(monkeypatch)
+    monkeypatch.setenv("CLOUD_PARITY_WORKER_API_REQUESTS_PER_MINUTE", "1000")
+    monkeypatch.setenv("CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE", "1001")
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        PlatformSettings.from_env(tmp_path)
+
+    monkeypatch.setenv("CLOUD_PARITY_WORKER_SOURCE_REQUESTS_PER_MINUTE", "500")
+    settings = PlatformSettings.from_env(tmp_path)
+    assert settings.worker_api_requests_per_minute == 1000
+    assert settings.worker_source_requests_per_minute == 500

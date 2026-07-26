@@ -46,6 +46,7 @@ from .cloud_parity.insights_api import create_insights_router
 from .cloud_parity.inference import InferenceGateway
 from .cloud_parity.inference_api import create_inference_router
 from .cloud_parity.observability import render_prometheus_metrics
+from .cloud_parity.rate_limit import is_worker_control_request
 from .cloud_parity.runtime import DockerRuntimeExecutor
 from .cloud_parity.runtime_api import create_runtime_router
 from .cloud_parity.store import PlatformStore
@@ -134,11 +135,19 @@ async def distributed_api_rate_limit(request: Request, call_next):
     path = request.url.path
     webhook_path = "/api/platform/telephony/webhooks/livekit"
     is_webhook = path == webhook_path
-    limit = (
-        platform_settings.webhook_requests_per_minute
-        if is_webhook
-        else platform_settings.api_requests_per_minute
-    )
+    is_worker = is_worker_control_request(path, request.method)
+    if is_webhook:
+        limit = platform_settings.webhook_requests_per_minute
+        source_limit = limit
+        rate_tier = "webhook"
+    elif is_worker:
+        limit = platform_settings.worker_api_requests_per_minute
+        source_limit = platform_settings.worker_source_requests_per_minute
+        rate_tier = "worker"
+    else:
+        limit = platform_settings.api_requests_per_minute
+        source_limit = min(limit * 4, 1_000_000)
+        rate_tier = "standard"
     excluded = (
         request.method == "OPTIONS"
         or path in {"/api/health", "/api/platform/health", "/api/platform/health/live", "/api/platform/health/ready", "/metrics"}
@@ -165,10 +174,9 @@ async def distributed_api_rate_limit(request: Request, call_next):
         # A per-source ceiling prevents token rotation from creating unbounded
         # limiter keys. The higher ceiling preserves independent user quotas for
         # trusted enterprise proxies and NAT gateways.
-        source_limit = limit if is_webhook else min(limit * 4, 1_000_000)
         source_result = await asyncio.to_thread(
             platform_store.consume_api_rate_limit,
-            key=f"api-source:{remote}",
+            key=f"api-source:{rate_tier}:{remote}",
             limit=source_limit,
         )
         if not source_result["allowed"]:
@@ -179,7 +187,7 @@ async def distributed_api_rate_limit(request: Request, call_next):
             )
         result = await asyncio.to_thread(
             platform_store.consume_api_rate_limit,
-            key=f"api:{identity}",
+            key=f"api:{rate_tier}:{identity}",
             limit=limit,
         )
         if not result["allowed"]:
