@@ -855,6 +855,85 @@ def test_production_campaign_pause_resume_and_trunk_cps(telephony_stack) -> None
     assert len(second) == 1
 
 
+def test_saturated_trunk_does_not_starve_another_ready_trunk(
+    telephony_stack,
+) -> None:
+    _, service, project_id = telephony_stack
+    _limits(service, project_id, total=2, outbound=2, inbound=1, rate=100)
+    saturated = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="saturated",
+        direction="outbound",
+        provider="carrier",
+        livekit_trunk_id="ST_saturated",
+        numbers=["+8610000000000"],
+        max_concurrent_calls=1,
+        max_calls_per_second=100,
+    )
+    ready = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="ready",
+        direction="outbound",
+        provider="carrier",
+        livekit_trunk_id="ST_ready",
+        numbers=["+8610000000000"],
+        max_concurrent_calls=1,
+        max_calls_per_second=100,
+    )
+    service.enqueue_outbound(
+        project_id=project_id,
+        user_id="owner",
+        idempotency_key="saturated-active",
+        destination_number="+8613800000100",
+        source_number="+8610000000000",
+        agent_name="commercial-agent",
+        trunk_id=saturated["id"],
+        priority=0,
+    )
+    first = service.claim_outbound(
+        project_id=project_id,
+        user_id="owner",
+        worker_id="fairness-worker-1",
+        limit=1,
+    )
+    assert len(first) == 1
+
+    # This is deliberately longer than the former capacity*5 candidate window.
+    for index in range(8):
+        service.enqueue_outbound(
+            project_id=project_id,
+            user_id="owner",
+            idempotency_key=f"saturated-waiting-{index}",
+            destination_number=f"+86138000002{index:02d}",
+            source_number="+8610000000000",
+            agent_name="commercial-agent",
+            trunk_id=saturated["id"],
+            priority=0,
+        )
+    service.enqueue_outbound(
+        project_id=project_id,
+        user_id="owner",
+        idempotency_key="ready-behind-saturated",
+        destination_number="+8613800000300",
+        source_number="+8610000000000",
+        agent_name="commercial-agent",
+        trunk_id=ready["id"],
+        priority=100,
+    )
+
+    claimed = service.claim_outbound(
+        project_id=project_id,
+        user_id="owner",
+        worker_id="fairness-worker-2",
+        limit=1,
+    )
+
+    assert len(claimed) == 1
+    assert claimed[0]["trunk_id"] == ready["id"]
+
+
 def test_encrypted_campaign_source_number_materializes_calls(telephony_stack) -> None:
     store, _, project_id = telephony_stack
     service = TelephonyService(store, phone_cipher=SecretCipher.generate())

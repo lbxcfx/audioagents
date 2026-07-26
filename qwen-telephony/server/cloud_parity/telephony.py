@@ -2256,30 +2256,67 @@ class TelephonyService:
             capacity = min(batch_limit, total_capacity, outbound_capacity, rate_capacity)
             if capacity <= 0:
                 return []
-            candidate_limit = min(500, max(capacity * 5, capacity))
+            # Spread the candidate window across trunk/campaign combinations. Without
+            # this, a long queue on one saturated trunk can hide a ready call on a
+            # different trunk indefinitely. The in-transaction checks below remain
+            # authoritative because other candidates in this batch consume capacity.
+            candidate_limit = min(5000, max(capacity * 10, 100))
             rows = conn.execute(
                 """
-                SELECT c.*,
-                       COALESCE(t.livekit_trunk_id, '') AS livekit_trunk_id,
-                       COALESCE(t.max_concurrent_calls, 0) AS trunk_max_concurrent_calls,
-                       COALESCE(t.max_calls_per_second, 0) AS trunk_max_calls_per_second,
-                       COALESCE(t.numbers_json, '[]') AS trunk_numbers_json,
-                       COALESCE(cp.max_concurrent_calls, 0) AS campaign_max_concurrent_calls
-                FROM call_jobs c
-                LEFT JOIN sip_trunks t ON t.id = c.trunk_id
-                  AND t.project_id = c.project_id
-                  AND t.direction IN ('outbound', 'bidirectional')
-                  AND t.status = 'active'
-                LEFT JOIN telephony_campaigns cp ON cp.id = c.campaign_id
-                  AND cp.project_id = c.project_id
-                WHERE c.project_id = ? AND c.direction = 'outbound' AND c.status = 'queued'
-                  AND c.available_at <= ? AND c.attempt_count < c.max_attempts
-                  AND (c.trunk_id IS NULL OR t.id IS NOT NULL)
-                  AND (c.campaign_id IS NULL OR cp.status = 'running')
-                ORDER BY c.priority ASC, c.available_at ASC, c.created_at ASC, c.id ASC
+                WITH ranked AS (
+                    SELECT c.*,
+                           COALESCE(t.livekit_trunk_id, '') AS livekit_trunk_id,
+                           COALESCE(t.max_concurrent_calls, 0) AS trunk_max_concurrent_calls,
+                           COALESCE(t.max_calls_per_second, 0) AS trunk_max_calls_per_second,
+                           COALESCE(t.numbers_json, '[]') AS trunk_numbers_json,
+                           COALESCE(cp.max_concurrent_calls, 0) AS campaign_max_concurrent_calls,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY COALESCE(c.trunk_id, ''), COALESCE(c.campaign_id, '')
+                               ORDER BY c.priority ASC, c.available_at ASC, c.created_at ASC, c.id ASC
+                           ) AS fairness_rank
+                    FROM call_jobs c
+                    LEFT JOIN sip_trunks t ON t.id = c.trunk_id
+                      AND t.project_id = c.project_id
+                      AND t.direction IN ('outbound', 'bidirectional')
+                      AND t.status = 'active'
+                    LEFT JOIN telephony_campaigns cp ON cp.id = c.campaign_id
+                      AND cp.project_id = c.project_id
+                    WHERE c.project_id = ? AND c.direction = 'outbound' AND c.status = 'queued'
+                      AND c.available_at <= ? AND c.attempt_count < c.max_attempts
+                      AND (c.trunk_id IS NULL OR t.id IS NOT NULL)
+                      AND (c.campaign_id IS NULL OR cp.status = 'running')
+                      AND (
+                          c.trunk_id IS NULL OR (
+                              (SELECT COUNT(*) FROM call_jobs active_trunk
+                               WHERE active_trunk.project_id = c.project_id
+                                 AND active_trunk.trunk_id = c.trunk_id
+                                 AND active_trunk.status IN (
+                                     'leased','dispatching','dialing','ringing','active','reconciling'
+                                 )) < t.max_concurrent_calls
+                              AND
+                              (SELECT COUNT(*) FROM call_attempts recent_attempt
+                               JOIN call_jobs attempted_call
+                                 ON attempted_call.id = recent_attempt.call_id
+                               WHERE recent_attempt.project_id = c.project_id
+                                 AND attempted_call.trunk_id = c.trunk_id
+                                 AND recent_attempt.started_at >= ?) < t.max_calls_per_second
+                          )
+                      )
+                      AND (
+                          c.campaign_id IS NULL OR
+                          (SELECT COUNT(*) FROM call_jobs active_campaign
+                           WHERE active_campaign.project_id = c.project_id
+                             AND active_campaign.campaign_id = c.campaign_id
+                             AND active_campaign.status IN (
+                                 'leased','dispatching','dialing','ringing','active','reconciling'
+                             )) < cp.max_concurrent_calls
+                      )
+                )
+                SELECT * FROM ranked
+                ORDER BY fairness_rank ASC, priority ASC, available_at ASC, created_at ASC, id ASC
                 LIMIT ?
                 """,
-                (project_id, timestamp, candidate_limit),
+                (project_id, timestamp, one_second_ago, candidate_limit),
             ).fetchall()
             lease_expires = _timestamp(current + timedelta(seconds=int(limits["lease_seconds"])))
             for row in rows:

@@ -34,9 +34,11 @@ class DispatcherSettings:
     def __init__(self) -> None:
         self.control_url = os.getenv("CLOUD_PARITY_CONTROL_URL", "").strip().rstrip("/")
         self.project_ids = tuple(
-            item.strip()
-            for item in os.getenv("CLOUD_PARITY_TELEPHONY_PROJECT_IDS", "").split(",")
-            if item.strip()
+            dict.fromkeys(
+                item.strip()
+                for item in os.getenv("CLOUD_PARITY_TELEPHONY_PROJECT_IDS", "").split(",")
+                if item.strip()
+            )
         )
         self.bearer_token = os.getenv("CLOUD_PARITY_SERVICE_BEARER_TOKEN", "").strip()
         self.bearer_token_file = os.getenv(
@@ -52,6 +54,9 @@ class DispatcherSettings:
             f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}",
         ).strip()
         self.batch_size = int(os.getenv("CLOUD_PARITY_TELEPHONY_CLAIM_BATCH", "10"))
+        self.project_concurrency = int(
+            os.getenv("CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY", "8")
+        )
         self.poll_seconds = float(os.getenv("CLOUD_PARITY_TELEPHONY_POLL_SECONDS", "1"))
         self.request_timeout = float(
             os.getenv("CLOUD_PARITY_CONTROL_TIMEOUT_SECONDS", "5")
@@ -108,6 +113,10 @@ class DispatcherSettings:
                 ) from exc
         if not 1 <= self.batch_size <= 100:
             raise ValueError("CLOUD_PARITY_TELEPHONY_CLAIM_BATCH must be between 1 and 100")
+        if not 1 <= self.project_concurrency <= 100:
+            raise ValueError(
+                "CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY must be between 1 and 100"
+            )
         if not 0.1 <= self.poll_seconds <= 60:
             raise ValueError("CLOUD_PARITY_TELEPHONY_POLL_SECONDS must be between 0.1 and 60")
         if not 1 <= self.heartbeat_seconds <= 60:
@@ -524,54 +533,87 @@ async def reconcile_call(
     )
 
 
+async def process_project(
+    settings: DispatcherSettings,
+    control: ControlPlaneClient,
+    livekit: api.LiveKitAPI,
+    runtime_state: DispatcherRuntimeState,
+    project_id: str,
+) -> int:
+    """Poll one tenant without allowing its latency to block every other tenant."""
+    try:
+        await control.materialize_campaigns(project_id)
+        calls = await control.claim(project_id)
+        reconciliation = await control.claim_reconciliation(project_id)
+        claimed = len(calls) + len(reconciliation)
+        if calls:
+            await asyncio.gather(
+                *(
+                    dispatch_call(settings, control, livekit, project_id, call)
+                    for call in calls
+                )
+            )
+        if reconciliation:
+            await asyncio.gather(
+                *(
+                    reconcile_call(settings, control, livekit, project_id, call)
+                    for call in reconciliation
+                )
+            )
+        runtime_state.success(claimed)
+        return claimed
+    except httpx.HTTPStatusError as exc:
+        runtime_state.failure()
+        logger.error(
+            "Control plane rejected dispatcher request: project_id=%s status=%s",
+            project_id,
+            exc.response.status_code,
+        )
+    except Exception:
+        runtime_state.failure()
+        logger.exception("Dispatcher project loop failed: project_id=%s", project_id)
+    return 0
+
+
+async def poll_projects(
+    settings: DispatcherSettings,
+    control: ControlPlaneClient,
+    livekit: api.LiveKitAPI,
+    runtime_state: DispatcherRuntimeState,
+) -> int:
+    """Poll configured projects concurrently with an explicit resource bound."""
+    semaphore = asyncio.Semaphore(settings.project_concurrency)
+
+    async def bounded_poll(project_id: str) -> int:
+        async with semaphore:
+            return await process_project(
+                settings, control, livekit, runtime_state, project_id
+            )
+
+    results = await asyncio.gather(
+        *(bounded_poll(project_id) for project_id in settings.project_ids)
+    )
+    return sum(results)
+
+
 async def run() -> None:
     settings = DispatcherSettings()
     control = ControlPlaneClient(settings)
     runtime_state = DispatcherRuntimeState(settings.poll_seconds)
     health_runner = await start_health_server(settings, runtime_state)
     logger.info(
-        "Dispatcher started: worker_id=%s projects=%s batch=%s",
+        "Dispatcher started: worker_id=%s projects=%s project_concurrency=%s batch=%s",
         settings.worker_id,
         len(settings.project_ids),
+        settings.project_concurrency,
         settings.batch_size,
     )
     try:
         async with api.LiveKitAPI() as livekit:
             while True:
-                claimed = 0
-                for project_id in settings.project_ids:
-                    try:
-                        await control.materialize_campaigns(project_id)
-                        calls = await control.claim(project_id)
-                        reconciliation = await control.claim_reconciliation(project_id)
-                        claimed += len(calls) + len(reconciliation)
-                        if calls:
-                            await asyncio.gather(
-                                *(
-                                    dispatch_call(settings, control, livekit, project_id, call)
-                                    for call in calls
-                                )
-                            )
-                        if reconciliation:
-                            await asyncio.gather(
-                                *(
-                                    reconcile_call(
-                                        settings, control, livekit, project_id, call
-                                    )
-                                    for call in reconciliation
-                                )
-                            )
-                        runtime_state.success(len(calls) + len(reconciliation))
-                    except httpx.HTTPStatusError as exc:
-                        runtime_state.failure()
-                        logger.error(
-                            "Control plane rejected dispatcher request: project_id=%s status=%s",
-                            project_id,
-                            exc.response.status_code,
-                        )
-                    except Exception:
-                        runtime_state.failure()
-                        logger.exception("Dispatcher project loop failed: project_id=%s", project_id)
+                claimed = await poll_projects(
+                    settings, control, livekit, runtime_state
+                )
                 await asyncio.sleep(0 if claimed else settings.poll_seconds)
     finally:
         await control.close()

@@ -52,6 +52,7 @@ docker push "$REGISTRY/voice-console:$VERSION"
 
 1. 替换 IdP、项目 ID、LiveKit Agent 名称、录音 bucket/region 和四个镜像标签；`OIDC_CONNECT_SRC` 必须是 Token Endpoint 的源。
 2. 按运营商实测值设置项目级并发、Trunk `max_concurrent_calls` 和 `max_calls_per_second`，不要只依赖 Pod 数量。
+   Dispatcher 会以 `CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY` 为上限并行轮询项目；该值默认 8，需结合控制面连接池、项目数和 API 延迟压测后调整。
 3. 根据 PostgreSQL 连接预算设置连接池，使 `最大 API Pod 数 × 每 Pod 最大连接数` 留有迁移、运维和故障切换余量。
 4. 为跨可用区集群配置节点拓扑、网络策略、私有镜像仓库凭据和入口 TLS；只公开控制面 Service，Dispatcher/Agent 健康端口保留在集群内部。
 5. 将 `FORWARDED_ALLOW_IPS` 设置为实际入口代理的精确 IP/CIDR；镜像默认只信任 `127.0.0.1`，生产禁止使用 `*`。

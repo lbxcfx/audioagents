@@ -149,6 +149,26 @@ def test_dispatcher_rejects_reused_production_encryption_key(monkeypatch) -> Non
         dispatcher.DispatcherSettings()
 
 
+def test_dispatcher_settings_deduplicate_projects_and_validate_parallelism(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CLOUD_PARITY_ENV", "development")
+    monkeypatch.setenv("CLOUD_PARITY_CONTROL_URL", "http://control.local")
+    monkeypatch.setenv(
+        "CLOUD_PARITY_TELEPHONY_PROJECT_IDS", "project-1,project-2,project-1"
+    )
+    monkeypatch.setenv("CLOUD_PARITY_SERVICE_USER_ID", "worker")
+    monkeypatch.setenv("CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY", "2")
+
+    settings = dispatcher.DispatcherSettings()
+
+    assert settings.project_ids == ("project-1", "project-2")
+    assert settings.project_concurrency == 2
+    monkeypatch.setenv("CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY", "0")
+    with pytest.raises(ValueError, match="PROJECT_CONCURRENCY"):
+        dispatcher.DispatcherSettings()
+
+
 def test_dispatcher_fails_closed_for_missing_trunk_and_reconciles_dispatch_errors() -> None:
     missing_control = FakeControl()
     missing_livekit = SimpleNamespace(agent_dispatch=FakeAgentDispatch())
@@ -286,3 +306,38 @@ def test_dispatcher_runtime_state_exposes_readiness_and_metrics() -> None:
     rendered = state.prometheus()
     assert "telephony_dispatcher_ready 1" in rendered
     assert "telephony_dispatcher_jobs_claimed_total 3" in rendered
+
+
+def test_dispatcher_polls_projects_with_bounded_parallelism() -> None:
+    class ConcurrentControl:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def materialize_campaigns(self, _project_id):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return {"queued": 0}
+
+        async def claim(self, _project_id):
+            return []
+
+        async def claim_reconciliation(self, _project_id):
+            return []
+
+    settings = SimpleNamespace(
+        project_ids=("project-1", "project-2", "project-3"),
+        project_concurrency=2,
+    )
+    control = ConcurrentControl()
+    state = dispatcher.DispatcherRuntimeState(1.0)
+
+    claimed = asyncio.run(
+        dispatcher.poll_projects(settings, control, SimpleNamespace(), state)
+    )
+
+    assert claimed == 0
+    assert control.max_active == 2
+    assert state.project_polls_total == 3
