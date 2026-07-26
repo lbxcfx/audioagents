@@ -267,7 +267,7 @@ spec:
               containerPort: 9091
           envFrom:
             - configMapRef: {name: cloud-parity-config}
-            - secretRef: {name: cloud-parity-secrets}
+            - secretRef: {name: cloud-parity-dispatcher-secrets}
           env:
             - name: CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE
               value: /run/secrets/service-token
@@ -296,7 +296,7 @@ spec:
       volumes:
         - name: service-token
           secret:
-            secretName: cloud-parity-service-token
+            secretName: cloud-parity-dispatcher-service-token
             defaultMode: 0400
 ---
 apiVersion: apps/v1
@@ -340,7 +340,7 @@ spec:
               containerPort: 18081
           envFrom:
             - configMapRef: {name: cloud-parity-config}
-            - secretRef: {name: cloud-parity-secrets}
+            - secretRef: {name: cloud-parity-agent-secrets}
           env:
             - name: CLOUD_PARITY_SERVICE_BEARER_TOKEN_FILE
               value: /run/secrets/service-token
@@ -373,7 +373,7 @@ spec:
       volumes:
         - name: service-token
           secret:
-            secretName: cloud-parity-service-token
+            secretName: cloud-parity-agent-service-token
             defaultMode: 0400
         - name: cache
           emptyDir: {}

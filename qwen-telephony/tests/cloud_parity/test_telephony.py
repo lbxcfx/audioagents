@@ -175,6 +175,60 @@ def test_concurrent_workers_cannot_exceed_project_capacity(telephony_stack) -> N
     assert service.metrics(project_id=project_id, user_id="owner")["queue_depth"] == 1
 
 
+def test_parallel_claims_are_unique_and_balanced_across_multiple_trunks(
+    telephony_stack,
+) -> None:
+    _, service, project_id = telephony_stack
+    _limits(service, project_id, total=40, outbound=40, inbound=1, rate=100)
+    trunks = [
+        service.upsert_trunk(
+            project_id=project_id,
+            user_id="owner",
+            name=f"parallel-{index}",
+            direction="outbound",
+            provider="carrier",
+            livekit_trunk_id=f"ST_parallel_{index}",
+            numbers=["+8610000000000"],
+            max_concurrent_calls=10,
+            max_calls_per_second=100,
+        )
+        for index in range(4)
+    ]
+    for index in range(100):
+        service.enqueue_outbound(
+            project_id=project_id,
+            user_id="owner",
+            idempotency_key=f"parallel-call-{index}",
+            destination_number=f"+86139{index:08d}",
+            source_number="+8610000000000",
+            agent_name="commercial-agent",
+            trunk_id=trunks[index % len(trunks)]["id"],
+        )
+
+    def claim(index: int) -> list[dict]:
+        return service.claim_outbound(
+            project_id=project_id,
+            user_id="owner",
+            worker_id=f"parallel-worker-{index}",
+            limit=5,
+        )
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        batches = list(executor.map(claim, range(20)))
+
+    claimed = [call for batch in batches for call in batch]
+    assert len(claimed) == 40
+    assert len({call["id"] for call in claimed}) == 40
+    per_trunk = {
+        trunk["id"]: sum(call["trunk_id"] == trunk["id"] for call in claimed)
+        for trunk in trunks
+    }
+    assert per_trunk == {trunk["id"]: 10 for trunk in trunks}
+    metrics = service.metrics(project_id=project_id, user_id="owner")
+    assert metrics["active_calls"] == 40
+    assert metrics["queue_depth"] == 60
+
+
 def test_rate_limit_and_lease_ownership_are_enforced(telephony_stack) -> None:
     _, service, project_id = telephony_stack
     _limits(service, project_id, total=2, outbound=2, inbound=2, rate=1)

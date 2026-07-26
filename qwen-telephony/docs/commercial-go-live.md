@@ -7,7 +7,8 @@
 - [ ] 生产使用 `CLOUD_PARITY_AUTH_MODE=oidc` 或受控可信代理，不允许开发身份头。
 - [ ] 企业 IdP 的 Issuer、Audience、JWKS、算法白名单、Client Credentials 和项目成员映射已用真实租户联调。
 - [ ] `CLOUD_PARITY_MASTER_KEY`、独立的 `CLOUD_PARITY_DISPATCH_METADATA_KEY`、`CLOUD_PARITY_PHONE_HASH_KEY`、`CLOUD_PARITY_METRICS_TOKEN` 和运营商凭据来自 KMS/Vault，均未写入仓库或日志。
-- [ ] Dispatcher 与 Agent 使用可轮换的文件挂载短期 Service Token；确认 Token 轮换不要求重启进程，旧 Token 被 IdP 拒绝。
+- [ ] Dispatcher 与 Agent 使用不同 Client Credentials 主体和可轮换的文件挂载短期 Service Token；确认 Token 轮换不要求重启进程，旧 Token 被 IdP 拒绝。
+- [ ] 已验证 Dispatcher/Agent 分别只挂载其工作负载 Secret，Pod 环境中不存在 PostgreSQL URL、Fernet 主密钥或号码哈希密钥。
 - [ ] Access Token 自撤销、过期、错误 Audience/Issuer/算法、JWKS 轮换和被撤销 Token 重放测试全部通过。
 - [ ] 公网入口已配置精确 CORS、TLS、WAF；可信代理会删除客户端伪造的身份头。
 - [ ] `CLOUD_PARITY_API_REQUESTS_PER_MINUTE` 根据压测设定，多个 API 副本共用 PostgreSQL 限流状态。

@@ -319,6 +319,74 @@ def test_postgres_high_volume_outbound_claims_remain_unique(
     assert metrics["queue_depth"] == 150
 
 
+def test_postgres_saturated_trunk_does_not_starve_ready_trunk(
+    postgres_store: PlatformStore,
+) -> None:
+    postgres_store.initialize()
+    project = postgres_store.create_project(
+        name="Fair Trunk Scheduling",
+        slug=f"fair-trunks-{uuid.uuid4().hex}",
+        owner_id="owner",
+    )
+    service = TelephonyService(postgres_store)
+    service.update_policy(
+        project_id=project["id"],
+        user_id="owner",
+        timezone_name="UTC",
+        allowed_weekdays=range(7),
+        calling_window_start="00:00",
+        calling_window_end="23:59",
+        require_consent=False,
+        consent_purpose="outbound",
+        max_attempts_per_number_per_day=100,
+    )
+    service.update_limits(
+        project_id=project["id"],
+        user_id="owner",
+        max_concurrent_calls=2,
+        max_outbound_calls=2,
+        max_inbound_calls=1,
+        max_calls_per_minute=100,
+        lease_seconds=30,
+    )
+    saturated = service.upsert_trunk(
+        project_id=project["id"], user_id="owner", name="saturated",
+        direction="outbound", provider="carrier", livekit_trunk_id="ST_saturated",
+        numbers=["+8610000000000"], max_concurrent_calls=1, max_calls_per_second=100,
+    )
+    ready = service.upsert_trunk(
+        project_id=project["id"], user_id="owner", name="ready",
+        direction="outbound", provider="carrier", livekit_trunk_id="ST_ready",
+        numbers=["+8610000000000"], max_concurrent_calls=1, max_calls_per_second=100,
+    )
+
+    def enqueue(key: str, number: str, trunk_id: str, priority: int) -> None:
+        service.enqueue_outbound(
+            project_id=project["id"], user_id="owner", idempotency_key=key,
+            destination_number=number, source_number="+8610000000000",
+            agent_name="postgres-worker-agent", trunk_id=trunk_id, priority=priority,
+        )
+
+    enqueue("active-saturated", "+8613800000100", saturated["id"], 0)
+    assert len(service.claim_outbound(
+        project_id=project["id"], user_id="owner", worker_id="fair-worker-1"
+    )) == 1
+    for index in range(20):
+        enqueue(
+            f"waiting-saturated-{index}",
+            f"+86138000002{index:02d}",
+            saturated["id"],
+            0,
+        )
+    enqueue("ready-behind-saturated", "+8613800000400", ready["id"], 100)
+
+    claimed = service.claim_outbound(
+        project_id=project["id"], user_id="owner", worker_id="fair-worker-2"
+    )
+    assert len(claimed) == 1
+    assert claimed[0]["trunk_id"] == ready["id"]
+
+
 def test_postgres_inbound_admission_and_reconciliation_are_concurrency_safe(
     postgres_store: PlatformStore,
 ) -> None:
