@@ -19,7 +19,7 @@ docker push "$REGISTRY/control-plane:$VERSION"
 docker push "$REGISTRY/dispatcher:$VERSION"
 docker push "$REGISTRY/agent:$VERSION"
 
-cd ../app
+cd app
 docker build -t "$REGISTRY/voice-console:$VERSION" \
   --build-arg VITE_OIDC_AUTHORIZATION_ENDPOINT=https://idp.example.com/oauth2/authorize \
   --build-arg VITE_OIDC_TOKEN_ENDPOINT=https://idp.example.com/oauth2/token \

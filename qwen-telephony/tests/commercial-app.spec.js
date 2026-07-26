@@ -147,8 +147,29 @@ test("production navigation hides replica-only modules and viewer actions are di
   await expect(page.getByRole("button", { name: "加入外呼队列" })).toBeDisabled();
   await expect(page.getByText("短信管理", { exact: true })).toHaveCount(0);
   await expect(page.getByText("财务管理", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("综合概况", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("话术配置", { exact: true })).toHaveCount(0);
   await expect(page.locator(".api-stick input")).toHaveCount(0);
   await expect(page.locator(".api-stick")).toContainText("同源 API");
+});
+
+test("worker role can be provisioned but cannot use human outbound controls", async ({ page }) => {
+  await authenticateAndMock(page);
+  await page.route("**/api/platform/projects", (route) => route.fulfill({ json: { items: [{ id: "project-1", name: "Worker", slug: "worker", role: "worker", retention_days: 30 }] } }));
+  await page.goto("/");
+
+  await expect(page.getByRole("button", { name: "加入外呼队列" })).toBeDisabled();
+  await page.getByRole("button", { name: "活动与客户" }).click();
+  await expect(page.getByRole("button", { name: "创建活动" })).toBeDisabled();
+});
+
+test("project RBAC form includes the dedicated service worker role", async ({ page }) => {
+  await authenticateAndMock(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "权限与审计" }).click();
+
+  const roleSelect = page.locator('select[name="role"]');
+  await expect(roleSelect.locator('option[value="worker"]')).toHaveText("服务工作节点");
 });
 
 test("campaign creation preserves selected contacts independently of the current page", async ({ page }) => {
