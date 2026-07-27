@@ -1,8 +1,11 @@
 FROM python:3.12-slim
 
+ARG HF_ENDPOINT=https://huggingface.co
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     XDG_CACHE_HOME=/app/qwen-telephony/cache \
+    HF_HOME=/app/models/huggingface \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PIP_TRUSTED_HOST=mirrors.aliyun.com
 
@@ -22,10 +25,15 @@ WORKDIR /app/qwen-telephony/agent
 
 RUN addgroup --system telephony \
     && adduser --system --ingroup telephony --home /app/qwen-telephony telephony \
-    && mkdir -p /app/qwen-telephony/cache /app/qwen-telephony/logs \
-    && chown -R telephony:telephony /app/qwen-telephony/cache /app/qwen-telephony/logs
+    && mkdir -p /app/qwen-telephony/cache /app/qwen-telephony/logs /app/models \
+    && chown -R telephony:telephony /app/qwen-telephony/cache /app/qwen-telephony/logs /app/models
 
 USER telephony
+
+# Bake Silero and multilingual text turn-detector assets into the image. The
+# runtime must not depend on Hugging Face availability or download model files
+# concurrently when several calls arrive after a cold start.
+RUN python -m livekit.agents download-files
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import os, urllib.request; port=os.getenv('QWEN_AGENT_PORT', '18081'); urllib.request.urlopen(f'http://127.0.0.1:{port}/worker', timeout=3)" || exit 1

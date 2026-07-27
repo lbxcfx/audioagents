@@ -33,6 +33,21 @@ docker push "$REGISTRY/voice-console:$VERSION"
 
 所有镜像以非 root 用户运行，并提供编排健康探针。构建完成后应执行镜像扫描、生成 SBOM，并按组织策略签名。
 
+Agent 镜像构建会执行 `python -m livekit.agents download-files`，下载 Silero VAD 与
+`livekit/turn-detector` 多语言文本模型，并写入镜像内的
+`/app/models/huggingface`。构建节点必须能够访问 Hugging Face；下载失败必须让构建
+失败，不能把运行时在线下载作为回退。该路径故意与 Pod 的可写 cache volume 分离，
+因此多副本或并发冷启动不会覆盖模型或重复下载。模型权重采用 LiveKit Model License，
+插件源代码采用 Apache-2.0，上线前应将二者纳入 SBOM 和许可证审核。
+受控网络可通过 Docker 构建参数 `--build-arg HF_ENDPOINT=<approved-mirror>` 指向组织
+批准的 Hugging Face 镜像；不得使用未经审核的公共中转站。
+
+生产配置保持 `QWEN_TURN_DETECTION_MODE=multilingual`，并确保
+`LIVEKIT_REMOTE_EOT_URL` 未设置。只有故障演练或经过审批的临时降级才使用
+`QWEN_TURN_DETECTION_MODE=vad`。文本插件在 LiveKit 1.6.6 中已标记 deprecated；
+升级 LiveKit 时必须重新评估接口、模型许可和是否会重新启用内置二进制音频 Turn
+Detector，不能直接解除版本锁。
+
 ## 2. 配置外部依赖
 
 部署前必须具备：

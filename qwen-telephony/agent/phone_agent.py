@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -25,6 +26,7 @@ from livekit.agents import (
     AgentSession,
     AutoSubscribe,
     JobContext,
+    JobProcess,
     MetricsCollectedEvent,
     TurnHandlingOptions,
     cli,
@@ -35,6 +37,7 @@ from livekit.agents import (
     utils,
 )
 from livekit.plugins import openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openai import AsyncOpenAI
 
 from dialogue_llm import ScriptFirstLLM
@@ -214,7 +217,11 @@ async def ensure_greeting_audio_cache() -> None:
         GREETING_AUDIO_LOCK_PATH.unlink(missing_ok=True)
 
 
-def prewarm_process(_proc) -> None:
+def prewarm_process(proc: JobProcess) -> None:
+    # Each LiveKit job process owns one preloaded VAD model. Streams created by
+    # AgentSession and StreamAdapter keep their own state, while the ONNX model
+    # is loaded only once per process.
+    proc.userdata["vad"] = _build_session_vad()
     try:
         asyncio.run(ensure_greeting_audio_cache())
     except Exception:
@@ -436,6 +443,122 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _configured_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw_value = os.getenv(name)
+    try:
+        value = default if raw_value is None or not raw_value.strip() else float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _configured_int(name: str, default: int, *, allowed: set[int]) -> int:
+    raw_value = os.getenv(name)
+    try:
+        value = default if raw_value is None or not raw_value.strip() else int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value not in allowed:
+        choices = ", ".join(str(item) for item in sorted(allowed))
+        raise ValueError(f"{name} must be one of: {choices}")
+    return value
+
+
+def _build_session_vad(*, loader: Any | None = None) -> Any:
+    sample_rate = _configured_int(
+        "QWEN_VAD_SAMPLE_RATE", 8000, allowed={8000, 16000}
+    )
+
+    vad_loader = loader or silero.VAD.load
+    return vad_loader(
+        min_speech_duration=_configured_float(
+            "QWEN_VAD_MIN_SPEECH_SECONDS", 0.05, minimum=0.01, maximum=5.0
+        ),
+        min_silence_duration=_configured_float(
+            "QWEN_VAD_MIN_SILENCE_SECONDS", 0.55, minimum=0.05, maximum=5.0
+        ),
+        prefix_padding_duration=_configured_float(
+            "QWEN_VAD_PREFIX_PADDING_SECONDS", 0.2, minimum=0.0, maximum=5.0
+        ),
+        activation_threshold=_configured_float(
+            "QWEN_VAD_ACTIVATION_THRESHOLD", 0.45, minimum=0.0, maximum=1.0
+        ),
+        sample_rate=sample_rate,
+    )
+
+
+def _turn_detection_mode() -> str:
+    mode = os.getenv("QWEN_TURN_DETECTION_MODE", "multilingual").strip().lower()
+    if mode == "text":
+        mode = "multilingual"
+    if mode not in {"multilingual", "vad"}:
+        raise ValueError(
+            "QWEN_TURN_DETECTION_MODE must be 'multilingual' (or 'text') or 'vad'"
+        )
+    return mode
+
+
+def _build_turn_detector(*, model_factory: Any | None = None) -> Any:
+    if _turn_detection_mode() == "vad":
+        return "vad"
+
+    # The official plugin switches to an HTTP service when this variable is
+    # present. This project intentionally guarantees local inference so call
+    # transcripts cannot be sent to an unexpected endpoint.
+    if os.getenv("LIVEKIT_REMOTE_EOT_URL", "").strip():
+        raise ValueError(
+            "LIVEKIT_REMOTE_EOT_URL must be unset when using the local multilingual "
+            "turn detector"
+        )
+
+    raw_threshold = os.getenv("QWEN_TURN_DETECTOR_THRESHOLD", "").strip()
+    threshold = (
+        _configured_float(
+            "QWEN_TURN_DETECTOR_THRESHOLD", 0.5, minimum=0.0, maximum=1.0
+        )
+        if raw_threshold
+        else None
+    )
+    if model_factory is None:
+        model_factory = MultilingualModel
+    return model_factory(unlikely_threshold=threshold)
+
+
+def _turn_endpointing_options() -> dict[str, str | float]:
+    mode = os.getenv("QWEN_ENDPOINTING_MODE", "dynamic").strip().lower()
+    if mode not in {"fixed", "dynamic"}:
+        raise ValueError("QWEN_ENDPOINTING_MODE must be 'fixed' or 'dynamic'")
+    minimum_delay = _configured_float(
+        "QWEN_ENDPOINTING_MIN_DELAY", 0.5, minimum=0.05, maximum=10.0
+    )
+    maximum_delay = _configured_float(
+        "QWEN_ENDPOINTING_MAX_DELAY", 3.0, minimum=0.05, maximum=15.0
+    )
+    if minimum_delay > maximum_delay:
+        raise ValueError(
+            "QWEN_ENDPOINTING_MIN_DELAY must not exceed QWEN_ENDPOINTING_MAX_DELAY"
+        )
+
+    options: dict[str, str | float] = {
+        "mode": mode,
+        "min_delay": minimum_delay,
+        "max_delay": maximum_delay,
+    }
+    if mode == "dynamic":
+        options["alpha"] = _configured_float(
+            "QWEN_ENDPOINTING_ALPHA", 0.9, minimum=0.0, maximum=1.0
+        )
+    return options
 
 
 def _bounded_duration(name: str, default: int, *, minimum: int, maximum: int) -> Duration:
@@ -1395,23 +1518,23 @@ async def entrypoint(ctx: JobContext) -> None:
         "yes",
         "on",
     }
+    session_vad = ctx.proc.userdata.get("vad")
+    if session_vad is None:
+        logger.warning("Silero VAD was not prewarmed; loading it in the job process")
+        session_vad = _build_session_vad()
     asr_provider = (
         QwenRealtimeASR()
         if use_realtime_asr
         else stt.StreamAdapter(
             stt=QwenASR(),
-            vad=silero.VAD.load(
-                min_speech_duration=0.05,
-                min_silence_duration=0.25,
-                prefix_padding_duration=0.2,
-                activation_threshold=0.45,
-                sample_rate=8000,
-            ),
+            vad=session_vad,
         )
     )
+    turn_detector = _build_turn_detector()
     logger.info(
-        "ASR provider selected: %s",
+        "Voice input selected: asr=%s vad=silero turn_detection=%s",
         "qwen-realtime-websocket" if use_realtime_asr else "qwen-http-vad-adapter",
+        _turn_detection_mode(),
     )
 
     hangup_task: asyncio.Task[None] | None = None
@@ -1445,6 +1568,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(
         stt=asr_provider,
+        vad=session_vad,
         llm=ScriptFirstLLM(
             upstream=openai.LLM(
                 model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
@@ -1459,11 +1583,8 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         tts=QwenTTS(),
         turn_handling=TurnHandlingOptions(
-            endpointing={
-                "mode": "fixed",
-                "min_delay": 0.1,
-                "max_delay": 0.6,
-            },
+            turn_detection=turn_detector,
+            endpointing=_turn_endpointing_options(),
             preemptive_generation={
                 "enabled": True,
                 "preemptive_tts": True,

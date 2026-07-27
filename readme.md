@@ -80,6 +80,8 @@ QWEN_LLM_MODEL=qwen-plus
 QWEN_ASR_MODEL=qwen3-asr-flash
 QWEN_TTS_MODEL=qwen3-tts-flash
 QWEN_TTS_VOICE=Cherry
+QWEN_TURN_DETECTION_MODE=multilingual
+QWEN_ENDPOINTING_MODE=dynamic
 
 SIP_PORT=5066
 SIP_RTP_PORT_RANGE=10000-10100
@@ -97,7 +99,13 @@ cd F:\ai-login-replica\agent
 wsl -d Ubuntu -- bash -lc "cd /mnt/f/ai-login-replica/agent && qwen-telephony/scripts/bootstrap-wsl.sh"
 ```
 
-脚本会创建 `qwen-telephony/.venv` 并安装 Python 依赖。
+脚本会创建 `qwen-telephony/.venv` 并安装 Python 依赖。首次启动 Agent
+前还需在该虚拟环境中下载 Silero VAD 和文本 Turn Detector 模型：
+
+```bash
+cd qwen-telephony
+.venv/bin/python -m livekit.agents download-files
+```
 
 ## 启动方式
 
@@ -287,7 +295,10 @@ wsl -d Ubuntu -- bash -lc "docker logs --tail 120 qwen-livekit-sip"
 - greeting 使用本地 8 kHz WAV 直接推送到 LiveKit 音频轨。
 - 播放 greeting 时后台线程执行一次 LLM warm-up，不阻塞音频发送。
 - ASR 默认使用 DashScope Qwen Realtime WebSocket。
-- LiveKit turn endpointing 使用较短等待：`min_delay=0.1`、`max_delay=0.6`。
+- 会话 VAD 显式使用 Silero，并在每个 LiveKit Job 进程中预加载一次。
+- Turn Detector 使用 `livekit/turn-detector` 多语言文本模型；同一 Worker 的并发
+  会话通过 LiveKit 共享推理执行器运行，默认不会把转写文本发送到远端 EOT 服务。
+- Endpointing 使用动态模式：`min_delay=0.5`、`max_delay=3.0`、`alpha=0.9`。
 - Qwen TTS 使用 DashScope SSE 增量音频输出。
 - 系统提示词要求回答尽量简短，减少 TTS 合成和播放时间。
 
@@ -295,9 +306,24 @@ wsl -d Ubuntu -- bash -lc "docker logs --tail 120 qwen-livekit-sip"
 
 ```env
 QWEN_USE_REALTIME_ASR=false
+QWEN_TURN_DETECTION_MODE=vad
 QWEN_LLM_WARMUP=false
 QWEN_TTS_USE_SSE=false
 ```
+
+`QWEN_TURN_DETECTION_MODE=vad` 仅用于模型故障时的显式降级；生产默认值是
+`multilingual`。不要设置 `LIVEKIT_REMOTE_EOT_URL`，代码会拒绝该配置，以免通话
+转写被意外发送到外部 Turn Detector 服务。Docker Agent 镜像在构建阶段自动执行
+`python -m livekit.agents download-files`，并把模型保存在不会被运行时缓存卷覆盖的
+`/app/models/huggingface`。
+
+当前固定的 `livekit-plugins-turn-detector==1.6.6` 与工程的 LiveKit Agents 版本一致。
+插件代码采用 Apache-2.0；模型权重采用
+[LiveKit Model License](https://huggingface.co/livekit/turn-detector/blob/main/LICENSE)，
+上线前需由交付方完成许可审核。该文本插件已被 LiveKit 标记为 deprecated，但仍是
+当前版本中避开内置音频 Turn Detector、使用可检查 ONNX 文本模型的兼容方案。
+`livekit-local-inference` 仍是 `livekit-agents` 的强制传递依赖，因此其二进制文件仍会
+安装，但本工程的 VAD 和 Turn Detection 调用链不再选择它的默认模型。
 
 ## GitHub 提交说明
 
