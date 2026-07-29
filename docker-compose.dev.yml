@@ -1,0 +1,154 @@
+name: audioagents-dev
+
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: ${DEV_POSTGRES_DB:-cloud_parity}
+      POSTGRES_USER: ${DEV_POSTGRES_USER:-cloud_parity}
+      POSTGRES_PASSWORD: ${DEV_POSTGRES_PASSWORD:-cloud-parity-dev-only}
+    ports:
+      - "127.0.0.1:${DEV_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - dev-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DEV_POSTGRES_USER:-cloud_parity} -d ${DEV_POSTGRES_DB:-cloud_parity}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${DEV_REDIS_PORT:-6379}:6379"
+    volumes:
+      - dev-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    command:
+      - --dev
+      - --bind=0.0.0.0
+      - --node-ip=${LIVEKIT_NODE_IP:-127.0.0.1}
+      - "--keys=${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-secret}"
+      - --redis-host=redis:6379
+    ports:
+      - "127.0.0.1:${DEV_LIVEKIT_HTTP_PORT:-7880}:7880"
+      - "${DEV_LIVEKIT_TCP_PORT:-7881}:7881"
+      - "${DEV_LIVEKIT_RTC_PORT:-7882}:7882/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  livekit-sip:
+    image: livekit/sip:v1.8.0
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:-devkey}"
+        api_secret: "${LIVEKIT_API_SECRET:-secret}"
+        ws_url: "ws://livekit:7880"
+        redis:
+          address: "redis:6379"
+        sip_port: ${SIP_PORT:-5066}
+        sip_port_listen: ${SIP_PORT:-5066}
+        sip_hostname: "${DEV_SIP_ADVERTISED_IP:-127.0.0.1}"
+        rtp_port: ${SIP_RTP_PORT_RANGE:-10000-10100}
+        use_external_ip: false
+        nat_1_to_1_ip: "${DEV_SIP_ADVERTISED_IP:-127.0.0.1}"
+        media_nat_1_to_1_ip: "${DEV_SIP_ADVERTISED_IP:-127.0.0.1}"
+        symmetric_rtp: true
+        ignore_local_addr_in_sdp: true
+        logging:
+          level: info
+    ports:
+      - "${SIP_PORT:-5066}:${SIP_PORT:-5066}/udp"
+      - "${SIP_PORT:-5066}:${SIP_PORT:-5066}/tcp"
+      - "${SIP_RTP_PORT_RANGE:-10000-10100}:${SIP_RTP_PORT_RANGE:-10000-10100}/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${DEV_MINIO_ROOT_USER:-audioagents}
+      MINIO_ROOT_PASSWORD: ${DEV_MINIO_ROOT_PASSWORD:-audioagents-dev-password}
+    ports:
+      - "127.0.0.1:${DEV_MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${DEV_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ./data/recordings/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${DEV_MINIO_ROOT_USER:-audioagents}
+      MINIO_ROOT_PASSWORD: ${DEV_MINIO_ROOT_PASSWORD:-audioagents-dev-password}
+      MINIO_RECORDING_BUCKET: ${QWEN_RECORDING_S3_BUCKET:-audioagents-recordings}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${MINIO_RECORDING_BUCKET}"
+        mc anonymous set none "local/$${MINIO_RECORDING_BUCKET}"
+    restart: "no"
+
+  livekit-egress:
+    image: livekit/egress:v1.12.0
+    environment:
+      LIVEKIT_PREFER_SOFTWARE: "true"
+      EGRESS_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:-devkey}"
+        api_secret: "${LIVEKIT_API_SECRET:-secret}"
+        ws_url: "ws://livekit:7880"
+        insecure: true
+        redis:
+          address: "redis:6379"
+        health_port: 8080
+        backup_storage: /out
+        cpu_cost:
+          room_composite_cpu_cost: 1.0
+        logging:
+          level: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/recordings/egress-backup:/out
+    shm_size: "2gb"
+    ports:
+      - "127.0.0.1:${DEV_EGRESS_HEALTH_PORT:-8082}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  dev-postgres-data:
+  dev-redis-data:

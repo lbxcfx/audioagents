@@ -32,12 +32,19 @@ class InsightsService:
         self.store.require_permission(project_id, actor_id, "session.write")
         if not room_name.strip():
             raise ValueError("room_name is required")
-        project = self.store.get_project(project_id, actor_id)
         value_id = session_id or str(uuid.uuid4())
         now = _utc_now()
-        retention = datetime.now(timezone.utc) + timedelta(days=int(project["retention_days"]))
-        retention_until = retention.isoformat().replace("+00:00", "Z")
         with self.store.transaction() as conn:
+            project = conn.execute(
+                "SELECT retention_days FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise ResourceNotFoundError("project not found")
+            retention = datetime.now(timezone.utc) + timedelta(
+                days=int(project["retention_days"])
+            )
+            retention_until = retention.isoformat().replace("+00:00", "Z")
             inserted = conn.execute(
                 """
                 INSERT INTO agent_sessions (
@@ -79,7 +86,13 @@ class InsightsService:
                     or str(existing["room_name"]) != room_name.strip()
                 ):
                     raise ValueError("session_id is already assigned to another session")
-        return self.get_session(project_id=project_id, user_id=actor_id, session_id=value_id)
+            session = conn.execute(
+                "SELECT * FROM agent_sessions WHERE id = ? AND project_id = ?",
+                (value_id, project_id),
+            ).fetchone()
+        if session is None:
+            raise ResourceNotFoundError("session not found")
+        return _parse_json(_row(session) or {}, "metadata_json", "metadata")
 
     def get_session(self, *, project_id: str, user_id: str, session_id: str) -> dict[str, Any]:
         self.store.require_permission(project_id, user_id, "session.read")
@@ -145,7 +158,13 @@ class InsightsService:
                 resource_id=session_id,
                 payload={"status": status},
             )
-        return self.get_session(project_id=project_id, user_id=actor_id, session_id=session_id)
+            session = conn.execute(
+                "SELECT * FROM agent_sessions WHERE id = ? AND project_id = ?",
+                (session_id, project_id),
+            ).fetchone()
+        if session is None:
+            raise ResourceNotFoundError("session not found")
+        return _parse_json(_row(session) or {}, "metadata_json", "metadata")
 
     def append_event(
         self,

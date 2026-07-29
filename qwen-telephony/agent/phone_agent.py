@@ -28,6 +28,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
+    RunContext,
     TurnHandlingOptions,
     cli,
     function_tool,
@@ -36,12 +37,46 @@ from livekit.agents import (
     stt,
     utils,
 )
+from livekit.agents.inference_runner import _InferenceRunner
 from livekit.plugins import openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openai import AsyncOpenAI
 
 from dialogue_llm import ScriptFirstLLM
+from qwen_audio_realtime import (
+    CLASSIC_PIPELINE,
+    QwenAudioRealtimeModel,
+    load_realtime_instructions,
+    voice_pipeline,
+)
 from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS, register_recorded_audio
+
+
+# Importing livekit.plugins.turn_detector registers both its English and
+# multilingual inference runners. This service only constructs
+# MultilingualModel, so avoid loading a second, unused English ONNX model in
+# every worker process. The multilingual runner remains registered.
+_InferenceRunner.registered_runners.pop("lk_end_of_utterance_en", None)
+
+
+def _provider_dial_target(phone_number: str) -> str:
+    """Translate an E.164 contact number to the carrier's SIP dial string."""
+    number = phone_number.strip()
+    prefix = os.getenv("QWEN_SIP_DIAL_PREFIX", "").strip()
+    if not prefix:
+        return number
+    if not prefix.isdigit():
+        raise ValueError("QWEN_SIP_DIAL_PREFIX must contain digits only")
+    normalized = number.removeprefix("+")
+    if not normalized.isdigit():
+        raise ValueError("outbound phone number must be E.164 digits")
+    strip_country_code = os.getenv("QWEN_SIP_STRIP_COUNTRY_CODE", "").strip()
+    if strip_country_code:
+        if not strip_country_code.isdigit():
+            raise ValueError("QWEN_SIP_STRIP_COUNTRY_CODE must contain digits only")
+        if normalized.startswith(strip_country_code):
+            normalized = normalized[len(strip_country_code) :]
+    return f"{prefix}{normalized}"
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +88,7 @@ _telephony_control_client: httpx.AsyncClient | None = None
 
 GREETING_TEXT = os.getenv(
     "QWEN_GREETING_TEXT",
-    "Hello, I am your voice assistant. We can start the call now.",
+    "您好，我是智能语音助手，很高兴为您服务。请问有什么可以帮助您？",
 ).strip()
 GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
 GREETING_ROOM_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_24k.wav"
@@ -356,6 +391,26 @@ async def fetch_dialogue_opening(session_id: str) -> dict | None:
     return None
 
 
+async def fetch_realtime_scene(scene_id: int | None) -> dict[str, Any] | None:
+    """Load the published front-end dialogue definition for Realtime prompting."""
+    if not scene_id:
+        return None
+    turn_url = os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn")
+    base_url = turn_url.split("/api/", 1)[0]
+    try:
+        async with httpx.AsyncClient(timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8"))) as client:
+            response = await client.get(
+                f"{base_url}/api/dialogue/scenes/{scene_id}",
+                headers=_telephony_control_headers(),
+            )
+            response.raise_for_status()
+            body = response.json()
+            return body if isinstance(body, dict) else None
+    except Exception:
+        logger.exception("Realtime scene fetch failed; using default prompt: scene=%s", scene_id)
+        return None
+
+
 async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
     started = perf_counter()
     qwen_tts = QwenTTS()
@@ -406,7 +461,6 @@ async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
 
 
 async def warm_up_qwen_llm_after_greeting() -> None:
-    await asyncio.sleep(0.5)
     await warm_up_qwen_llm()
 
 
@@ -688,16 +742,20 @@ async def warm_up_qwen_llm() -> None:
 
     client = AsyncOpenAI(
         api_key=dashscope_key,
-        base_url=os.getenv("QWEN_OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        base_url=os.getenv(
+            "QWEN_LLM_BASE_URL",
+            "https://llm-vfnjvqxp5829jfc6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
     )
     started = perf_counter()
     try:
         await client.chat.completions.create(
-            model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
-            messages=[{"role": "user", "content": "just warm up"}],
+            model=os.getenv("QWEN_LLM_MODEL", "qwen3.7-flash"),
+            messages=[{"role": "user", "content": "你好"}],
             temperature=0,
             max_tokens=1,
             timeout=10,
+            extra_body={"enable_thinking": False},
         )
         logger.info("LLM warm-up completed in %.2fs", perf_counter() - started)
     except Exception:
@@ -753,6 +811,22 @@ def _inbound_job(raw_metadata: str) -> dict[str, Any] | None:
     if not str(payload.get("project_id") or "").strip():
         raise RuntimeError("inbound telephony job metadata is incomplete")
     return payload
+
+
+def _metadata_scene_id(raw_metadata: str, managed_job: dict[str, Any] | None) -> int | None:
+    candidate = (managed_job or {}).get("scene_id")
+    if candidate in {None, ""} and raw_metadata.strip() and not raw_metadata.startswith("enc:v1:"):
+        try:
+            payload = json.loads(raw_metadata)
+            if isinstance(payload, dict):
+                candidate = payload.get("scene_id")
+        except json.JSONDecodeError:
+            pass
+    try:
+        return int(candidate) if candidate not in {None, ""} else None
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid dialogue scene id in job metadata: %r", candidate)
+        return None
 
 
 def _telephony_control_headers() -> dict[str, str]:
@@ -867,7 +941,7 @@ async def _insights_record_session_usage(
         {
             "category": "agent_runtime",
             "provider": "livekit-agents",
-            "model": os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
+            "model": os.getenv("QWEN_LLM_MODEL", "qwen3.7-flash"),
             "quantity": 1,
             "unit": "session",
             "cost_usd": 0,
@@ -1129,7 +1203,7 @@ async def _start_managed_recording(
 
     notice = session.say(disclosure, allow_interruptions=False)
     await notice.wait_for_playout()
-    filepath = f"{prefix}/{job['project_id']}/{job['call_id']}.ogg"
+    filepath = f"{prefix}/{job['project_id']}/{job['call_id']}.mp3"
     upload = api.S3Upload(
         access_key=os.getenv("QWEN_RECORDING_S3_ACCESS_KEY", "").strip(),
         secret=os.getenv("QWEN_RECORDING_S3_SECRET", "").strip(),
@@ -1148,7 +1222,7 @@ async def _start_managed_recording(
             audio_mixing=api.AudioMixing.DUAL_CHANNEL_AGENT,
             file_outputs=[
                 api.EncodedFileOutput(
-                    file_type=api.EncodedFileType.OGG,
+                    file_type=api.EncodedFileType.MP3,
                     filepath=filepath,
                     s3=upload,
                 )
@@ -1353,20 +1427,25 @@ class PhoneAgent(Agent):
         ctx: JobContext | None = None,
         managed_job: dict[str, Any] | None = None,
         sip_identity: str = "",
+        instructions: str | None = None,
     ) -> None:
         self._job_ctx = ctx
         self._managed_job = managed_job
         self._sip_identity = sip_identity
         super().__init__(
-            instructions=os.getenv(
-                "QWEN_AGENT_INSTRUCTIONS",
-                (
-                "你是一个中文语音电话助手，负责直接回答用户问题。"
-                "回答要准确、简洁、自然，适合电话语音播报。"
-                "优先给出结论，再补充必要说明。"
-                "如果没有听清用户问题，只回答：我没有听清，请再说一遍。"
-                "通常不超过三句话，除非用户明确要求详细解释。"
-                ),
+            instructions=(
+                instructions
+                if instructions is not None
+                else os.getenv(
+                    "QWEN_AGENT_INSTRUCTIONS",
+                    (
+                    "你是一个中文语音电话助手，负责直接回答用户问题。"
+                    "回答要准确、简洁、自然，适合电话语音播报。"
+                    "优先给出结论，再补充必要说明。"
+                    "如果没有听清用户问题，只回答：我没有听清，请再说一遍。"
+                    "通常不超过三句话，除非用户明确要求详细解释。"
+                    ),
+                )
             ).strip()
         )
 
@@ -1399,6 +1478,119 @@ class PhoneAgent(Agent):
                 destination_name,
             )
             return "人工客服暂时无法接通，我会继续为您处理。"
+
+    async def _record_realtime_business_event(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> bool:
+        if not self._managed_job:
+            logger.info("Realtime business event without managed call: %s %s", event_type, payload)
+            return False
+        try:
+            await _insights_event(
+                self._managed_job,
+                str(self._managed_job["call_id"]),
+                event_type,
+                payload,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Unable to persist Realtime business event: call_id=%s type=%s",
+                self._managed_job.get("call_id"),
+                event_type,
+            )
+            return False
+
+    @function_tool(
+        description="Save the current customer intent label after applying the prompt rules."
+    )
+    async def save_intent_label(self, label: str, evidence: str) -> str:
+        normalized = label.strip().upper()
+        if normalized not in {"A类", "B类", "C类"}:
+            return "意向标签无效，未保存。"
+        saved = await self._record_realtime_business_event(
+            "call.intent_label",
+            {"label": normalized, "evidence": evidence.strip()[:1000]},
+        )
+        return "意向标签已保存。" if saved else "意向标签暂时无法保存。"
+
+    @function_tool(description="Save a faithful summary before normally completing the call.")
+    async def save_call_result(self, summary: str, intent_label: str = "") -> str:
+        if not summary.strip():
+            return "通话摘要为空，未保存。"
+        saved = await self._record_realtime_business_event(
+            "call.result",
+            {
+                "summary": summary.strip()[:4000],
+                "intent_label": intent_label.strip().upper()[:10],
+            },
+        )
+        return "通话结果已保存。" if saved else "通话结果暂时无法保存。"
+
+    @function_tool(
+        description="Record a customer question that isn't covered by the supplied facts or knowledge."
+    )
+    async def record_unresolved_question(self, question: str) -> str:
+        if not question.strip():
+            return "问题为空，未记录。"
+        saved = await self._record_realtime_business_event(
+            "call.unresolved_question", {"question": question.strip()[:2000]}
+        )
+        return "未解决问题已记录。" if saved else "未解决问题暂时无法记录。"
+
+    @function_tool(
+        description=(
+            "End the current call after the final spoken sentence has had time to play. "
+            "Use only for a completed flow or an explicit customer rejection."
+        )
+    )
+    async def end_call(self, ctx: RunContext, reason: str) -> str:
+        if not self._job_ctx:
+            return "当前通话不支持自动挂机。"
+        session = ctx.session
+        current_speech = ctx.speech_handle
+        next_speech: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+        def on_speech_created(event: Any) -> None:
+            handle = getattr(event, "speech_handle", None)
+            if handle is not None and handle is not current_speech and not next_speech.done():
+                next_speech.set_result(handle)
+
+        session.on("speech_created", on_speech_created)
+
+        async def shutdown_after_playout() -> None:
+            try:
+                # The tool belongs to current_speech. Waiting in this detached task is
+                # safe after the tool returns and ensures its whole turn is drained.
+                await asyncio.wait_for(current_speech.wait_for_playout(), timeout=30.0)
+
+                # Some Realtime providers generate the spoken tool reply as a second
+                # SpeechHandle. If one was created, drain that handle as well.
+                if next_speech.done():
+                    followup = next_speech.result()
+                    await asyncio.wait_for(followup.wait_for_playout(), timeout=30.0)
+                else:
+                    try:
+                        followup = await asyncio.wait_for(
+                            asyncio.shield(next_speech), timeout=1.0
+                        )
+                        await asyncio.wait_for(followup.wait_for_playout(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.TimeoutError:
+                logger.warning("Realtime final response playout timed out; forcing hangup")
+            except Exception:
+                logger.exception("Unable to wait for Realtime final response playout")
+            finally:
+                session.off("speech_created", on_speech_created)
+                await asyncio.sleep(
+                    max(0, _env_int("QWEN_AUDIO_REALTIME_PLAYOUT_TAIL_MS", 400)) / 1000
+                )
+                if self._job_ctx:
+                    self._job_ctx.shutdown(reason=f"realtime end_call: {reason[:200]}")
+
+        asyncio.create_task(shutdown_after_playout())
+        return "请完整播报当前结束节点的话术；系统会在音频实际播放完成后挂机。"
 
 
 server = AgentServer(
@@ -1505,37 +1697,48 @@ async def entrypoint(ctx: JobContext) -> None:
                 managed_job.get("call_id"),
             )
 
-    start_llm_warmup_background_thread()
-
     dashscope_key = os.getenv("DASHSCOPE_API_KEY")
     qwen_base_url = os.getenv(
-        "QWEN_OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        "QWEN_LLM_BASE_URL",
+        "https://llm-vfnjvqxp5829jfc6.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
     )
+    selected_pipeline = voice_pipeline()
+    metadata_scene_id = _metadata_scene_id(raw_job_metadata, managed_job)
+    scene_id = int(metadata_scene_id or os.getenv("QWEN_DIALOGUE_SCENE_ID", "0")) or None
 
-    use_realtime_asr = os.getenv("QWEN_USE_REALTIME_ASR", "true").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    session_vad = ctx.proc.userdata.get("vad")
-    if session_vad is None:
-        logger.warning("Silero VAD was not prewarmed; loading it in the job process")
-        session_vad = _build_session_vad()
-    asr_provider = (
-        QwenRealtimeASR()
-        if use_realtime_asr
-        else stt.StreamAdapter(
-            stt=QwenASR(),
-            vad=session_vad,
+    session_vad = None
+    asr_provider = None
+    turn_detector = None
+    if selected_pipeline == CLASSIC_PIPELINE:
+        use_realtime_asr = os.getenv("QWEN_USE_REALTIME_ASR", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        session_vad = ctx.proc.userdata.get("vad")
+        if session_vad is None:
+            logger.warning("Silero VAD was not prewarmed; loading it in the job process")
+            session_vad = _build_session_vad()
+        asr_provider = (
+            QwenRealtimeASR()
+            if use_realtime_asr
+            else stt.StreamAdapter(
+                stt=QwenASR(),
+                vad=session_vad,
+            )
         )
-    )
-    turn_detector = _build_turn_detector()
-    logger.info(
-        "Voice input selected: asr=%s vad=silero turn_detection=%s",
-        "qwen-realtime-websocket" if use_realtime_asr else "qwen-http-vad-adapter",
-        _turn_detection_mode(),
-    )
+        turn_detector = _build_turn_detector()
+        logger.info(
+            "Voice pipeline selected: mode=classic asr=%s vad=silero turn_detection=%s",
+            "qwen-realtime-websocket" if use_realtime_asr else "qwen-http-vad-adapter",
+            _turn_detection_mode(),
+        )
+    else:
+        logger.info(
+            "Voice pipeline selected: mode=realtime model=%s",
+            os.getenv("QWEN_AUDIO_REALTIME_MODEL", "qwen-audio-3.0-realtime-flash"),
+        )
 
     hangup_task: asyncio.Task[None] | None = None
     current_speech_handle: Any = None
@@ -1566,38 +1769,65 @@ async def entrypoint(ctx: JobContext) -> None:
         delay_ms = max(delay_ms, _env_int("QWEN_DIALOGUE_HANGUP_MIN_DELAY_MS", 3500))
         hangup_task = asyncio.create_task(hangup_room_after_dialogue_end(ctx.room.name, delay_ms))
 
-    session = AgentSession(
-        stt=asr_provider,
-        vad=session_vad,
-        llm=ScriptFirstLLM(
-            upstream=openai.LLM(
-                model=os.getenv("QWEN_LLM_MODEL", "qwen-plus"),
-                api_key=dashscope_key,
-                base_url=qwen_base_url,
+    realtime_instructions = ""
+    if selected_pipeline == CLASSIC_PIPELINE:
+        session = AgentSession(
+            stt=asr_provider,
+            vad=session_vad,
+            llm=ScriptFirstLLM(
+                upstream=openai.LLM(
+                    model=os.getenv("QWEN_LLM_MODEL", "qwen3.7-flash"),
+                    api_key=dashscope_key,
+                    base_url=qwen_base_url,
+                    extra_body={"enable_thinking": False},
+                ),
+                session_id=ctx.room.name,
+                scene_id=scene_id,
+                dialogue_url=os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn"),
+                timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8")),
+                on_dialogue_result=on_dialogue_result,
             ),
+            tts=QwenTTS(),
+            turn_handling=TurnHandlingOptions(
+                turn_detection=turn_detector,
+                endpointing=_turn_endpointing_options(),
+                preemptive_generation={
+                    "enabled": True,
+                    "preemptive_tts": True,
+                    "max_speech_duration": 8.0,
+                    "max_retries": 3,
+                },
+                interruption={
+                    "resume_false_interruption": True,
+                    "false_interruption_timeout": 0.4,
+                },
+            ),
+            aec_warmup_duration=1.0,
+        )
+    else:
+        realtime_scene = await fetch_realtime_scene(scene_id)
+        realtime_instructions = load_realtime_instructions(
+            root=ROOT,
             session_id=ctx.room.name,
-            scene_id=int(os.getenv("QWEN_DIALOGUE_SCENE_ID", "0")) or None,
-            dialogue_url=os.getenv("QWEN_DIALOGUE_URL", "http://127.0.0.1:8090/api/dialogue/turn"),
-            timeout=float(os.getenv("QWEN_DIALOGUE_TIMEOUT", "0.8")),
-            on_dialogue_result=on_dialogue_result,
-        ),
-        tts=QwenTTS(),
-        turn_handling=TurnHandlingOptions(
-            turn_detection=turn_detector,
-            endpointing=_turn_endpointing_options(),
-            preemptive_generation={
-                "enabled": True,
-                "preemptive_tts": True,
-                "max_speech_duration": 8.0,
-                "max_retries": 3,
-            },
-            interruption={
-                "resume_false_interruption": True,
-                "false_interruption_timeout": 0.4,
-            },
-        ),
-        aec_warmup_duration=1.0,
-    )
+            scene_id=scene_id,
+            customer_name=str((managed_job or {}).get("customer_name") or ""),
+            customer_company=str((managed_job or {}).get("customer_company") or ""),
+            customer_phone=str(
+                (managed_job or {}).get("phone_number")
+                or (managed_job or {}).get("source_number")
+                or ""
+            ),
+            customer_profile=str((managed_job or {}).get("customer_profile") or ""),
+            scene=realtime_scene,
+        )
+        session = AgentSession(
+            llm=QwenAudioRealtimeModel(api_key=str(dashscope_key or "")),
+            # Realtime owns normal conversational speech. Keep the existing TTS
+            # only as an operational fallback for exact compliance notices,
+            # voicemail text and supervisor console announcements (`say`).
+            tts=QwenTTS(),
+            aec_warmup_duration=1.0,
+        )
 
     metrics_event_count = 0
 
@@ -1626,6 +1856,31 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_speech_created(ev) -> None:
         nonlocal current_speech_handle
         current_speech_handle = ev.speech_handle
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev) -> None:
+        if not managed_job or not insights_session_id:
+            return
+        item = getattr(ev, "item", None)
+        role = str(getattr(item, "role", ""))
+        text = str(getattr(item, "text_content", "") or "").strip()
+        if role not in {"user", "assistant"} or not text:
+            return
+        event_type = "user.transcript" if role == "user" else "agent.response"
+        item_id = str(getattr(item, "id", "") or "")
+
+        async def persist_conversation_item() -> None:
+            try:
+                await _insights_event(
+                    managed_job,
+                    insights_session_id,
+                    event_type,
+                    {"text": text, "item_id": item_id},
+                )
+            except Exception:
+                logger.exception("Unable to persist conversation item")
+
+        asyncio.create_task(persist_conversation_item())
 
     async def log_usage(_reason: str = "") -> None:
         logger.info("Usage: %s", session.usage)
@@ -1746,6 +2001,7 @@ async def entrypoint(ctx: JobContext) -> None:
             ctx=ctx,
             managed_job=managed_job,
             sip_identity=managed_sip_identity,
+            instructions=realtime_instructions or None,
         ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
@@ -1822,7 +2078,9 @@ async def entrypoint(ctx: JobContext) -> None:
                     api.CreateSIPParticipantRequest(
                         room_name=ctx.room.name,
                         sip_trunk_id=str(outbound_job["livekit_trunk_id"]),
-                        sip_call_to=str(outbound_job["phone_number"]),
+                        sip_call_to=_provider_dial_target(
+                            str(outbound_job["phone_number"])
+                        ),
                         sip_number=str(outbound_job.get("source_number") or ""),
                         participant_identity=managed_sip_identity,
                         participant_name="AI voice call",
@@ -1979,21 +2237,37 @@ async def entrypoint(ctx: JobContext) -> None:
     if not await ensure_required_recording():
         return
 
-    opening = await fetch_dialogue_opening(ctx.room.name)
-    if opening and opening.get("text"):
-        audio = opening.get("audio") if isinstance(opening.get("audio"), dict) else {}
-        audio_url = str(opening.get("audio_url") or audio.get("url") or "").strip()
-        speech = session.say(str(opening["text"]), allow_interruptions=not audio_url)
-        if audio_url:
-            schedule_interrupt_gate(
-                speech,
-                text=str(opening["text"]),
-                audio_url=audio_url,
-                result=opening,
-            )
-        await speech.wait_for_playout()
+    if selected_pipeline == CLASSIC_PIPELINE:
+        # Warm the classic LLM concurrently with the welcome message so the
+        # first caller utterance uses an already-active model endpoint.
+        start_llm_warmup_background_thread()
+        opening = await fetch_dialogue_opening(ctx.room.name)
+        if opening and opening.get("text"):
+            audio = opening.get("audio") if isinstance(opening.get("audio"), dict) else {}
+            audio_url = str(opening.get("audio_url") or audio.get("url") or "").strip()
+            speech = session.say(str(opening["text"]), allow_interruptions=not audio_url)
+            if audio_url:
+                schedule_interrupt_gate(
+                    speech,
+                    text=str(opening["text"]),
+                    audio_url=audio_url,
+                    result=opening,
+                )
+            await speech.wait_for_playout()
+        else:
+            await play_greeting_audio_direct(ctx.room)
     else:
-        await play_greeting_audio_direct(ctx.room)
+        # In Realtime mode the model owns both generation and speech. Trigger
+        # the start node only after the SIP participant is ready/recording is
+        # active, so the caller cannot miss the opening sentence.
+        speech = session.generate_reply(
+            instructions=(
+                "现在开始通话。严格只播报系统指令中定义的开场白，"
+                "不要解释规则，不要提前进入下一节点。"
+            ),
+            allow_interruptions=True,
+        )
+        await speech.wait_for_playout()
 
 
 if __name__ == "__main__":

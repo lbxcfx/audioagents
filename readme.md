@@ -107,6 +107,52 @@ cd qwen-telephony
 .venv/bin/python -m livekit.agents download-files
 ```
 
+## 混合开发模式
+
+功能开发阶段建议只用 Docker 运行 PostgreSQL、Redis、LiveKit 和
+LiveKit SIP；控制面、Dispatcher、Phone Agent 和 React 前端直接从源码运行，
+以便使用自动重载、断点和前台日志。
+
+首次准备：
+
+```bash
+cp qwen-telephony/config/dev.env.example qwen-telephony/config/dev.env
+# 将真实 DASHSCOPE_API_KEY 写入根目录 .env
+qwen-telephony/scripts/bootstrap-wsl.sh
+```
+
+启动基础设施：
+
+```bash
+qwen-telephony/scripts/dev-infra.sh up
+qwen-telephony/scripts/dev-init-sip.sh
+```
+
+随后分别打开终端启动需要调试的源码服务：
+
+```bash
+qwen-telephony/scripts/dev-control-plane.sh
+qwen-telephony/scripts/dev-frontend.sh
+qwen-telephony/scripts/dev-agent.sh
+```
+
+创建项目并把 `telephony-worker` 加入项目后，在 `dev.env` 设置
+`CLOUD_PARITY_TELEPHONY_PROJECT_IDS`，然后启动 Dispatcher：
+
+```bash
+qwen-telephony/scripts/dev-dispatcher.sh
+```
+
+状态检查与停止基础设施：
+
+```bash
+qwen-telephony/scripts/dev-check.sh
+qwen-telephony/scripts/dev-infra.sh down
+```
+
+开发数据默认保留在 Docker 卷中。只有确认要删除 PostgreSQL 和 Redis 开发数据时，
+才执行 `qwen-telephony/scripts/dev-infra.sh reset --delete-data`。
+
 ## 启动方式
 
 推荐使用健康检查脚本启动。它会检查 Docker、LiveKit、SIP、SIP trunk/dispatch rule、Agent 进程和 worker 注册状态；如果发现异常，会自动启动或修复。

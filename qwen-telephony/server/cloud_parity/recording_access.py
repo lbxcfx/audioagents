@@ -66,7 +66,7 @@ def presign_recording_uri(
         "QWEN_RECORDING_S3_REGION",
         os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")),
     ).strip()
-    endpoint = os.getenv(
+    endpoint = os.getenv("QWEN_RECORDING_S3_PUBLIC_ENDPOINT", "").strip() or os.getenv(
         "QWEN_RECORDING_S3_ENDPOINT",
         os.getenv("CLOUD_PARITY_RECORDING_S3_ENDPOINT", ""),
     ).strip()
@@ -80,8 +80,13 @@ def presign_recording_uri(
         raise ValueError("recording access TTL must be between 30 and 3600 seconds")
 
     endpoint_url = urlparse(endpoint.rstrip("/"))
-    if endpoint_url.scheme != "https" or not endpoint_url.netloc:
-        raise ValueError("recording S3 endpoint must be an https URL")
+    development_loopback = (
+        os.getenv("CLOUD_PARITY_ENV", "development").strip().lower() == "development"
+        and endpoint_url.scheme == "http"
+        and endpoint_url.hostname in {"127.0.0.1", "localhost", "::1"}
+    )
+    if (endpoint_url.scheme != "https" and not development_loopback) or not endpoint_url.netloc:
+        raise ValueError("recording S3 endpoint must be https (except loopback development)")
     timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     amz_date = timestamp.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = timestamp.strftime("%Y%m%d")

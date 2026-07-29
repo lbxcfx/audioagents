@@ -72,3 +72,15 @@ def test_s3_recording_uri_requires_a_https_endpoint(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="https"):
         presign_recording_uri("s3://bucket/call.ogg")
+
+
+def test_s3_recording_uri_allows_loopback_http_in_development(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_RECORDING_S3_ACCESS_KEY", "access")
+    monkeypatch.setenv("QWEN_RECORDING_S3_SECRET", "secret")
+    monkeypatch.setenv("QWEN_RECORDING_S3_REGION", "us-east-1")
+    monkeypatch.setenv("QWEN_RECORDING_S3_PUBLIC_ENDPOINT", "http://127.0.0.1:9000")
+    monkeypatch.setenv("CLOUD_PARITY_ENV", "development")
+
+    signed = presign_recording_uri("s3://bucket/call.ogg")
+
+    assert signed.startswith("http://127.0.0.1:9000/bucket/call.ogg?")

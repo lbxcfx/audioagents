@@ -18,6 +18,29 @@ if str(AGENT_DIR) not in sys.path:
 import phone_agent
 
 
+def test_provider_dial_target_preserves_e164_without_prefix(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_SIP_DIAL_PREFIX", raising=False)
+    assert phone_agent._provider_dial_target("+8613812345678") == "+8613812345678"
+
+
+def test_provider_dial_target_applies_numeric_carrier_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_SIP_DIAL_PREFIX", "10012008")
+    monkeypatch.delenv("QWEN_SIP_STRIP_COUNTRY_CODE", raising=False)
+    assert phone_agent._provider_dial_target("+8613812345678") == "100120088613812345678"
+
+
+def test_provider_dial_target_strips_carrier_country_code(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_SIP_DIAL_PREFIX", "10012008")
+    monkeypatch.setenv("QWEN_SIP_STRIP_COUNTRY_CODE", "86")
+    assert phone_agent._provider_dial_target("+8613812345678") == "1001200813812345678"
+
+
+def test_provider_dial_target_rejects_invalid_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_SIP_DIAL_PREFIX", "carrier-")
+    with pytest.raises(ValueError, match="digits only"):
+        phone_agent._provider_dial_target("+8613812345678")
+
+
 def _payload() -> dict[str, str]:
     return {
         "kind": "telephony.outbound",

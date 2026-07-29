@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r /app/qwen-telephony/requirements.lock && pip c
 
 COPY qwen-telephony/agent /app/qwen-telephony/agent
 COPY qwen-telephony/config /app/qwen-telephony/config
+COPY qwen-telephony/docs/qwen-audio-realtime-dialogue-prompt.md /app/qwen-telephony/docs/qwen-audio-realtime-dialogue-prompt.md
 
 WORKDIR /app/qwen-telephony/agent
 
