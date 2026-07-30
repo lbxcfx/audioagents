@@ -23,7 +23,12 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     instructions: str = Field(min_length=10, max_length=20_000)
     welcome_message: str = Field(min_length=1, max_length=1_000)
-    voice: str = Field(default="Cherry", min_length=1, max_length=120)
+    voice: Literal[
+        "longanqian", "longanlingxin", "longanlufeng", "longanlingxi",
+        "longanxiaoxin", "longanfengyue", "longanyuanfei", "longanhuan_v3.6",
+        "longjielidou_v3.6", "longpaopao_v3.6", "longhuohuo_v3.6",
+        "longchuanshu_v3.6", "loongmary", "loongeva_v3.6", "loongjohn",
+    ] = "longanlingxin"
     language: str = Field(default="zh-CN", min_length=2, max_length=32)
     max_duration_seconds: int = Field(default=600, ge=30, le=7_200)
     recording_mode: Literal["off"] = "off"
@@ -133,7 +138,9 @@ def issue_public_livekit_token(
                 room=room_name,
                 can_publish=True,
                 can_subscribe=True,
-                can_publish_data=False,
+                # LiveKit text streams (lk.chat) use the data channel. The
+                # public Agent has tools disabled, so this only enables chat.
+                can_publish_data=True,
                 can_publish_sources=["microphone"],
             )
         )

@@ -13,7 +13,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from server.cloud_parity.auth import AuthenticationSettings, create_authenticator, install_authenticator
 from server.cloud_parity.store import AccessDeniedError, PlatformStore
-from server.inbound_control.api import create_inbound_router
+from server.inbound_control.api import create_inbound_router, issue_public_livekit_token
 from server.inbound_control.metadata import InboundMetadataSigner, MetadataValidationError
 from server.inbound_control.service import InboundAgentService
 from server.inbound_control.store import InboundAgentStore, PublicDemoQuotaError
@@ -28,7 +28,7 @@ from server.inbound_control.worker_auth import (
 VALID_CONFIG = {
     "instructions": "你是一个耐心、清晰的企业服务助手，需要准确理解来电人的问题。",
     "welcome_message": "您好，请问有什么可以帮您？",
-    "voice": "Cherry",
+    "voice": "longanlingxin",
     "language": "zh-CN",
     "max_duration_seconds": 600,
     "recording_mode": "off",
@@ -143,7 +143,7 @@ def test_signed_runtime_rejects_tampering_and_replay(environment):
 
     runtime = service.resolve_runtime(token)
     assert runtime["project_id"] == project["id"]
-    assert runtime["config"]["voice"] == "Cherry"
+    assert runtime["config"]["voice"] == "longanlingxin"
     with pytest.raises(Exception):
         service.resolve_runtime(token)
     with pytest.raises(MetadataValidationError):
@@ -254,6 +254,18 @@ def test_api_rbac_conflict_and_public_token_contract(environment):
         f"/inbound-api/projects/{project['id']}/agents", headers={"X-User-ID": "owner-b"}
     )
     assert denied.status_code == 403
+
+
+def test_public_livekit_token_allows_chat_data_but_not_arbitrary_sources(monkeypatch):
+    monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "a-livekit-secret-with-more-than-32-characters")
+    monkeypatch.setenv("LIVEKIT_URL", "ws://livekit.test")
+    issued = issue_public_livekit_token("text-room", "text-user", "signed-metadata", 120)
+    claims = __import__("jwt").decode(issued["token"], options={"verify_signature": False})
+    grant = claims["video"]
+    assert grant["canPublishData"] is True
+    assert grant["canPublishSources"] == ["microphone"]
+    assert claims["roomConfig"]["agents"][0]["agentName"] == "public-demo-agent"
 
 
 def test_public_completion_is_idempotent_and_accounts_duration(environment):

@@ -13,6 +13,8 @@ import httpx
 import jwt
 from livekit import api, rtc
 from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents.voice.room_io import RoomOptions, TextInputEvent, TextInputOptions
+from openai import AsyncOpenAI
 
 from qwen_audio_realtime import QwenAudioRealtimeModel
 
@@ -155,9 +157,10 @@ async def entrypoint(ctx: JobContext) -> None:
     final_reason = "participant_disconnected"
     limit_task: asyncio.Task[None] | None = None
     finalized = False
+    text_client: AsyncOpenAI | None = None
 
     async def finalize_once(reason: str = "") -> None:
-        nonlocal finalized, final_reason
+        nonlocal finalized, final_reason, text_client
         if finalized:
             return
         if reason and final_reason == "participant_disconnected":
@@ -177,6 +180,9 @@ async def entrypoint(ctx: JobContext) -> None:
             finalized = True
         except Exception:
             logger.exception("Unable to finalize inbound session")
+        if text_client is not None:
+            await text_client.close()
+            text_client = None
         await control.close()
 
     ctx.add_shutdown_callback(finalize_once)
@@ -224,7 +230,39 @@ async def entrypoint(ctx: JobContext) -> None:
                 voice=voice,
             )
         )
-        await session.start(agent=InboundVoiceAgent(instructions), room=ctx.room)
+        text_client = AsyncOpenAI(
+            api_key=os.getenv("DASHSCOPE_API_KEY", "").strip(),
+            base_url=os.getenv(
+                "QWEN_OPENAI_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+        )
+        text_messages: list[dict[str, str]] = [{"role": "system", "content": instructions}]
+        text_lock = asyncio.Lock()
+
+        async def handle_text(_session: AgentSession, event: TextInputEvent) -> None:
+            text = event.text.strip()
+            if not text or len(text) > 4_000:
+                return
+            async with text_lock:
+                text_messages.append({"role": "user", "content": text})
+                completion = await text_client.chat.completions.create(
+                    model=os.getenv("QWEN_TEXT_MODEL", "qwen-plus"),
+                    messages=text_messages[-21:],
+                    temperature=0.3,
+                    timeout=20,
+                )
+                reply = (completion.choices[0].message.content or "").strip()
+                if not reply:
+                    reply = "抱歉，我暂时没有生成有效回复，请稍后再试。"
+                text_messages.append({"role": "assistant", "content": reply})
+                await ctx.room.local_participant.send_text(reply, topic="lk.transcription")
+
+        await session.start(
+            agent=InboundVoiceAgent(instructions),
+            room=ctx.room,
+            room_options=RoomOptions(text_input=TextInputOptions(text_input_cb=handle_text)),
+        )
 
         if welcome:
             session.generate_reply(

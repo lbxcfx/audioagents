@@ -255,6 +255,7 @@ POST /inbound-api/internal/sessions/{session_id}/complete
 
 - `server/inbound_control`：Agent 草稿、不可变发布版本、版本激活/回滚、入口绑定/切版/停用、公开配额、会话、分析、SIP 准入和短时 Worker JWT。
 - `agent/inbound_agent.py`：公开与企业共用镜像、按 Agent Name 分池部署、Qwen Realtime、远端音频、欢迎语、硬时长和幂等完成。
+- 文本通道使用 LiveKit `lk.chat` 输入与 `lk.transcription` 输出；文本回复走独立的 Qwen Chat 会话上下文，避免音频 Realtime 协议的上下文确认差异，同时保留相同 Agent 指令、准入、配额和会话边界。
 - `scripts/sync-inbound-dispatch.py`：为每个 SIP DID 创建 Individual Room Dispatch，使用静态 `sip_inbound` 类型标识；项目和版本由控制面依据真实 Trunk/DID 解析，不把短时 Web Token 写入长期 Rule。
 - `app/src/InboundExperience.tsx`：公开 WebRTC 体验、远端音轨播放、麦克风控制、重连、服务端状态和额度反馈。
 - `app/src/InboundConsole.tsx`：企业 Agent 配置、发布、入口、版本切换和会话记录。
