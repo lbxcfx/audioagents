@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 import uuid
 
 from server.cloud_parity.store import (
@@ -150,9 +150,45 @@ class PublicDemoQuotaError(RuntimeError):
 
 
 class InboundAgentStore:
-    def __init__(self, platform: PlatformStore, *, public_project_id: str = ""):
+    def __init__(
+        self,
+        platform: PlatformStore,
+        *,
+        public_project_id: str = "",
+        knowledge_validator: Callable[[str, list[str]], None] | None = None,
+        knowledge_snapshotter: Callable[[str, list[str]], list[str]] | None = None,
+        tool_validator: Callable[[str, list[str]], None] | None = None,
+        content_validator: Callable[[str, list[str]], None] | None = None,
+    ):
         self.platform = platform
         self.public_project_id = public_project_id.strip()
+        self.knowledge_validator = knowledge_validator
+        self.knowledge_snapshotter = knowledge_snapshotter
+        self.tool_validator = tool_validator
+        self.content_validator = content_validator
+
+    def _validate_isolated_capabilities(
+        self, *, project_id: str, kind: str, config: Mapping[str, Any]
+    ) -> None:
+        tool_ids = [str(value) for value in config.get("tools") or []]
+        if kind == "public_demo" and tool_ids:
+            raise ValueError("public demo agents cannot bind enterprise tools")
+        if tool_ids:
+            if self.tool_validator is None:
+                raise ValueError("tool gateway is not enabled")
+            self.tool_validator(project_id, tool_ids)
+        source_ids = [str(value) for value in config.get("knowledge_sources") or []]
+        if kind == "public_demo" and source_ids:
+            raise ValueError("public demo agents cannot bind enterprise knowledge")
+        if source_ids:
+            if self.knowledge_validator is None:
+                raise ValueError("knowledge runtime is not enabled")
+            self.knowledge_validator(project_id, source_ids)
+        content_ids = [str(value) for value in config.get("content_sources") or []]
+        if kind == "public_demo" and content_ids: raise ValueError("public demo agents cannot bind enterprise content")
+        if content_ids:
+            if self.content_validator is None: raise ValueError("content service is not enabled")
+            self.content_validator(project_id, content_ids)
 
     def _require_public_admin(self, project_id: str, actor_id: str, kind: str) -> None:
         if kind != "public_demo":
@@ -210,8 +246,7 @@ class InboundAgentStore:
         if kind not in {"enterprise", "public_demo"}:
             raise ValueError("invalid inbound agent kind")
         self._require_public_admin(project_id, actor_id, kind)
-        if config.get("tools") or config.get("knowledge_sources"):
-            raise ValueError("tools and knowledge are disabled until the isolated runtime is enabled")
+        self._validate_isolated_capabilities(project_id=project_id, kind=kind, config=config)
         if config.get("recording_mode", "off") != "off":
             raise ValueError("inbound recording is disabled until disclosure and retention are configured")
         clean_name = name.strip()
@@ -279,8 +314,9 @@ class InboundAgentStore:
         with self.platform.transaction() as conn:
             current = self._agent(conn, project_id, agent_id)
             self._require_public_admin(project_id, actor_id, str(current["kind"]))
-            if config.get("tools") or config.get("knowledge_sources"):
-                raise ValueError("tools and knowledge are disabled until the isolated runtime is enabled")
+            self._validate_isolated_capabilities(
+                project_id=project_id, kind=str(current["kind"]), config=config
+            )
             if config.get("recording_mode", "off") != "off":
                 raise ValueError("inbound recording is disabled until disclosure and retention are configured")
             if int(current["draft_revision"]) != expected_revision:
@@ -323,7 +359,13 @@ class InboundAgentStore:
             self._require_public_admin(project_id, actor_id, str(agent["kind"]))
             if int(agent["draft_revision"]) != expected_revision:
                 raise ValueError("agent draft revision conflict")
-            config_text = canonical_json(agent["draft_config"])
+            published_config = dict(agent["draft_config"])
+            source_ids = [str(value) for value in published_config.get("knowledge_sources") or []]
+            if source_ids:
+                if self.knowledge_snapshotter is None:
+                    raise ValueError("knowledge snapshot runtime is not enabled")
+                published_config["knowledge_document_ids"] = self.knowledge_snapshotter(project_id, source_ids)
+            config_text = canonical_json(published_config)
             digest = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
             existing = conn.execute(
                 "SELECT * FROM inbound_agent_versions WHERE agent_id = ? AND revision = ?",
@@ -828,11 +870,11 @@ class InboundAgentStore:
                     id, project_id, agent_id, agent_version_id, binding_id,
                     entry_type, room_name, provider_call_id, caller_hash, caller_last4,
                     status, started_at, retention_until, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'sip_did', ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
                 """,
                 (
                     session_id, binding["project_id"], binding["agent_id"],
-                    binding["agent_version_id"], binding["id"], room_name,
+                    binding["agent_version_id"], binding["id"], binding.get("entry_type", "sip_did"), room_name,
                     provider_call_id, caller_hash, caller_last4, now, retention_until, now, now,
                 ),
             )

@@ -14,6 +14,15 @@ data:
   INBOUND_ENTERPRISE_MAX_CONCURRENT: "100"
   INBOUND_AGENT_PORT: "18082"
   INBOUND_AGENT_LOAD_THRESHOLD: "0.80"
+  INBOUND_VISION_ENABLED: "false"
+  INBOUND_VISION_MODEL: qwen3.5-omni-flash
+  INBOUND_VISION_TIMEOUT_SECONDS: "12"
+  INBOUND_EMBEDDING_ENABLED: "true"
+  INBOUND_EMBEDDING_MODEL: text-embedding-v4
+  INBOUND_KNOWLEDGE_OBJECT_STORE_ENABLED: "true"
+  INBOUND_KNOWLEDGE_S3_ENDPOINT: https://minio.example.com
+  INBOUND_KNOWLEDGE_S3_BUCKET: audioagents-knowledge
+  INBOUND_AVATAR_PROVIDER_URL: https://avatar.example.com/api
   INBOUND_PUBLIC_PROJECT_ID: replace-with-platform-public-project-uuid
   CLOUD_PARITY_ENV: production
   CLOUD_PARITY_AUTH_MODE: oidc
@@ -74,6 +83,29 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             capabilities: {drop: ["ALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inbound-knowledge-worker
+  namespace: qwen-telephony
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: inbound-knowledge-worker}}
+  template:
+    metadata: {labels: {app: inbound-knowledge-worker, inbound-pool: knowledge}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: worker
+          image: registry.example.com/qwen-telephony/inbound-control@sha256:REPLACE_WITH_DIGEST
+          command: ["python", "/app/scripts/process-knowledge-jobs.py"]
+          envFrom:
+            - configMapRef: {name: inbound-agent-config}
+            - secretRef: {name: inbound-control-secrets}
+          resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "2", memory: 2Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: ["ALL"]}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -224,6 +256,17 @@ metadata: {name: inbound-control, namespace: qwen-telephony}
 spec:
   scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inbound-control}
   minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: inbound-knowledge-worker, namespace: qwen-telephony}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inbound-knowledge-worker}
+  minReplicas: 2
   maxReplicas: 12
   metrics:
     - type: Resource

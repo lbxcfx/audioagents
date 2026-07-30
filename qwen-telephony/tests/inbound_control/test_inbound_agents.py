@@ -256,7 +256,7 @@ def test_api_rbac_conflict_and_public_token_contract(environment):
     assert denied.status_code == 403
 
 
-def test_public_livekit_token_allows_chat_data_but_not_arbitrary_sources(monkeypatch):
+def test_public_livekit_token_allows_chat_camera_and_screen_but_not_arbitrary_sources(monkeypatch):
     monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "a-livekit-secret-with-more-than-32-characters")
     monkeypatch.setenv("LIVEKIT_URL", "ws://livekit.test")
@@ -264,7 +264,7 @@ def test_public_livekit_token_allows_chat_data_but_not_arbitrary_sources(monkeyp
     claims = __import__("jwt").decode(issued["token"], options={"verify_signature": False})
     grant = claims["video"]
     assert grant["canPublishData"] is True
-    assert grant["canPublishSources"] == ["microphone"]
+    assert grant["canPublishSources"] == ["microphone", "camera", "screen_share"]
     assert claims["roomConfig"]["agents"][0]["agentName"] == "public-demo-agent"
 
 

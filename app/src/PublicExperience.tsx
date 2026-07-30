@@ -32,6 +32,7 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
   const [accountView, setAccountView] = useState<AccountView>("login");
   const [message, setMessage] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [loginIdentifier, setLoginIdentifier] = useState("");
 
   useEffect(() => {
     const sync = () => setPage(pageFromPath());
@@ -99,6 +100,7 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
       }
       accounts.push({ email, name: String(values.get("name") || "").trim(), passwordHash: await passwordDigest(password) });
       localStorage.setItem(DEVELOPMENT_ACCOUNTS_KEY, JSON.stringify(accounts));
+      setLoginIdentifier(email);
       setAccountView("login");
       setMessage("注册成功，请使用邮箱和密码登录。");
       return;
@@ -110,6 +112,7 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
         password,
         accepted_terms: true,
       });
+      setLoginIdentifier(email);
       setAccountView("login");
       setMessage("注册成功，请使用邮箱和密码登录。");
     } catch (error) {
@@ -139,12 +142,12 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
             <h2>{accountView === "forgot" ? "重置您的密码" : accountView === "register" ? "欢迎加入" : "欢迎回来"}</h2>
             <p>{accountView === "forgot" ? "输入注册邮箱，我们会将密码重置链接发送给您。" : accountView === "register" ? "先创建个人账号，登录后即可配置并测试您的智能客服。" : "登录您的工作空间，继续处理今天的重要沟通。"}</p>
             {accountView === "forgot" ? (
-              <form className="login-form" onSubmit={requestReset}>
+              <form className="login-form" key="forgot-form" onSubmit={requestReset}>
                 <div className="login-field"><label htmlFor="reset-email">注册邮箱</label><input id="reset-email" name="email" type="email" autoComplete="email" inputMode="email" spellCheck={false} placeholder="例如：name@company.com" required /></div>
                 <button className="account-primary" type="submit">发送重置链接</button>
               </form>
             ) : accountView === "register" ? (
-              <form className="login-form" onSubmit={register}>
+              <form className="login-form" key="register-form" onSubmit={register}>
                 <div className="login-field"><label htmlFor="register-name">您的称呼</label><input id="register-name" name="name" autoComplete="name" placeholder="请输入姓名" required /></div>
                 <div className="login-field"><label htmlFor="register-email">邮箱</label><input id="register-email" name="email" type="email" autoComplete="email" inputMode="email" spellCheck={false} placeholder="例如：name@company.com" required /></div>
                 <div className="login-field"><label htmlFor="register-password">设置密码</label><input id="register-password" name="password" type="password" autoComplete="new-password" minLength={8} placeholder="至少 8 位字符" required /></div>
@@ -153,8 +156,8 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
                 <button className="account-primary" type="submit">注册账号</button>
               </form>
             ) : (
-              <form className="login-form" onSubmit={login}>
-                <div className="login-field"><label htmlFor="login-identifier">邮箱或手机号</label><input id="login-identifier" name="identifier" autoComplete="username" spellCheck={false} placeholder="请输入邮箱或手机号" required /></div>
+              <form className="login-form" key="login-form" onSubmit={login}>
+                <div className="login-field"><label htmlFor="login-identifier">邮箱或手机号</label><input id="login-identifier" name="identifier" autoComplete="username" spellCheck={false} placeholder="请输入邮箱或手机号" value={loginIdentifier} onChange={(event) => setLoginIdentifier(event.target.value)} required /></div>
                 <div className="login-field"><label htmlFor="login-password">密码</label><div className="password-control"><input id="login-password" name="password" type={showPassword ? "text" : "password"} autoComplete="current-password" placeholder="请输入密码" minLength={6} required /><button aria-label={showPassword ? "隐藏密码" : "显示密码"} aria-pressed={showPassword} onClick={() => setShowPassword((value) => !value)} type="button">{showPassword ? "隐藏" : "显示"}</button></div></div>
                 <div className="login-options"><label><input name="remember" type="checkbox" /> <span>记住密码</span></label><button onClick={() => { setAccountView("forgot"); setMessage(""); }} type="button">忘记密码？</button></div>
                 <button className="account-primary" type="submit">登录</button>

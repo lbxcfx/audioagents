@@ -5,6 +5,10 @@ import { loadPlatformAuth, platformAuthHeaders, platformAuthSubject, savePlatfor
 
 const InboundExperience = lazy(() => import("./InboundExperience"));
 const InboundConsole = lazy(() => import("./InboundConsole"));
+const KnowledgeConsole = lazy(() => import("./KnowledgeConsole"));
+const IntegrationConsole = lazy(() => import("./IntegrationConsole"));
+const ContentConsole = lazy(() => import("./ContentConsole"));
+const EvaluationConsole = lazy(() => import("./EvaluationConsole"));
 const WorkspaceHome = lazy(() => import("./WorkspaceHome"));
 const LegalDocument = lazy(() => import("./LegalDocument"));
 
@@ -4537,6 +4541,10 @@ function App() {
   if (path === "/terms" || path === "/privacy") return <Suspense fallback={<div className="route-loading">正在打开文档…</div>}><LegalDocument kind={path === "/terms" ? "terms" : "privacy"} /></Suspense>;
   if (path.startsWith("/experience/voice")) return <Suspense fallback={<div className="route-loading">正在准备语音体验…</div>}><InboundExperience /></Suspense>;
   if (path.startsWith("/app/home")) return <Suspense fallback={<div className="route-loading">正在打开工作空间…</div>}><WorkspaceHome /></Suspense>;
+  if (path.startsWith("/app/inbound/knowledge")) return <Suspense fallback={<div className="route-loading">正在打开知识库…</div>}><KnowledgeConsole /></Suspense>;
+  if (path.startsWith("/app/inbound/integrations")) return <Suspense fallback={<div className="route-loading">正在打开业务系统…</div>}><IntegrationConsole /></Suspense>;
+  if (path.startsWith("/app/inbound/content")) return <Suspense fallback={<div className="route-loading">正在打开展示素材…</div>}><ContentConsole /></Suspense>;
+  if (path.startsWith("/app/inbound/evaluation")) return <Suspense fallback={<div className="route-loading">正在打开评测…</div>}><EvaluationConsole /></Suspense>;
   if (path.startsWith("/app/inbound")) return <Suspense fallback={<div className="route-loading">正在打开智能呼入…</div>}><InboundConsole /></Suspense>;
   return <LegacyApp />;
 }

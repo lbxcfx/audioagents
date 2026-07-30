@@ -84,6 +84,9 @@ test("enterprise inbound console loads agents and opens version-pinned detail", 
   await page.route("**/api/platform/projects", (route) => route.fulfill({ json: {
     items: [{ id: "project-1", name: "示例企业", role: "owner" }],
   } }));
+  await page.route("**/inbound-api/projects/project-1/knowledge-bases", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/tools", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/content-assets", (route) => route.fulfill({ json: { items: [] } }));
   await page.route("**/inbound-api/projects/project-1/agents", (route) => route.fulfill({ json: {
     items: [{
       id: "agent-1", project_id: "project-1", kind: "enterprise", name: "客户服务助手",
@@ -101,7 +104,7 @@ test("enterprise inbound console loads agents and opens version-pinned detail", 
       instructions: "你是一个耐心的服务助手，需要准确回答客户问题。",
       welcome_message: "您好，请问有什么可以帮您？", voice: "Cherry", language: "zh-CN",
       max_duration_seconds: 600, recording_mode: "off", recording_disclosure: "",
-      tools: [], knowledge_sources: [],
+      tools: [], knowledge_sources: [], content_sources: [], avatar_enabled: false, avatar_id: "",
     },
     bindings: [{
       id: "binding-1", entry_type: "sip_did", destination: "+8613800000000",
@@ -130,4 +133,27 @@ test("enterprise inbound console protects unauthenticated deep links", async ({ 
   await page.goto("/app/inbound/agents");
   await expect(page.getByRole("heading", { name: "请先登录控制台" })).toBeVisible();
   await expect(page.getByRole("link", { name: "前往登录" })).toHaveAttribute("href", "/login");
+});
+
+test("enterprise knowledge, tools, content and evaluation pages load within project scope", async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem(
+    "voicePlatformAuth",
+    JSON.stringify({ mode: "development", userId: "owner" }),
+  ));
+  await page.route("**/api/platform/projects", (route) => route.fulfill({ json: {
+    items: [{ id: "project-1", name: "示例企业", role: "owner" }],
+  } }));
+  await page.route("**/inbound-api/projects/project-1/knowledge-bases", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/tool-connections", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/tools", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/content-assets", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/inbound-api/projects/project-1/agents", (route) => route.fulfill({ json: { items: [] } }));
+  await page.goto("/app/inbound/knowledge");
+  await expect(page.getByRole("heading", { name: /知识/ }).first()).toBeVisible();
+  await page.goto("/app/inbound/integrations");
+  await expect(page.getByRole("heading", { name: "把业务动作关进白名单" })).toBeVisible();
+  await page.goto("/app/inbound/content");
+  await expect(page.getByRole("heading", { name: /素材/ }).first()).toBeVisible();
+  await page.goto("/app/inbound/evaluation");
+  await expect(page.getByRole("heading", { name: "真实链路测试" })).toBeVisible();
 });

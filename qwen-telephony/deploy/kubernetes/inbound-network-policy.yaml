@@ -15,7 +15,10 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: inbound-workers-egress, namespace: qwen-telephony}
 spec:
-  podSelector: {matchExpressions: [{key: inbound-pool, operator: Exists}]}
+  podSelector:
+    matchExpressions:
+      - {key: inbound-pool, operator: Exists}
+      - {key: inbound-pool, operator: NotIn, values: [knowledge]}
   policyTypes: [Egress]
   egress:
     - to:
@@ -28,6 +31,24 @@ spec:
       ports: [{protocol: TCP, port: 8092}]
     # Add environment-specific ipBlock entries for LiveKit and model endpoints.
     # Keep this policy fail-closed until those destinations are explicitly approved.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: inbound-knowledge-worker-egress, namespace: qwen-telephony}
+spec:
+  podSelector: {matchLabels: {inbound-pool: knowledge}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to: [{podSelector: {matchLabels: {app: postgres}}}]
+      ports: [{protocol: TCP, port: 5432}]
+    - to: [{podSelector: {matchLabels: {app: minio}}}]
+      ports: [{protocol: TCP, port: 9000}]
+    # If PostgreSQL, S3 or DashScope are outside the namespace, add their
+    # approved static egress CIDRs here before applying this fail-closed policy.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

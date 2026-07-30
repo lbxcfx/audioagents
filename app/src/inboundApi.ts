@@ -66,8 +66,11 @@ export type InboundAgentDetail = InboundAgentSummary & {
     max_duration_seconds: number;
     recording_mode: "off" | "disclosed";
     recording_disclosure: string;
-    tools: Array<Record<string, unknown>>;
+    tools: string[];
     knowledge_sources: string[];
+    content_sources: string[];
+    avatar_enabled: boolean;
+    avatar_id: string;
   };
   bindings: Array<{
     id: string;

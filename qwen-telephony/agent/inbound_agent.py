@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 import logging
 import os
 from time import monotonic
@@ -12,7 +13,7 @@ import uuid
 import httpx
 import jwt
 from livekit import api, rtc
-from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli, function_tool
 from livekit.agents.voice.room_io import RoomOptions, TextInputEvent, TextInputOptions
 from openai import AsyncOpenAI
 
@@ -106,6 +107,44 @@ class InboundControlClient:
                 await asyncio.sleep(0.4 * (2**attempt))
         raise InboundControlError("session completion retries exhausted") from last_error
 
+    async def search_knowledge(
+        self, *, project_id: str, knowledge_base_ids: list[str], query: str, limit: int = 5,
+        document_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        response = await self._client.post(
+            "/inbound-api/internal/knowledge/search",
+            json={"project_id": project_id, "knowledge_base_ids": knowledge_base_ids, "document_ids": document_ids, "query": query, "limit": limit},
+            headers=self._headers("knowledge:read"),
+        )
+        if response.status_code != 200:
+            raise InboundControlError(f"knowledge search failed with status {response.status_code}")
+        payload = response.json()
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise InboundControlError("knowledge search returned an invalid payload")
+        return [item for item in items if isinstance(item, dict)]
+
+    async def tool_catalog(self, *, project_id: str, tool_ids: list[str]) -> list[dict[str, Any]]:
+        response = await self._client.post("/inbound-api/internal/tools/catalog", json={"project_id": project_id, "tool_ids": tool_ids}, headers=self._headers("tool:invoke"))
+        if response.status_code != 200: raise InboundControlError(f"tool catalog failed with status {response.status_code}")
+        items = response.json().get("items", [])
+        return [item for item in items if isinstance(item, dict)]
+
+    async def invoke_tool(self, *, project_id: str, session_id: str, tool_id: str, arguments: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        response = await self._client.post("/inbound-api/internal/tools/invoke", json={"project_id": project_id, "session_id": session_id, "tool_id": tool_id, "arguments": arguments, "idempotency_key": idempotency_key}, headers=self._headers("tool:invoke"))
+        if response.status_code != 200: raise InboundControlError(f"tool invocation failed with status {response.status_code}")
+        return response.json()
+
+    async def confirm_tool(self, *, project_id: str, session_id: str, confirmation_id: str) -> dict[str, Any]:
+        response = await self._client.post("/inbound-api/internal/tools/confirm", json={"project_id": project_id, "session_id": session_id, "confirmation_id": confirmation_id}, headers=self._headers("tool:invoke"))
+        if response.status_code != 200: raise InboundControlError(f"tool confirmation failed with status {response.status_code}")
+        return response.json()
+
+    async def get_content(self, *, project_id: str, asset_id: str) -> dict[str, Any]:
+        response = await self._client.post("/inbound-api/internal/content/get", json={"project_id": project_id, "asset_id": asset_id}, headers=self._headers("runtime:read"))
+        if response.status_code != 200: raise InboundControlError(f"content lookup failed with status {response.status_code}")
+        return response.json()
+
     async def admit_sip(
         self,
         *,
@@ -134,9 +173,27 @@ class InboundControlClient:
         await self._client.aclose()
 
 
+async def start_external_avatar(ctx: JobContext, config: dict[str, Any]) -> None:
+    if not config.get("avatar_enabled"): return
+    endpoint = os.getenv("INBOUND_AVATAR_PROVIDER_URL", "").rstrip("/")
+    provider_secret = os.getenv("INBOUND_AVATAR_PROVIDER_SECRET", "").strip()
+    avatar_id = str(config.get("avatar_id") or "").strip()
+    if not endpoint or not provider_secret or not avatar_id:
+        logger.warning("Avatar requested but provider configuration is incomplete; continuing audio-only")
+        return
+    livekit_token = (api.AccessToken(os.getenv("LIVEKIT_API_KEY", ""), os.getenv("LIVEKIT_API_SECRET", "")).with_identity(f"avatar:{uuid.uuid4().hex}").with_name("AI digital avatar").with_grants(api.VideoGrants(room_join=True, room=ctx.room.name, can_publish=True, can_subscribe=True)).with_ttl(timedelta(hours=2)).to_jwt())
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(f"{endpoint}/sessions", headers={"Authorization": f"Bearer {provider_secret}"}, json={"avatar_id": avatar_id, "room_name": ctx.room.name, "livekit_url": os.getenv("LIVEKIT_URL", ""), "livekit_token": livekit_token, "audio_participant_identity": ctx.room.local_participant.identity})
+            response.raise_for_status()
+        logger.info("External avatar session started for room=%s", ctx.room.name)
+    except Exception:
+        logger.exception("Avatar provider failed; continuing audio-only")
+
+
 class InboundVoiceAgent(Agent):
-    def __init__(self, instructions: str) -> None:
-        super().__init__(instructions=instructions.strip())
+    def __init__(self, instructions: str, *, tools: list[Any] | None = None) -> None:
+        super().__init__(instructions=instructions.strip(), tools=tools or [])
 
     async def on_enter(self) -> None:
         logger.info("Inbound voice agent entered the session")
@@ -217,6 +274,11 @@ async def entrypoint(ctx: JobContext) -> None:
             runtime = await control.resolve(metadata=metadata, room_name=ctx.room.name)
         session_id = str(runtime.get("session_id") or "")
         config = runtime["config"]
+        project_id = str(runtime.get("project_id") or "")
+        knowledge_base_ids = [str(value) for value in config.get("knowledge_sources") or [] if str(value)]
+        knowledge_document_ids = [str(value) for value in config.get("knowledge_document_ids") or [] if str(value)]
+        configured_tool_ids = [str(value) for value in config.get("tools") or [] if str(value)]
+        content_source_ids = [str(value) for value in config.get("content_sources") or [] if str(value)]
         instructions = str(config.get("instructions") or "").strip()
         welcome = str(config.get("welcome_message") or "").strip()
         voice = str(config.get("voice") or "").strip() or None
@@ -240,15 +302,101 @@ async def entrypoint(ctx: JobContext) -> None:
         text_messages: list[dict[str, str]] = [{"role": "system", "content": instructions}]
         text_lock = asyncio.Lock()
 
+        async def handle_vision_stream(reader: Any, _identity: str) -> None:
+            if os.getenv("INBOUND_VISION_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}:
+                await ctx.room.local_participant.send_text(json.dumps({"status": "disabled", "message": "视觉能力未启用，已保持纯语音。"}, ensure_ascii=False), topic="inbound.vision.result")
+                return
+            try:
+                payload = json.loads(await reader.read_all())
+                image, question = str(payload.get("image") or ""), str(payload.get("question") or "请描述画面中的相关事实。")[:1000]
+                if not image.startswith("data:image/jpeg;base64,") or len(image) > 7_000_000: raise ValueError("invalid vision frame")
+                completion = await text_client.chat.completions.create(model=os.getenv("INBOUND_VISION_MODEL", "qwen3.5-omni-flash"), messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}, {"type": "text", "text": question}]}], timeout=float(os.getenv("INBOUND_VISION_TIMEOUT_SECONDS", "12")), max_tokens=500)
+                observation = (completion.choices[0].message.content or "").strip()
+                await ctx.room.local_participant.send_text(json.dumps({"status": "completed", "observation": observation}, ensure_ascii=False), topic="inbound.vision.result")
+                session.generate_reply(instructions=f"视觉工具观察到：{observation}\n请结合当前对话简洁回答；不确定时说明并建议人工确认。")
+            except Exception:
+                logger.exception("Vision frame analysis failed")
+                await ctx.room.local_participant.send_text(json.dumps({"status": "failed", "message": "画面识别失败，已继续纯语音服务。"}, ensure_ascii=False), topic="inbound.vision.result")
+
+        ctx.room.register_text_stream_handler("inbound.vision", lambda reader, identity: asyncio.create_task(handle_vision_stream(reader, identity)))
+
+        async def retrieve(query: str) -> list[dict[str, Any]]:
+            if not knowledge_base_ids:
+                return []
+            return await control.search_knowledge(project_id=project_id, knowledge_base_ids=knowledge_base_ids, document_ids=knowledge_document_ids, query=query)
+
+        realtime_tools: list[Any] = []
+        if knowledge_base_ids:
+            @function_tool(name="search_knowledge")
+            async def search_knowledge(query: str) -> str:
+                """Search bound enterprise knowledge before answering policy or product questions."""
+                items = await retrieve(query)
+                return json.dumps({
+                    "found": bool(items),
+                    "results": [{
+                        "content": item.get("content", ""),
+                        "citation": {key: item.get(key, "") for key in ("chunk_id", "document_id", "filename", "heading")},
+                    } for item in items],
+                }, ensure_ascii=False)
+            realtime_tools.append(search_knowledge)
+        tool_catalog = await control.tool_catalog(project_id=project_id, tool_ids=configured_tool_ids) if configured_tool_ids else []
+        if tool_catalog and session_id:
+            tool_by_name = {str(item["name"]): item for item in tool_catalog}
+            instructions += "\n\n可用业务工具：\n" + "\n".join(f"- {item['name']}: {item['description']}（策略 {item['policy']}）" for item in tool_catalog)
+
+            @function_tool(name="call_business_tool")
+            async def call_business_tool(tool_name: str, arguments_json: str) -> str:
+                """Call one whitelisted business tool. arguments_json must be a JSON object."""
+                tool = tool_by_name.get(tool_name)
+                if tool is None: return json.dumps({"status": "denied", "reason": "tool is not in the Agent whitelist"}, ensure_ascii=False)
+                try: arguments = json.loads(arguments_json)
+                except json.JSONDecodeError: return json.dumps({"status": "invalid_arguments"})
+                if not isinstance(arguments, dict): return json.dumps({"status": "invalid_arguments"})
+                result = await control.invoke_tool(project_id=project_id, session_id=session_id, tool_id=str(tool["id"]), arguments=arguments, idempotency_key=f"{session_id}:{tool['id']}:{hashlib.sha256(arguments_json.encode()).hexdigest()}")
+                if result.get("status") == "confirmation_required":
+                    await ctx.room.local_participant.send_text(json.dumps(result, ensure_ascii=False), topic="inbound.tool.confirmation")
+                return json.dumps(result, ensure_ascii=False)
+            realtime_tools.append(call_business_tool)
+
+            async def handle_tool_confirmation(reader: Any, _identity: str) -> None:
+                try:
+                    payload = json.loads(await reader.read_all())
+                    confirmation_id = str(payload.get("confirmation_id") or "")
+                    if not confirmation_id: raise ValueError("confirmation id is required")
+                    result = await control.confirm_tool(project_id=project_id, session_id=session_id, confirmation_id=confirmation_id)
+                    await ctx.room.local_participant.send_text(json.dumps(result, ensure_ascii=False), topic="inbound.tool.result")
+                    session.generate_reply(instructions="客户已经通过会话界面确认业务操作。请根据工具结果简洁告知执行结果。")
+                except Exception:
+                    logger.exception("Tool confirmation failed")
+                    await ctx.room.local_participant.send_text(json.dumps({"status": "failed", "message": "确认未生效，业务操作没有执行。"}, ensure_ascii=False), topic="inbound.tool.result")
+            ctx.room.register_text_stream_handler("inbound.tool.confirm", lambda reader, identity: asyncio.create_task(handle_tool_confirmation(reader, identity)))
+        if content_source_ids:
+            @function_tool(name="show_content")
+            async def show_content(asset_id: str) -> str:
+                """Show one approved enterprise image, video, PDF, or step card to the customer."""
+                if asset_id not in content_source_ids: return json.dumps({"status": "denied"})
+                asset = await control.get_content(project_id=project_id, asset_id=asset_id)
+                await ctx.room.local_participant.send_text(json.dumps(asset, ensure_ascii=False), topic="inbound.content")
+                return json.dumps({"status": "shown", "asset_id": asset_id}, ensure_ascii=False)
+            realtime_tools.append(show_content)
+
         async def handle_text(_session: AgentSession, event: TextInputEvent) -> None:
             text = event.text.strip()
             if not text or len(text) > 4_000:
                 return
             async with text_lock:
                 text_messages.append({"role": "user", "content": text})
+                citations = await retrieve(text)
+                request_messages = text_messages[-21:]
+                if citations:
+                    context = "\n\n".join(
+                        f"[来源: {item.get('filename', '')} / {item.get('heading', '') or '正文'}]\n{item.get('content', '')}"
+                        for item in citations
+                    )
+                    request_messages = [*request_messages, {"role": "system", "content": "以下是本轮检索到的企业资料。仅在资料支持时作答，并在答案末尾列出来源文件名：\n" + context}]
                 completion = await text_client.chat.completions.create(
                     model=os.getenv("QWEN_TEXT_MODEL", "qwen-plus"),
-                    messages=text_messages[-21:],
+                    messages=request_messages,
                     temperature=0.3,
                     timeout=20,
                 )
@@ -259,10 +407,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 await ctx.room.local_participant.send_text(reply, topic="lk.transcription")
 
         await session.start(
-            agent=InboundVoiceAgent(instructions),
+            agent=InboundVoiceAgent(instructions, tools=realtime_tools),
             room=ctx.room,
             room_options=RoomOptions(text_input=TextInputOptions(text_input_cb=handle_text)),
         )
+        await start_external_avatar(ctx, config)
 
         if welcome:
             session.generate_reply(

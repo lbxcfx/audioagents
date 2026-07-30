@@ -119,6 +119,7 @@ class InboundAgentService:
         if binding["kind"] == "public_demo":
             config["tools"] = []
             config["knowledge_sources"] = []
+            config["content_sources"] = []
         return {
             "project_id": binding["project_id"],
             "agent_id": binding["agent_id"],
@@ -180,6 +181,7 @@ class InboundAgentService:
         if binding["kind"] == "public_demo":
             config["tools"] = []
             config["knowledge_sources"] = []
+            config["content_sources"] = []
         return {
             "project_id": binding["project_id"],
             "agent_id": binding["agent_id"],

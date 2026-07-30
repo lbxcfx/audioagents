@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import base64
+import binascii
 import os
 import json
 from typing import Any, Callable, Literal
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from server.cloud_parity.auth import require_user_id
 from server.cloud_parity.database import is_integrity_error
-from server.cloud_parity.builder import ToolConfig
 from server.cloud_parity.store import AccessDeniedError, ResourceNotFoundError
 
 from .service import InboundAgentService
 from .store import INBOUND_SCHEMA_VERSION, InboundAgentStore, PublicDemoQuotaError
+from .knowledge import KnowledgeStore
+from .tool_gateway import ToolGateway
+from .content import ContentStore
 from .worker_auth import WorkerAuthenticationError, verify_worker_identity_token, verify_worker_token
 
 
@@ -33,8 +37,11 @@ class AgentConfig(BaseModel):
     max_duration_seconds: int = Field(default=600, ge=30, le=7_200)
     recording_mode: Literal["off"] = "off"
     recording_disclosure: str = Field(default="", max_length=1_000)
-    tools: list[ToolConfig] = Field(default_factory=list, max_length=0)
+    tools: list[str] = Field(default_factory=list, max_length=50)
     knowledge_sources: list[str] = Field(default_factory=list, max_length=100)
+    content_sources: list[str] = Field(default_factory=list, max_length=100)
+    avatar_enabled: bool = False
+    avatar_id: str = Field(default="", max_length=120)
 
     @field_validator("knowledge_sources")
     @classmethod
@@ -81,6 +88,84 @@ class PublicSessionRequest(BaseModel):
 
 class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=1)
+
+
+class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1_000)
+
+
+class KnowledgeTextDocumentCreate(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: Literal["text/plain", "text/markdown"] = "text/plain"
+    text: str = Field(min_length=1, max_length=5_000_000)
+
+
+class KnowledgeDocumentCreate(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: Literal[
+        "text/plain", "text/markdown", "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ]
+    content_base64: str = Field(min_length=1, max_length=28_000_000)
+
+
+class KnowledgeSearchRequest(BaseModel):
+    knowledge_base_ids: list[str] = Field(min_length=1, max_length=20)
+    document_ids: list[str] | None = Field(default=None, max_length=2_000)
+    query: str = Field(min_length=1, max_length=2_000)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class InternalKnowledgeSearchRequest(KnowledgeSearchRequest):
+    project_id: str = Field(min_length=1, max_length=120)
+
+
+class ToolConnectionCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: Literal["http_api", "mcp_streamable_http"]
+    base_url: str = Field(min_length=8, max_length=2_000)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class ToolCreate(BaseModel):
+    connection_id: str = Field(min_length=1, max_length=120)
+    name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$", max_length=80)
+    description: str = Field(min_length=1, max_length=1_000)
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+    path: str = Field(min_length=1, max_length=1_000)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    policy: Literal["auto", "confirm", "deny"] = "confirm"
+    timeout_seconds: int = Field(default=10, ge=1, le=30)
+
+
+class InternalToolCatalogRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    tool_ids: list[str] = Field(max_length=50)
+
+
+class InternalToolInvokeRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    session_id: str = Field(min_length=1, max_length=120)
+    tool_id: str = Field(min_length=1, max_length=120)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = Field(min_length=8, max_length=200)
+
+class InternalToolConfirmRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    session_id: str = Field(min_length=1, max_length=120)
+    confirmation_id: str = Field(min_length=1, max_length=120)
+
+class ContentAssetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: Literal["image", "video", "pdf", "steps"]
+    source_url: str = Field(min_length=8, max_length=2_000)
+    description: str = Field(default="", max_length=1_000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+class InternalContentRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=120)
+    asset_id: str = Field(min_length=1, max_length=120)
 
 
 class RuntimeRequest(BaseModel):
@@ -141,7 +226,7 @@ def issue_public_livekit_token(
                 # LiveKit text streams (lk.chat) use the data channel. The
                 # public Agent has tools disabled, so this only enables chat.
                 can_publish_data=True,
-                can_publish_sources=["microphone"],
+                can_publish_sources=["microphone", "camera", "screen_share"],
             )
         )
         .with_room_config(
@@ -159,13 +244,20 @@ def issue_public_livekit_token(
     )
     return {"token": token, "url": livekit_url}
 
+def issue_enterprise_livekit_token(room_name: str, identity: str, dispatch_metadata: str, ttl_seconds: int) -> dict[str, str]:
+    api_key, api_secret = os.getenv("LIVEKIT_API_KEY", "").strip(), os.getenv("LIVEKIT_API_SECRET", "").strip()
+    livekit_url = os.getenv("LIVEKIT_URL", "").strip()
+    if not api_key or not api_secret or not livekit_url: raise RuntimeError("LiveKit is not configured")
+    token = (api.AccessToken(api_key, api_secret).with_identity(identity).with_name("Enterprise Agent tester").with_grants(api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True, can_publish_data=True, can_publish_sources=["microphone", "camera", "screen_share"])).with_room_config(api.RoomConfiguration(agents=[api.RoomAgentDispatch(agent_name=os.getenv("INBOUND_ENTERPRISE_AGENT_NAME", "tenant-voice-agent"), metadata=dispatch_metadata)])).with_ttl(timedelta(seconds=ttl_seconds)).to_jwt())
+    return {"token": token, "url": livekit_url}
+
 
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ResourceNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, PublicDemoQuotaError):
         return HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "3600"})
-    if isinstance(exc, AccessDeniedError):
+    if isinstance(exc, (AccessDeniedError, PermissionError)):
         return HTTPException(status_code=403, detail=str(exc))
     if is_integrity_error(exc):
         return HTTPException(status_code=409, detail="resource already exists")
@@ -179,6 +271,9 @@ def create_inbound_router(
     store: InboundAgentStore,
     service: InboundAgentService,
     *,
+    knowledge_store: KnowledgeStore | None = None,
+    tool_gateway: ToolGateway | None = None,
+    content_store: ContentStore | None = None,
     worker_secret: str,
     token_issuer: TokenIssuer = issue_public_livekit_token,
     enabled: bool = True,
@@ -210,6 +305,11 @@ def create_inbound_router(
         health = store.healthcheck()
         if health["schema_version"] != INBOUND_SCHEMA_VERSION:
             raise HTTPException(status_code=503, detail="inbound schema is not ready")
+        if knowledge_store is not None:
+            knowledge_health = knowledge_store.healthcheck()
+            if knowledge_health["schema_version"] != 4:
+                raise HTTPException(status_code=503, detail="knowledge schema is not ready")
+            health["knowledge_schema_version"] = knowledge_health["schema_version"]
         return health
 
     @router.get("/public/demo")
@@ -272,6 +372,137 @@ def create_inbound_router(
             return {"items": store.list_agents(project_id=project_id, actor_id=user_id)}
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/knowledge-bases")
+    def list_knowledge_bases(project_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return {"items": knowledge_store.list_bases(project_id=project_id, actor_id=user_id)}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/knowledge-bases", status_code=201)
+    def create_knowledge_base(project_id: str, payload: KnowledgeBaseCreate, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return knowledge_store.create_base(project_id=project_id, actor_id=user_id, name=payload.name, description=payload.description)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/knowledge-bases/{base_id}/documents/text", status_code=201)
+    def add_knowledge_text(project_id: str, base_id: str, payload: KnowledgeTextDocumentCreate, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return knowledge_store.add_text_document(project_id=project_id, actor_id=user_id, base_id=base_id, filename=payload.filename, media_type=payload.media_type, text=payload.text)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/knowledge-bases/{base_id}/documents")
+    def list_knowledge_documents(project_id: str, base_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return {"items": knowledge_store.list_documents(project_id=project_id, actor_id=user_id, base_id=base_id)}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/knowledge-bases/{base_id}/documents", status_code=202)
+    def add_knowledge_document(project_id: str, base_id: str, payload: KnowledgeDocumentCreate, background_tasks: BackgroundTasks, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            data = base64.b64decode(payload.content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="document content is not valid base64") from exc
+        try:
+            job = knowledge_store.queue_document(project_id=project_id, actor_id=user_id, base_id=base_id, filename=payload.filename, media_type=payload.media_type, data=data)
+            if os.getenv("INBOUND_KNOWLEDGE_INLINE_WORKER", "false").lower() in {"1", "true", "yes", "on"}:
+                background_tasks.add_task(knowledge_store.process_job, job["id"])
+            return job
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/knowledge-jobs/{job_id}")
+    def get_knowledge_job(project_id: str, job_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None: raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try: return knowledge_store.get_job(project_id=project_id, actor_id=user_id, job_id=job_id)
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.delete("/projects/{project_id}/knowledge-bases/{base_id}/documents/{document_id}")
+    def delete_knowledge_document(project_id: str, base_id: str, document_id: str, user_id: str = Depends(require_user_id)) -> dict[str, str]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return knowledge_store.delete_document(project_id=project_id, actor_id=user_id, base_id=base_id, document_id=document_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/knowledge/search")
+    def search_knowledge(project_id: str, payload: KnowledgeSearchRequest, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            store.platform.require_permission(project_id, user_id, "agent.read")
+            return {"items": knowledge_store.search(project_id=project_id, base_ids=payload.knowledge_base_ids, document_ids=payload.document_ids, query=payload.query, limit=payload.limit)}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/tool-connections")
+    def list_tool_connections(project_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return {"items": tool_gateway.list_connections(project_id=project_id, actor_id=user_id)}
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/tool-connections", status_code=201)
+    def create_tool_connection(project_id: str, payload: ToolConnectionCreate, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return tool_gateway.create_connection(project_id=project_id, actor_id=user_id, **payload.model_dump())
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/tool-connections/{connection_id}/discover")
+    async def discover_mcp_tools(project_id: str, connection_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return {"items": await tool_gateway.discover_mcp(project_id=project_id, actor_id=user_id, connection_id=connection_id)}
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/tools")
+    def list_tools(project_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return {"items": tool_gateway.list_tools(project_id=project_id, actor_id=user_id)}
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/tools", status_code=201)
+    def create_tool(project_id: str, payload: ToolCreate, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return tool_gateway.create_tool(project_id=project_id, actor_id=user_id, **payload.model_dump())
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/content-assets")
+    def list_content_assets(project_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if content_store is None: raise HTTPException(status_code=503, detail="content service is disabled")
+        try: return {"items": content_store.list(project_id=project_id, actor_id=user_id)}
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/content-assets", status_code=201)
+    def create_content_asset(project_id: str, payload: ContentAssetCreate, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if content_store is None: raise HTTPException(status_code=503, detail="content service is disabled")
+        try: return content_store.create(project_id=project_id, actor_id=user_id, **payload.model_dump())
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.get("/projects/{project_id}/video-service/presets")
+    def get_video_service_presets(project_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if content_store is None: raise HTTPException(status_code=503, detail="content service is disabled")
+        try: return content_store.video_service_presets(project_id=project_id, actor_id=user_id)
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/content-assets/{asset_id}/publish")
+    def publish_content_asset(project_id: str, asset_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        if content_store is None: raise HTTPException(status_code=503, detail="content service is disabled")
+        try: return content_store.publish(project_id=project_id, actor_id=user_id, asset_id=asset_id)
+        except Exception as exc: raise _http_error(exc) from exc
 
     @router.post("/projects/{project_id}/agents", status_code=201)
     def create_agent(
@@ -342,6 +573,20 @@ def create_inbound_router(
             )
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @router.post("/projects/{project_id}/agents/{agent_id}/test-sessions", status_code=201)
+    def create_agent_test_session(project_id: str, agent_id: str, user_id: str = Depends(require_user_id)) -> dict[str, Any]:
+        try:
+            store.platform.require_permission(project_id, user_id, "agent.read")
+            bindings = store.list_bindings(project_id=project_id, actor_id=user_id, agent_id=agent_id)
+            binding = next((item for item in bindings if item["entry_type"] == "web" and item["status"] == "active"), None)
+            if binding is None: raise ValueError("publish the Agent and create an active web binding before testing")
+            room_name, identity = f"agent-test-{uuid.uuid4().hex}", f"tester:{uuid.uuid4().hex}"
+            session = store.create_enterprise_session(binding=binding, room_name=room_name, provider_call_id=f"test:{identity}", caller_hash="", caller_last4="", max_concurrent_sessions=20)
+            metadata = service.signer.sign({"kind": "enterprise", "binding_id": binding["id"], "project_id": project_id, "agent_version_id": binding["agent_version_id"], "session_id": session["id"], "room_name": room_name})
+            credentials = issue_enterprise_livekit_token(room_name, identity, metadata, 900)
+            return {**credentials, "session_id": session["id"], "room_name": room_name, "identity": identity, "max_duration_seconds": 840}
+        except Exception as exc: raise _http_error(exc) from exc
 
     @router.get("/projects/{project_id}/agents/{agent_id}/versions")
     def list_versions(
@@ -476,6 +721,55 @@ def create_inbound_router(
             )
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @router.post("/internal/knowledge/search")
+    def internal_search_knowledge(
+        payload: InternalKnowledgeSearchRequest,
+        authorization: str = Header(default="", alias="Authorization"),
+    ) -> dict[str, Any]:
+        require_worker(authorization, "knowledge:read")
+        if knowledge_store is None:
+            raise HTTPException(status_code=503, detail="knowledge service is disabled")
+        try:
+            return {"items": knowledge_store.search(project_id=payload.project_id, base_ids=payload.knowledge_base_ids, document_ids=payload.document_ids, query=payload.query, limit=payload.limit)}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/internal/tools/catalog")
+    def internal_tool_catalog(payload: InternalToolCatalogRequest, authorization: str = Header(default="", alias="Authorization")) -> dict[str, Any]:
+        require_worker(authorization, "tool:invoke")
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try:
+            tool_gateway.assert_tools(project_id=payload.project_id, tool_ids=payload.tool_ids)
+            return {"items": [tool_gateway.get_tool(project_id=payload.project_id, tool_id=tool_id) for tool_id in payload.tool_ids]}
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/internal/content/get")
+    def internal_content_get(payload: InternalContentRequest, authorization: str = Header(default="", alias="Authorization")) -> dict[str, Any]:
+        require_worker(authorization, "runtime:read")
+        if content_store is None: raise HTTPException(status_code=503, detail="content service is disabled")
+        try: return content_store.get(project_id=payload.project_id, asset_id=payload.asset_id, published_only=True)
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/internal/tools/invoke")
+    async def internal_tool_invoke(payload: InternalToolInvokeRequest, authorization: str = Header(default="", alias="Authorization")) -> dict[str, Any]:
+        require_worker(authorization, "tool:invoke")
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try:
+            # The published Agent version is the authoritative whitelist, not the caller payload.
+            with store.platform.connect() as conn:
+                row = conn.execute("SELECT v.config_json FROM inbound_agent_sessions s JOIN inbound_agent_versions v ON v.id = s.agent_version_id AND v.project_id = s.project_id WHERE s.id = ? AND s.project_id = ?", (payload.session_id, payload.project_id)).fetchone()
+            if row is None or payload.tool_id not in json.loads(row["config_json"]).get("tools", []):
+                raise AccessDeniedError("tool is not allowed by the session Agent version")
+            return await tool_gateway.invoke(**payload.model_dump(), confirmed=False)
+        except Exception as exc: raise _http_error(exc) from exc
+
+    @router.post("/internal/tools/confirm")
+    async def internal_tool_confirm(payload: InternalToolConfirmRequest, authorization: str = Header(default="", alias="Authorization")) -> dict[str, Any]:
+        require_worker(authorization, "tool:invoke")
+        if tool_gateway is None: raise HTTPException(status_code=503, detail="tool gateway is disabled")
+        try: return await tool_gateway.confirm(**payload.model_dump())
+        except Exception as exc: raise _http_error(exc) from exc
 
     @router.post("/internal/sessions/complete")
     def complete_session(

@@ -107,13 +107,16 @@ services:
       MINIO_ROOT_USER: ${DEV_MINIO_ROOT_USER:-audioagents}
       MINIO_ROOT_PASSWORD: ${DEV_MINIO_ROOT_PASSWORD:-audioagents-dev-password}
       MINIO_RECORDING_BUCKET: ${QWEN_RECORDING_S3_BUCKET:-audioagents-recordings}
+      MINIO_KNOWLEDGE_BUCKET: ${INBOUND_KNOWLEDGE_S3_BUCKET:-audioagents-knowledge}
     entrypoint:
       - /bin/sh
       - -ec
       - |
         mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
         mc mb --ignore-existing "local/$${MINIO_RECORDING_BUCKET}"
+        mc mb --ignore-existing "local/$${MINIO_KNOWLEDGE_BUCKET}"
         mc anonymous set none "local/$${MINIO_RECORDING_BUCKET}"
+        mc anonymous set none "local/$${MINIO_KNOWLEDGE_BUCKET}"
     restart: "no"
 
   livekit-egress:
@@ -164,7 +167,16 @@ services:
       INBOUND_PUBLIC_MAX_CONCURRENT: ${INBOUND_PUBLIC_MAX_CONCURRENT:-20}
       INBOUND_ENTERPRISE_MAX_CONCURRENT: ${INBOUND_ENTERPRISE_MAX_CONCURRENT:-100}
       INBOUND_METADATA_SECRET: ${INBOUND_METADATA_SECRET:-development-inbound-metadata-secret-change-me}
-      INBOUND_WORKER_IDENTITIES_JSON: '${INBOUND_WORKER_IDENTITIES_JSON:-{"public-worker":{"secret":"development-public-worker-secret-change-me","scopes":["runtime:read","session:complete"]},"enterprise-worker":{"secret":"development-enterprise-worker-secret-change-me","scopes":["runtime:read","sip:admit","session:complete"]}}}'
+      INBOUND_TOOL_ENCRYPTION_KEY: ${INBOUND_TOOL_ENCRYPTION_KEY:-development-inbound-tool-encryption-key-change-me}
+      INBOUND_EMBEDDING_ENABLED: ${INBOUND_EMBEDDING_ENABLED:-false}
+      INBOUND_EMBEDDING_MODEL: ${INBOUND_EMBEDDING_MODEL:-text-embedding-v4}
+      INBOUND_KNOWLEDGE_OBJECT_STORE_ENABLED: ${INBOUND_KNOWLEDGE_OBJECT_STORE_ENABLED:-false}
+      INBOUND_KNOWLEDGE_S3_ENDPOINT: http://minio:9000
+      INBOUND_KNOWLEDGE_S3_BUCKET: ${INBOUND_KNOWLEDGE_S3_BUCKET:-audioagents-knowledge}
+      INBOUND_KNOWLEDGE_S3_ACCESS_KEY: ${DEV_MINIO_ROOT_USER:-audioagents}
+      INBOUND_KNOWLEDGE_S3_SECRET: ${DEV_MINIO_ROOT_PASSWORD:-audioagents-dev-password}
+      INBOUND_KNOWLEDGE_INLINE_WORKER: ${INBOUND_KNOWLEDGE_INLINE_WORKER:-true}
+      INBOUND_WORKER_IDENTITIES_JSON: '${INBOUND_WORKER_IDENTITIES_JSON:-{"public-worker":{"secret":"development-public-worker-secret-change-me","scopes":["runtime:read","session:complete"]},"enterprise-worker":{"secret":"development-enterprise-worker-secret-change-me","scopes":["runtime:read","sip:admit","session:complete","knowledge:read","tool:invoke"]}}}'
       LIVEKIT_URL: ws://livekit:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
@@ -196,6 +208,11 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      INBOUND_VISION_ENABLED: ${INBOUND_VISION_ENABLED:-false}
+      INBOUND_VISION_MODEL: ${INBOUND_VISION_MODEL:-qwen3.5-omni-flash}
+      INBOUND_VISION_TIMEOUT_SECONDS: ${INBOUND_VISION_TIMEOUT_SECONDS:-12}
+      INBOUND_AVATAR_PROVIDER_URL: ${INBOUND_AVATAR_PROVIDER_URL:-}
+      INBOUND_AVATAR_PROVIDER_SECRET: ${INBOUND_AVATAR_PROVIDER_SECRET:-}
     depends_on:
       inbound-control: {condition: service_healthy}
     restart: unless-stopped
@@ -215,6 +232,9 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      INBOUND_VISION_ENABLED: ${INBOUND_VISION_ENABLED:-false}
+      INBOUND_VISION_MODEL: ${INBOUND_VISION_MODEL:-qwen3.5-omni-flash}
+      INBOUND_VISION_TIMEOUT_SECONDS: ${INBOUND_VISION_TIMEOUT_SECONDS:-12}
     depends_on:
       inbound-control: {condition: service_healthy}
     restart: unless-stopped

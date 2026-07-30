@@ -12,6 +12,9 @@ from server.cloud_parity.store import PlatformStore
 
 from .api import create_inbound_router
 from .metadata import InboundMetadataSigner
+from .knowledge import KnowledgeStore
+from .tool_gateway import ToolGateway
+from .content import ContentStore
 from .service import InboundAgentService
 from .store import InboundAgentStore
 
@@ -23,9 +26,10 @@ def create_app() -> FastAPI:
     settings = PlatformSettings.from_env(ROOT)
     metadata_secret = os.getenv("INBOUND_METADATA_SECRET", "").strip()
     worker_secret = os.getenv("INBOUND_WORKER_SECRET", "").strip()
+    tool_encryption_key = os.getenv("INBOUND_TOOL_ENCRYPTION_KEY", "").strip()
     if settings.environment in {"staging", "production"}:
-        if len(metadata_secret) < 32 or not os.getenv("INBOUND_WORKER_IDENTITIES_JSON", "").strip():
-            raise ValueError("inbound metadata and worker secrets must contain at least 32 characters")
+        if len(metadata_secret) < 32 or len(tool_encryption_key) < 32 or not os.getenv("INBOUND_WORKER_IDENTITIES_JSON", "").strip():
+            raise ValueError("inbound metadata, tool encryption, and worker identity secrets are required")
     metadata_secret = metadata_secret or "development-inbound-metadata-secret-change-me"
     worker_secret = worker_secret or "development-inbound-worker-secret-change-me"
 
@@ -39,9 +43,27 @@ def create_app() -> FastAPI:
         connect_timeout_seconds=settings.database_connect_timeout_seconds,
     )
     platform.initialize()
+    knowledge = KnowledgeStore(platform)
+    knowledge.migrate()
+    tool_gateway = ToolGateway(
+        platform,
+        tool_encryption_key or "development-inbound-tool-encryption-key-change-me",
+    )
+    tool_gateway.migrate()
+    content = ContentStore(platform); content.migrate()
     inbound = InboundAgentStore(
         platform,
         public_project_id=os.getenv("INBOUND_PUBLIC_PROJECT_ID", ""),
+        knowledge_validator=lambda project_id, base_ids: knowledge.assert_bases(
+            project_id=project_id, base_ids=base_ids
+        ),
+        knowledge_snapshotter=lambda project_id, base_ids: knowledge.snapshot_document_ids(
+            project_id=project_id, base_ids=base_ids
+        ),
+        tool_validator=lambda project_id, tool_ids: tool_gateway.assert_tools(
+            project_id=project_id, tool_ids=tool_ids
+        ),
+        content_validator=lambda project_id, asset_ids: content.assert_assets(project_id=project_id, asset_ids=asset_ids),
     )
     inbound.migrate()
     service = InboundAgentService(
@@ -89,6 +111,9 @@ def create_app() -> FastAPI:
         create_inbound_router(
             inbound,
             service,
+            knowledge_store=knowledge,
+            tool_gateway=tool_gateway,
+            content_store=content,
             worker_secret=worker_secret,
             enabled=inbound_enabled,
         )

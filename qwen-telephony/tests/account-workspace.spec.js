@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("user registers, logs in and sees the two product domains", async ({ page }) => {
+test("user registers, logs in and sees the voice service products", async ({ page }) => {
   await page.route("**/api/accounts/register", async (route) => {
     const body = route.request().postDataJSON();
     expect(body.email).toBe("lin@example.com");
@@ -26,13 +26,15 @@ test("user registers, logs in and sees the two product domains", async ({ page }
   await page.getByRole("button", { name: "注册账号" }).click();
   await expect(page.getByText("注册成功，请使用邮箱和密码登录。")).toBeVisible();
 
-  await page.getByLabel("邮箱或手机号").fill("lin@example.com");
+  await expect(page.getByLabel("邮箱或手机号")).toHaveValue("lin@example.com");
+  await expect(page.getByLabel("邮箱或手机号")).not.toHaveValue("林女士");
   await page.getByLabel("密码", { exact: true }).fill("safe-password-123");
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page).toHaveURL(/\/app\/home$/);
   await expect(page.getByRole("heading", { name: "今天想从哪里开始？" })).toBeVisible();
   await expect(page.getByRole("heading", { name: /让 Agent 理解业务/ })).toBeVisible();
   await expect(page.getByRole("heading", { name: /把批量联系/ })).toBeVisible();
+  await expect(page.getByText("视频客服", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: /进入智能客服/ })).toHaveAttribute("href", "/app/inbound/agents");
   await expect(page.getByRole("link", { name: /进入智能外呼/ })).toHaveAttribute("href", "/app/dashboard");
 });
@@ -41,9 +43,12 @@ test("terms and privacy documents can be opened independently", async ({ page })
   await page.goto("/terms");
   await expect(page.getByRole("heading", { name: "服务条款", level: 1 })).toBeVisible();
   await expect(page.getByRole("link", { name: "返回登录" })).toHaveAttribute("href", "/login");
+  await expect(page.getByRole("heading", { name: /通信、录音与外呼合规/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /人工智能服务特别说明/ })).toBeVisible();
   await page.goto("/privacy");
   await expect(page.getByRole("heading", { name: "隐私政策", level: 1 })).toBeVisible();
-  await expect(page.getByText("数据保护", { exact: false })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /AI模型与自动化处理/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /保存、删除与账户注销/ })).toBeVisible();
 });
 
 test("registration and product choice remain usable on mobile", async ({ page }) => {
@@ -56,4 +61,5 @@ test("registration and product choice remain usable on mobile", async ({ page })
   await page.goto("/app/home");
   await expect(page.getByRole("heading", { name: "今天想从哪里开始？" })).toBeVisible();
   await expect(page.getByRole("link", { name: /进入智能客服/ })).toBeVisible();
+  await expect(page.getByText("视频客服", { exact: true })).toHaveCount(0);
 });

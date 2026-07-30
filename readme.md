@@ -174,6 +174,22 @@ SIP: sip:1000@127.0.0.1:5066
 
 运营台用于管理外呼任务、客户名单、通话队列和统计分析。
 
+### 从 Windows 访问远程开发前端
+
+远程服务器上的 Vite 前端监听 `127.0.0.1:5173` 时，在 Windows PowerShell 中执行：
+
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\audioagents" -o ExitOnForwardFailure=yes -N -L 127.0.0.1:15173:127.0.0.1:5173 root@120.55.185.55
+```
+
+保持该 PowerShell 窗口运行，然后在 Windows 浏览器打开：
+
+```text
+http://127.0.0.1:15173/
+```
+
+该隧道只绑定 Windows 本机回环地址，并将本地 `15173` 映射到远程服务器的 `5173`。如果提示本地端口被占用，请先停止占用 `15173` 的本机进程；`ExitOnForwardFailure` 会在转发创建失败时立即退出。
+
 设计方案见：
 
 ```text

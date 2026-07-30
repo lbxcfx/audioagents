@@ -173,7 +173,7 @@ export default function InboundExperience() {
             {!live && state !== "completed" ? <button className="start-call" disabled={!info?.available || state === "requesting"} onClick={startExperience} type="button">{state === "requesting" ? "正在准备…" : "立即体验"}</button> : null}
             {state === "completed" || state === "error" ? <button className="start-call" onClick={startExperience} type="button">再次体验</button> : null}
           </div>
-          {session ? <small>今日还可体验 {session.remaining_calls} 次</small> : <small>{info?.notice || "请勿在体验中提供密码、验证码或敏感个人信息。"}</small>}
+          {session ? <small>今日还可体验 {session.remaining_calls} 次 · 当前公开 Agent 仅提供语音服务</small> : <small>{info?.notice || "请勿在体验中提供密码、验证码或敏感个人信息。"}</small>}
         </section>
       </section>
 
