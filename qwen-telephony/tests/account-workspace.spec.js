@@ -20,7 +20,9 @@ test("user registers, logs in and sees the two product domains", async ({ page }
   await page.getByLabel("邮箱", { exact: true }).fill("lin@example.com");
   await page.getByLabel("设置密码").fill("safe-password-123");
   await page.getByLabel("确认密码").fill("safe-password-123");
-  await page.getByText("我已阅读并同意").click();
+  await expect(page.getByRole("link", { name: "服务条款" })).toHaveAttribute("href", "/terms");
+  await expect(page.getByRole("link", { name: "隐私政策" })).toHaveAttribute("href", "/privacy");
+  await page.getByRole("checkbox", { name: /我已阅读并同意/ }).check();
   await page.getByRole("button", { name: "注册账号" }).click();
   await expect(page.getByText("注册成功，请使用邮箱和密码登录。")).toBeVisible();
 
@@ -33,6 +35,15 @@ test("user registers, logs in and sees the two product domains", async ({ page }
   await expect(page.getByRole("heading", { name: /把批量联系/ })).toBeVisible();
   await expect(page.getByRole("link", { name: /进入智能客服/ })).toHaveAttribute("href", "/app/inbound/agents");
   await expect(page.getByRole("link", { name: /进入智能外呼/ })).toHaveAttribute("href", "/app/dashboard");
+});
+
+test("terms and privacy documents can be opened independently", async ({ page }) => {
+  await page.goto("/terms");
+  await expect(page.getByRole("heading", { name: "服务条款", level: 1 })).toBeVisible();
+  await expect(page.getByRole("link", { name: "返回登录" })).toHaveAttribute("href", "/login");
+  await page.goto("/privacy");
+  await expect(page.getByRole("heading", { name: "隐私政策", level: 1 })).toBeVisible();
+  await expect(page.getByText("数据保护", { exact: false })).toBeVisible();
 });
 
 test("registration and product choice remain usable on mobile", async ({ page }) => {

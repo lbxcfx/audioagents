@@ -149,7 +149,7 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
                 <div className="login-field"><label htmlFor="register-email">邮箱</label><input id="register-email" name="email" type="email" autoComplete="email" inputMode="email" spellCheck={false} placeholder="例如：name@company.com" required /></div>
                 <div className="login-field"><label htmlFor="register-password">设置密码</label><input id="register-password" name="password" type="password" autoComplete="new-password" minLength={8} placeholder="至少 8 位字符" required /></div>
                 <div className="login-field"><label htmlFor="register-confirm">确认密码</label><input id="register-confirm" name="confirm_password" type="password" autoComplete="new-password" minLength={8} placeholder="再次输入密码" required /></div>
-                <label className="register-consent"><input name="terms" type="checkbox" required /><span>我已阅读并同意服务条款和隐私政策</span></label>
+                <div className="register-consent"><input id="register-terms" name="terms" type="checkbox" required /><label htmlFor="register-terms">我已阅读并同意 <a href="/terms" target="_blank" rel="noreferrer">服务条款</a> 和 <a href="/privacy" target="_blank" rel="noreferrer">隐私政策</a></label></div>
                 <button className="account-primary" type="submit">注册账号</button>
               </form>
             ) : (
