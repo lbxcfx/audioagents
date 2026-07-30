@@ -1,0 +1,59 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: inbound-control-ingress, namespace: qwen-telephony}
+spec:
+  podSelector: {matchLabels: {app: inbound-control}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+        - podSelector: {matchExpressions: [{key: inbound-pool, operator: Exists}]}
+        - podSelector: {matchExpressions: [{key: inbound-ops, operator: Exists}]}
+      ports: [{protocol: TCP, port: 8092}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: inbound-workers-egress, namespace: qwen-telephony}
+spec:
+  podSelector: {matchExpressions: [{key: inbound-pool, operator: Exists}]}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to: [{podSelector: {matchLabels: {app: inbound-control}}}]
+      ports: [{protocol: TCP, port: 8092}]
+    # Add environment-specific ipBlock entries for LiveKit and model endpoints.
+    # Keep this policy fail-closed until those destinations are explicitly approved.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: inbound-maintenance-egress, namespace: qwen-telephony}
+spec:
+  podSelector: {matchLabels: {inbound-ops: maintenance}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to: [{podSelector: {matchLabels: {app: inbound-control}}}]
+      ports: [{protocol: TCP, port: 8092}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: inbound-dispatch-sync-egress, namespace: qwen-telephony}
+spec:
+  podSelector: {matchLabels: {inbound-ops: dispatch-sync}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to: [{podSelector: {matchLabels: {app: inbound-control}}}]
+      ports: [{protocol: TCP, port: 8092}]
+    # Add the approved LiveKit endpoint ipBlock before enabling this CronJob.

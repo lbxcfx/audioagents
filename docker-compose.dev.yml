@@ -149,6 +149,76 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  inbound-control:
+    profiles: ["inbound"]
+    build:
+      context: ./qwen-telephony
+      dockerfile: Dockerfile.inbound-control
+    environment:
+      CLOUD_PARITY_ENV: development
+      CLOUD_PARITY_AUTH_MODE: development
+      CLOUD_PARITY_DATABASE_URL: postgresql://${DEV_POSTGRES_USER:-cloud_parity}:${DEV_POSTGRES_PASSWORD:-cloud-parity-dev-only}@postgres:5432/${DEV_POSTGRES_DB:-cloud_parity}
+      CLOUD_PARITY_PHONE_HASH_KEY: ${CLOUD_PARITY_PHONE_HASH_KEY:-development-inbound-phone-hash-key}
+      INBOUND_AGENT_SYSTEM_ENABLED: ${INBOUND_AGENT_SYSTEM_ENABLED:-false}
+      INBOUND_PUBLIC_PROJECT_ID: ${INBOUND_PUBLIC_PROJECT_ID:-}
+      INBOUND_PUBLIC_MAX_CONCURRENT: ${INBOUND_PUBLIC_MAX_CONCURRENT:-20}
+      INBOUND_ENTERPRISE_MAX_CONCURRENT: ${INBOUND_ENTERPRISE_MAX_CONCURRENT:-100}
+      INBOUND_METADATA_SECRET: ${INBOUND_METADATA_SECRET:-development-inbound-metadata-secret-change-me}
+      INBOUND_WORKER_IDENTITIES_JSON: '${INBOUND_WORKER_IDENTITIES_JSON:-{"public-worker":{"secret":"development-public-worker-secret-change-me","scopes":["runtime:read","session:complete"]},"enterprise-worker":{"secret":"development-enterprise-worker-secret-change-me","scopes":["runtime:read","sip:admit","session:complete"]}}}'
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      FORWARDED_ALLOW_IPS: 127.0.0.1
+    ports:
+      - "127.0.0.1:${DEV_INBOUND_CONTROL_PORT:-8092}:8092"
+    depends_on:
+      postgres: {condition: service_healthy}
+      livekit: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/inbound-api/health/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  inbound-public-agent:
+    profiles: ["inbound"]
+    build:
+      context: ./qwen-telephony
+      dockerfile: Dockerfile.inbound-agent
+    environment:
+      INBOUND_AGENT_SYSTEM_ENABLED: ${INBOUND_AGENT_SYSTEM_ENABLED:-false}
+      INBOUND_AGENT_NAME: public-demo-agent
+      INBOUND_WORKER_ID: public-worker
+      INBOUND_CONTROL_URL: http://inbound-control:8092
+      INBOUND_WORKER_SECRET: ${INBOUND_PUBLIC_WORKER_SECRET:-development-public-worker-secret-change-me}
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    depends_on:
+      inbound-control: {condition: service_healthy}
+    restart: unless-stopped
+
+  inbound-enterprise-agent:
+    profiles: ["inbound"]
+    build:
+      context: ./qwen-telephony
+      dockerfile: Dockerfile.inbound-agent
+    environment:
+      INBOUND_AGENT_SYSTEM_ENABLED: ${INBOUND_AGENT_SYSTEM_ENABLED:-false}
+      INBOUND_AGENT_NAME: tenant-voice-agent
+      INBOUND_WORKER_ID: enterprise-worker
+      INBOUND_CONTROL_URL: http://inbound-control:8092
+      INBOUND_WORKER_SECRET: ${INBOUND_ENTERPRISE_WORKER_SECRET:-development-enterprise-worker-secret-change-me}
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    depends_on:
+      inbound-control: {condition: service_healthy}
+    restart: unless-stopped
+
 volumes:
   dev-postgres-data:
   dev-redis-data:

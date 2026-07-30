@@ -1,0 +1,90 @@
+name: inbound-quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.9-alpine
+        env:
+          POSTGRES_DB: inbound_test
+          POSTGRES_USER: inbound
+          POSTGRES_PASSWORD: inbound-test-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U inbound -d inbound_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      CLOUD_PARITY_TEST_POSTGRES_URL: postgresql://inbound:inbound-test-password@127.0.0.1:5432/inbound_test
+    defaults: {run: {working-directory: qwen-telephony}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: qwen-telephony/requirements.lock}
+      - run: pip install -r requirements.lock && pip check
+      - run: pytest -q tests/inbound_control tests/cloud_parity tests/test_qwen_audio_realtime.py
+      - run: python -m py_compile agent/inbound_agent.py server/inbound_control/*.py
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "22", cache: npm, cache-dependency-path: app/package-lock.json}
+      - run: npm ci
+        working-directory: app
+      - run: npm run build
+        working-directory: app
+      - run: npm ci
+        working-directory: qwen-telephony
+      - run: npx playwright install --with-deps chromium
+        working-directory: qwen-telephony
+      - run: npm run preview -- --host 127.0.0.1 --port 5173 > /tmp/inbound-vite.log 2>&1 &
+        working-directory: app
+      - run: curl --fail --retry 20 --retry-delay 1 --retry-connrefused http://127.0.0.1:5173 >/dev/null && OPS_UI_URL=http://127.0.0.1:5173 npx playwright test tests/inbound-app.spec.js
+        working-directory: qwen-telephony
+
+  secret-scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: gitleaks/gitleaks-action@v2
+        env: {GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+
+  manifests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - run: kubectl create --dry-run=client -f qwen-telephony/deploy/kubernetes/inbound-stack.yaml -o yaml >/dev/null
+      - run: kubectl create --dry-run=client -f qwen-telephony/deploy/kubernetes/inbound-network-policy.yaml -o yaml >/dev/null
+
+  images:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f qwen-telephony/Dockerfile.inbound-control -t inbound-control:test qwen-telephony
+      - run: docker build -f qwen-telephony/Dockerfile.inbound-agent -t inbound-agent:test qwen-telephony
+      - name: Disabled worker health smoke
+        run: |
+          docker run -d --rm --name inbound-agent-smoke -p 18082:18082 -e INBOUND_AGENT_SYSTEM_ENABLED=false inbound-agent:test
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18082/worker && exit 0; sleep 1; done
+          docker logs inbound-agent-smoke
+          exit 1
+      - uses: aquasecurity/trivy-action@0.30.0
+        with: {image-ref: inbound-control:test, severity: CRITICAL, ignore-unfixed: true, exit-code: "1", format: table}
+      - uses: aquasecurity/trivy-action@0.30.0
+        with: {image-ref: inbound-agent:test, severity: CRITICAL, ignore-unfixed: true, exit-code: "1", format: table}
+      - uses: anchore/sbom-action@v0
+        with: {image: inbound-control:test, artifact-name: inbound-control.spdx.json}
+      - uses: anchore/sbom-action@v0
+        with: {image: inbound-agent:test, artifact-name: inbound-agent.spdx.json}

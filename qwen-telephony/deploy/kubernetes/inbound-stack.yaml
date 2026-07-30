@@ -1,0 +1,252 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inbound-agent-config
+  namespace: qwen-telephony
+data:
+  INBOUND_AGENT_SYSTEM_ENABLED: "false"
+  INBOUND_CONTROL_URL: http://inbound-control:8092
+  INBOUND_PUBLIC_AGENT_NAME: public-demo-agent
+  INBOUND_PUBLIC_CALLS_PER_DAY: "3"
+  INBOUND_PUBLIC_SECONDS_PER_DAY: "600"
+  INBOUND_PUBLIC_SESSION_SECONDS: "180"
+  INBOUND_PUBLIC_MAX_CONCURRENT: "20"
+  INBOUND_ENTERPRISE_MAX_CONCURRENT: "100"
+  INBOUND_AGENT_PORT: "18082"
+  INBOUND_AGENT_LOAD_THRESHOLD: "0.80"
+  INBOUND_PUBLIC_PROJECT_ID: replace-with-platform-public-project-uuid
+  CLOUD_PARITY_ENV: production
+  CLOUD_PARITY_AUTH_MODE: oidc
+  CLOUD_PARITY_OIDC_ISSUER: https://idp.example.com/
+  CLOUD_PARITY_OIDC_AUDIENCE: qwen-telephony
+  CLOUD_PARITY_OIDC_JWKS_URL: https://idp.example.com/.well-known/jwks.json
+  LIVEKIT_URL: wss://livekit.example.com
+  FORWARDED_ALLOW_IPS: replace-with-ingress-pod-cidr
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inbound-control
+  namespace: qwen-telephony
+spec:
+  selector: {app: inbound-control}
+  ports:
+    - {name: http, port: 8092, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inbound-control
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector: {matchLabels: {app: inbound-control}}
+  template:
+    metadata: {labels: {app: inbound-control}}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: {matchLabels: {app: inbound-control}}
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: api
+          image: registry.example.com/qwen-telephony/inbound-control@sha256:REPLACE_WITH_DIGEST
+          ports: [{name: http, containerPort: 8092}]
+          envFrom:
+            - configMapRef: {name: inbound-agent-config}
+            - secretRef: {name: inbound-control-secrets}
+          readinessProbe: {httpGet: {path: /inbound-api/health/ready, port: http}, periodSeconds: 10, timeoutSeconds: 3}
+          livenessProbe: {httpGet: {path: /inbound-api/health/live, port: http}, periodSeconds: 20, timeoutSeconds: 3}
+          startupProbe: {httpGet: {path: /inbound-api/health/live, port: http}, periodSeconds: 5, failureThreshold: 30}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inbound-enterprise-agent
+  namespace: qwen-telephony
+spec:
+  replicas: 3
+  minReadySeconds: 10
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+  selector: {matchLabels: {app: inbound-enterprise-agent}}
+  template:
+    metadata: {labels: {app: inbound-enterprise-agent, inbound-pool: enterprise}}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 180
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: agent
+          image: registry.example.com/qwen-telephony/inbound-agent@sha256:REPLACE_WITH_DIGEST
+          ports: [{name: health, containerPort: 18082}]
+          envFrom:
+            - configMapRef: {name: inbound-agent-config}
+            - secretRef: {name: inbound-enterprise-worker-secrets}
+          env:
+            - {name: INBOUND_AGENT_NAME, value: tenant-voice-agent}
+            - {name: INBOUND_WORKER_ID, value: enterprise-worker}
+          readinessProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 30}
+          startupProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 10, failureThreshold: 60}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "4", memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inbound-public-agent
+  namespace: qwen-telephony
+spec:
+  replicas: 2
+  minReadySeconds: 10
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+  selector: {matchLabels: {app: inbound-public-agent}}
+  template:
+    metadata: {labels: {app: inbound-public-agent, inbound-pool: public}}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: agent
+          image: registry.example.com/qwen-telephony/inbound-agent@sha256:REPLACE_WITH_DIGEST
+          ports: [{name: health, containerPort: 18082}]
+          envFrom:
+            - configMapRef: {name: inbound-agent-config}
+            - secretRef: {name: inbound-public-worker-secrets}
+          env:
+            - {name: INBOUND_AGENT_NAME, value: public-demo-agent}
+            - {name: INBOUND_WORKER_ID, value: public-worker}
+          readinessProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 30}
+          startupProbe: {httpGet: {path: /worker, port: health}, periodSeconds: 10, failureThreshold: 60}
+          resources:
+            requests: {cpu: 500m, memory: 768Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: inbound-control, namespace: qwen-telephony}
+spec: {minAvailable: 2, selector: {matchLabels: {app: inbound-control}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: inbound-enterprise-agent, namespace: qwen-telephony}
+spec: {minAvailable: 2, selector: {matchLabels: {app: inbound-enterprise-agent}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: inbound-public-agent, namespace: qwen-telephony}
+spec: {minAvailable: 1, selector: {matchLabels: {app: inbound-public-agent}}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: inbound-session-reaper, namespace: qwen-telephony}
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      template:
+        metadata: {labels: {inbound-ops: maintenance}}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: reaper
+              image: registry.example.com/qwen-telephony/inbound-control@sha256:REPLACE_WITH_DIGEST
+              command: ["python", "/app/scripts/reap-inbound-sessions.py"]
+              envFrom:
+                - configMapRef: {name: inbound-agent-config}
+                - secretRef: {name: inbound-maintenance-secrets}
+              securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: ["ALL"]}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: inbound-dispatch-sync, namespace: qwen-telephony}
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 180
+      template:
+        metadata: {labels: {inbound-ops: dispatch-sync}}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: sync
+              image: registry.example.com/qwen-telephony/inbound-control@sha256:REPLACE_WITH_DIGEST
+              command: ["python", "/app/scripts/sync-inbound-dispatch.py"]
+              envFrom:
+                - configMapRef: {name: inbound-agent-config}
+                - secretRef: {name: inbound-dispatch-sync-secrets}
+              securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: ["ALL"]}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: inbound-control, namespace: qwen-telephony}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inbound-control}
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: inbound-enterprise-agent, namespace: qwen-telephony}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inbound-enterprise-agent}
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: inbound-public-agent, namespace: qwen-telephony}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: inbound-public-agent}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}

@@ -1,7 +1,10 @@
-import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, PointerEvent, Suspense, lazy, useEffect, useMemo, useState } from "react";
 import CommercialPlatform from "./CommercialPlatformV2";
 import PublicExperience from "./PublicExperience";
 import { loadPlatformAuth, platformAuthHeaders, platformAuthSubject, savePlatformAuth, type PlatformAuthSession } from "./platformAuth";
+
+const InboundExperience = lazy(() => import("./InboundExperience"));
+const InboundConsole = lazy(() => import("./InboundConsole"));
 
 type ViewKey = "platform" | "dashboard" | "campaignCreate" | "campaigns" | "scripts" | "calls" | "contacts" | "sms" | "manager" | "models" | "system" | "subpage";
 
@@ -408,7 +411,7 @@ const routeText: Record<string, string> = {
   unknown: "未识别",
 };
 
-function App() {
+function LegacyApp() {
   const allowLegacyReplica = import.meta.env.DEV || import.meta.env.VITE_ENABLE_LEGACY_REPLICA === "true";
   const allowApiOverride = import.meta.env.DEV || import.meta.env.VITE_ALLOW_API_OVERRIDE === "true";
   const productionLabels = new Set(["商用语音平台"]);
@@ -4525,6 +4528,13 @@ function labelFromSource(source: string) {
     "/user/manager/account_management": "账户管理",
   };
   return map[source] || source.split("/").filter(Boolean).slice(-1)[0].replace(/_/g, " ");
+}
+
+function App() {
+  const path = window.location.pathname;
+  if (path.startsWith("/experience/voice")) return <Suspense fallback={<div className="route-loading">正在准备语音体验…</div>}><InboundExperience /></Suspense>;
+  if (path.startsWith("/app/inbound")) return <Suspense fallback={<div className="route-loading">正在打开智能呼入…</div>}><InboundConsole /></Suspense>;
+  return <LegacyApp />;
 }
 
 export default App;
