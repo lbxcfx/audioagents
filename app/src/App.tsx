@@ -1,5 +1,6 @@
 import { ChangeEvent, DragEvent, FormEvent, PointerEvent, useEffect, useMemo, useState } from "react";
 import CommercialPlatform from "./CommercialPlatformV2";
+import PublicExperience from "./PublicExperience";
 import { loadPlatformAuth, platformAuthHeaders, platformAuthSubject, savePlatformAuth, type PlatformAuthSession } from "./platformAuth";
 
 type ViewKey = "platform" | "dashboard" | "campaignCreate" | "campaigns" | "scripts" | "calls" | "contacts" | "sms" | "manager" | "models" | "system" | "subpage";
@@ -864,6 +865,11 @@ function App() {
     setPlatformAuth(null);
     setView("platform");
     setActiveMenu("商用语音平台");
+    history.replaceState({}, "", "/");
+  }
+
+  if (!platformAuth) {
+    return <PublicExperience onLogin={setPlatformAuth} />;
   }
 
   return (

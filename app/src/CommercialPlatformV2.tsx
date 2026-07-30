@@ -1091,16 +1091,43 @@ export default function CommercialPlatformV2({
     }
   }
 
-  async function openRecording() {
-    if (!callDetail) return;
+  async function openRecording(call: PlatformCall | null = callDetail) {
+    if (!call) return;
     setBusy(true);
     setError("");
     try {
       const access = await request<{ url: string; temporary: boolean; expires_at?: string | null }>(
-        `/api/platform/projects/${projectId}/telephony/calls/${callDetail.id}/recording-access?ttl_seconds=300`,
+        `/api/platform/projects/${projectId}/telephony/calls/${call.id}/recording-access?ttl_seconds=300`,
       );
       setRecordingAccess(access);
       announce(access.temporary ? "已生成 5 分钟录音访问链接" : "录音访问链接已就绪");
+    } catch (value) {
+      setError(errorMessage(value));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function listenToRecording(callId: string) {
+    setSelectedCallId(callId);
+    setBusy(true);
+    setError("");
+    const prefix = `/api/platform/projects/${projectId}/telephony/calls/${callId}`;
+    try {
+      setRecordingAccess(null);
+      const [detail, cdrData, transfersData, access] = await Promise.all([
+        request<PlatformCall>(prefix),
+        optional<JsonObject | null>(`${prefix}/cdr`, null),
+        optional<{ items: JsonObject[] }>(`${prefix}/transfers`, { items: [] }),
+        request<{ url: string; temporary: boolean; expires_at?: string | null }>(
+          `${prefix}/recording-access?ttl_seconds=300`,
+        ),
+      ]);
+      setCallDetail(detail);
+      setCdr(cdrData);
+      setCallTransfers(transfersData.items);
+      setRecordingAccess(access);
+      announce(access.temporary ? "录音已就绪，链接 5 分钟内有效" : "录音已就绪");
     } catch (value) {
       setError(errorMessage(value));
     } finally {
@@ -1651,9 +1678,9 @@ export default function CommercialPlatformV2({
             <div className="commercial-stack">
               <section className="commercial-panel">
                 <div className="commercial-panel-title"><div><span>CALL LEDGER</span><h2>最近呼叫</h2></div><b>{calls.length}</b></div>
-                <div className="commercial-table-wrap"><table><thead><tr><th>方向</th><th>号码</th><th>状态</th><th>Agent / Room</th><th>录音</th><th>时间</th><th>操作</th></tr></thead><tbody>
-                  {calls.map((call) => <tr className={selectedCallId === call.id ? "selected" : ""} key={call.id}><td><span className={`direction ${call.direction}`}>{call.direction === "inbound" ? "呼入" : "外呼"}</span></td><td>{call.direction === "inbound" ? call.source_number : call.destination_number}</td><td><span className={`commercial-status ${call.status}`}>{call.status}</span>{call.failure_code ? <small>{call.failure_code}</small> : null}</td><td>{call.agent_name}<small>{call.room_name || "等待分配房间"}</small></td><td>{call.recording_status || "关闭"}</td><td>{displayTime(call.created_at)}</td><td><button onClick={() => openCall(call.id)} type="button">详情</button></td></tr>)}
-                  {!calls.length ? <tr><td colSpan={7} className="commercial-empty-row">暂无呼叫记录</td></tr> : null}
+                <div className="commercial-table-wrap"><table><thead><tr><th>方向</th><th>号码</th><th>状态</th><th>拨打次数</th><th>Agent / Room</th><th>录音</th><th>时间</th><th>操作</th></tr></thead><tbody>
+                  {calls.map((call) => <tr className={selectedCallId === call.id ? "selected" : ""} key={call.id}><td><span className={`direction ${call.direction}`}>{call.direction === "inbound" ? "呼入" : "外呼"}</span></td><td>{call.direction === "inbound" ? call.source_number : call.destination_number}</td><td><span className={`commercial-status ${call.status}`}>{call.status}</span>{call.failure_code ? <small>{call.failure_code}</small> : null}</td><td>{call.attempt_count ?? 0}<small>最多 {call.max_attempts ?? "—"} 次</small></td><td>{call.agent_name}<small>{call.room_name || "等待分配房间"}</small></td><td>{call.recording_status || "关闭"}</td><td>{displayTime(call.created_at)}</td><td><div className="commercial-row-actions"><button onClick={() => openCall(call.id)} type="button">详情</button>{call.recording_status === "completed" && call.recording_storage_uri ? <button disabled={busy || !canOperate} onClick={() => listenToRecording(call.id)} type="button">听录音</button> : null}</div></td></tr>)}
+                  {!calls.length ? <tr><td colSpan={8} className="commercial-empty-row">暂无呼叫记录</td></tr> : null}
                 </tbody></table></div>
               </section>
               {callDetail ? (
@@ -1669,7 +1696,7 @@ export default function CommercialPlatformV2({
                     <div className="commercial-recording">
                       <strong>录音</strong>
                       {recordingAccess ? <audio controls preload="none" src={recordingAccess.url} /> : <code>{callDetail.recording_storage_uri}</code>}
-                      {recordingAccess ? <a href={recordingAccess.url} rel="noreferrer" target="_blank">打开/下载</a> : <button disabled={callDetail.recording_status !== "completed" || !canOperate} onClick={openRecording} type="button">获取安全访问链接</button>}
+                      {recordingAccess ? <a href={recordingAccess.url} rel="noreferrer" target="_blank">打开/下载</a> : <button disabled={callDetail.recording_status !== "completed" || !canOperate} onClick={() => openRecording()} type="button">获取安全访问链接</button>}
                       <small>{recordingAccess?.temporary ? `临时链接将于 ${displayTime(recordingAccess.expires_at || undefined)} 失效。` : "长期存储凭据不会发送到浏览器。"}</small>
                     </div>
                   ) : <p className="commercial-muted">当前没有可用录音对象。</p>}

@@ -47,9 +47,16 @@ def test_prompt_loader_replaces_call_variables(monkeypatch: pytest.MonkeyPatch) 
     assert "场景编号：7" in prompt
     assert "客户姓名：林晓" in prompt
     assert "建筑设计师" in prompt
-    assert "陌陌公司负责骑手招聘的招聘专员" in prompt
+    assert "脉脉公司负责骑手招聘的招聘顾问" in prompt
+    assert "您好，我是脉脉招聘顾问。有个职位机会分享给您。" in prompt
     assert "rider_opening" in prompt
     assert "骑手配送岗位" in prompt
+    assert "rider_wechat_collect" in prompt
+    assert "少于 11 位" in prompt
+    assert "您接着说，我在听" in prompt
+    assert "一次只问一个问题" in prompt
+    assert "不超过 20 个汉字" in prompt
+    assert "不得每轮固定说“好的”" in prompt
     assert "{{" not in prompt
 
 
@@ -105,6 +112,7 @@ def test_realtime_model_uses_dashscope_beta_compatibility() -> None:
         assert model._opts.turn_detection.threshold == 0.65
         assert model._opts.turn_detection.prefix_padding_ms == 200
         assert model._opts.turn_detection.silence_duration_ms == 650
+        assert model.capabilities.auto_tool_reply_generation is True
     finally:
         # No session was opened, so there is no async resource to close.
         pass

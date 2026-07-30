@@ -127,6 +127,22 @@ test("call detail obtains protected recording access and queues managed transfer
   expect(queuedCommand.payload.arguments.destination_name).toBe("human-support");
 });
 
+test("call ledger shows dial attempts and plays a completed recording directly", async ({ page }) => {
+  await authenticateAndMock(page);
+  await page.route("**/api/platform/projects/project-1/telephony/calls/call-1", (route) => route.fulfill({ json: call }));
+  await page.route("**/api/platform/projects/project-1/telephony/calls/call-1/cdr", (route) => route.fulfill({ json: { provider: "livekit" } }));
+  await page.route("**/api/platform/projects/project-1/telephony/calls/call-1/transfers", (route) => route.fulfill({ json: { items: [] } }));
+  await page.route("**/api/platform/projects/project-1/telephony/calls/call-1/recording-access?ttl_seconds=300", (route) => route.fulfill({ json: { url: "https://media.example.com/call-1.ogg", temporary: true, expires_at: "2026-07-25T10:05:00Z" } }));
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "实时呼叫" }).click();
+  const row = page.locator("tbody tr", { hasText: "+86138****0001" });
+  await expect(row).toContainText("最多 3 次");
+  await row.getByRole("button", { name: "听录音" }).click();
+  await expect(page.getByRole("heading", { name: "通话详情" })).toBeVisible();
+  await expect(page.locator("audio")).toHaveAttribute("src", "https://media.example.com/call-1.ogg");
+});
+
 test("compliance, analytics, agent and integration modules render real API data", async ({ page }) => {
   await authenticateAndMock(page);
   await page.goto("/");
