@@ -49,7 +49,7 @@ jobs:
         working-directory: qwen-telephony
       - run: npm run preview -- --host 127.0.0.1 --port 5173 > /tmp/inbound-vite.log 2>&1 &
         working-directory: app
-      - run: curl --fail --retry 20 --retry-delay 1 --retry-connrefused http://127.0.0.1:5173 >/dev/null && OPS_UI_URL=http://127.0.0.1:5173 npx playwright test tests/inbound-app.spec.js
+      - run: curl --fail --retry 20 --retry-delay 1 --retry-connrefused http://127.0.0.1:5173 >/dev/null && OPS_UI_URL=http://127.0.0.1:5173 npx playwright test tests/inbound-app.spec.js tests/account-workspace.spec.js
         working-directory: qwen-telephony
 
   secret-scan:

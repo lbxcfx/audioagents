@@ -5,6 +5,7 @@ import { loadPlatformAuth, platformAuthHeaders, platformAuthSubject, savePlatfor
 
 const InboundExperience = lazy(() => import("./InboundExperience"));
 const InboundConsole = lazy(() => import("./InboundConsole"));
+const WorkspaceHome = lazy(() => import("./WorkspaceHome"));
 
 type ViewKey = "platform" | "dashboard" | "campaignCreate" | "campaigns" | "scripts" | "calls" | "contacts" | "sms" | "manager" | "models" | "system" | "subpage";
 
@@ -4533,6 +4534,7 @@ function labelFromSource(source: string) {
 function App() {
   const path = window.location.pathname;
   if (path.startsWith("/experience/voice")) return <Suspense fallback={<div className="route-loading">正在准备语音体验…</div>}><InboundExperience /></Suspense>;
+  if (path.startsWith("/app/home")) return <Suspense fallback={<div className="route-loading">正在打开工作空间…</div>}><WorkspaceHome /></Suspense>;
   if (path.startsWith("/app/inbound")) return <Suspense fallback={<div className="route-loading">正在打开智能呼入…</div>}><InboundConsole /></Suspense>;
   return <LegacyApp />;
 }

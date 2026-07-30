@@ -2,6 +2,26 @@ import { FormEvent, useEffect, useState } from "react";
 import { savePlatformAuth, type PlatformAuthSession } from "./platformAuth";
 
 type Page = "home" | "login";
+type AccountView = "login" | "register" | "forgot";
+
+const DEVELOPMENT_ACCOUNTS_KEY = "voicePlatformDevelopmentAccounts";
+const accountApiBase = String(import.meta.env.VITE_ACCOUNT_API_BASE || window.location.origin).replace(/\/$/, "");
+
+async function accountRequest<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${accountApiBase}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(payload.detail || payload.message || `账户服务请求失败（${response.status}）`));
+  return payload as T;
+}
+
+async function passwordDigest(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function pageFromPath(): Page {
   return window.location.pathname === "/login" ? "login" : "home";
@@ -9,7 +29,7 @@ function pageFromPath(): Page {
 
 export default function PublicExperience({ onLogin }: { onLogin: (session: PlatformAuthSession) => void }) {
   const [page, setPage] = useState<Page>(pageFromPath);
-  const [forgot, setForgot] = useState(false);
+  const [accountView, setAccountView] = useState<AccountView>("login");
   const [message, setMessage] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
@@ -25,18 +45,76 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  function login(event: FormEvent<HTMLFormElement>) {
+  async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const values = new FormData(event.currentTarget);
     const identifier = String(values.get("identifier") || "").trim();
     if (import.meta.env.DEV || import.meta.env.VITE_ALLOW_DEVELOPMENT_AUTH === "true") {
+      const accounts = JSON.parse(localStorage.getItem(DEVELOPMENT_ACCOUNTS_KEY) || "[]") as Array<{ email: string; passwordHash: string }>;
+      const registered = accounts.find((account) => account.email === identifier.toLowerCase());
+      if (registered && registered.passwordHash !== await passwordDigest(String(values.get("password") || ""))) {
+        setMessage("邮箱或密码不正确。");
+        return;
+      }
       const session: PlatformAuthSession = { mode: "development", userId: identifier };
       savePlatformAuth(session);
-      history.replaceState({}, "", "/app/dashboard");
       onLogin(session);
+      window.location.assign("/app/home");
       return;
     }
-    setMessage("账号密码认证服务尚未启用，请联系系统管理员。");
+    try {
+      const result = await accountRequest<{ access_token: string; refresh_token?: string; expires_in?: number; subject?: string }>("/api/accounts/login", {
+        identifier,
+        password: String(values.get("password") || ""),
+      });
+      const session: PlatformAuthSession = {
+        mode: "bearer",
+        accessToken: result.access_token,
+        refreshToken: result.refresh_token,
+        subject: result.subject || identifier,
+        expiresAt: result.expires_in ? Date.now() + result.expires_in * 1000 : null,
+      };
+      savePlatformAuth(session);
+      onLogin(session);
+      window.location.assign("/app/home");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "登录失败，请稍后重试。");
+    }
+  }
+
+  async function register(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget);
+    const email = String(values.get("email") || "").trim().toLowerCase();
+    const password = String(values.get("password") || "");
+    if (password !== String(values.get("confirm_password") || "")) {
+      setMessage("两次输入的密码不一致。");
+      return;
+    }
+    if (import.meta.env.DEV || import.meta.env.VITE_ALLOW_DEVELOPMENT_AUTH === "true") {
+      const accounts = JSON.parse(localStorage.getItem(DEVELOPMENT_ACCOUNTS_KEY) || "[]") as Array<{ email: string; name: string; passwordHash: string }>;
+      if (accounts.some((account) => account.email === email)) {
+        setMessage("该邮箱已经注册，请直接登录。");
+        return;
+      }
+      accounts.push({ email, name: String(values.get("name") || "").trim(), passwordHash: await passwordDigest(password) });
+      localStorage.setItem(DEVELOPMENT_ACCOUNTS_KEY, JSON.stringify(accounts));
+      setAccountView("login");
+      setMessage("注册成功，请使用邮箱和密码登录。");
+      return;
+    }
+    try {
+      await accountRequest("/api/accounts/register", {
+        email,
+        name: String(values.get("name") || "").trim(),
+        password,
+        accepted_terms: true,
+      });
+      setAccountView("login");
+      setMessage("注册成功，请使用邮箱和密码登录。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "注册失败，请稍后重试。");
+    }
   }
 
   function requestReset(event: FormEvent<HTMLFormElement>) {
@@ -56,21 +134,31 @@ export default function PublicExperience({ onLogin }: { onLogin: (session: Platf
         <section className="login-panel">
           <div className="login-box">
             <img className="login-mobile-logo" src="/assets/brand/call-logo.svg" alt="云声通" width="180" height="43" />
-            <button className="login-back" onClick={() => forgot ? setForgot(false) : navigate("home")} type="button">← {forgot ? "返回登录" : "返回首页"}</button>
-            <p className="section-kicker">{forgot ? "账户帮助" : "登录控制台"}</p>
-            <h2>{forgot ? "重置您的密码" : "欢迎回来"}</h2>
-            <p>{forgot ? "输入注册邮箱，我们会将密码重置链接发送给您。" : "登录您的工作空间，继续处理今天的重要沟通。"}</p>
-            {forgot ? (
+            <button className="login-back" onClick={() => accountView === "login" ? navigate("home") : setAccountView("login")} type="button">← {accountView === "login" ? "返回首页" : "返回登录"}</button>
+            <p className="section-kicker">{accountView === "forgot" ? "账户帮助" : accountView === "register" ? "创建账号" : "登录控制台"}</p>
+            <h2>{accountView === "forgot" ? "重置您的密码" : accountView === "register" ? "欢迎加入" : "欢迎回来"}</h2>
+            <p>{accountView === "forgot" ? "输入注册邮箱，我们会将密码重置链接发送给您。" : accountView === "register" ? "先创建个人账号，登录后即可配置并测试您的智能客服。" : "登录您的工作空间，继续处理今天的重要沟通。"}</p>
+            {accountView === "forgot" ? (
               <form className="login-form" onSubmit={requestReset}>
                 <div className="login-field"><label htmlFor="reset-email">注册邮箱</label><input id="reset-email" name="email" type="email" autoComplete="email" inputMode="email" spellCheck={false} placeholder="例如：name@company.com" required /></div>
                 <button className="account-primary" type="submit">发送重置链接</button>
+              </form>
+            ) : accountView === "register" ? (
+              <form className="login-form" onSubmit={register}>
+                <div className="login-field"><label htmlFor="register-name">您的称呼</label><input id="register-name" name="name" autoComplete="name" placeholder="请输入姓名" required /></div>
+                <div className="login-field"><label htmlFor="register-email">邮箱</label><input id="register-email" name="email" type="email" autoComplete="email" inputMode="email" spellCheck={false} placeholder="例如：name@company.com" required /></div>
+                <div className="login-field"><label htmlFor="register-password">设置密码</label><input id="register-password" name="password" type="password" autoComplete="new-password" minLength={8} placeholder="至少 8 位字符" required /></div>
+                <div className="login-field"><label htmlFor="register-confirm">确认密码</label><input id="register-confirm" name="confirm_password" type="password" autoComplete="new-password" minLength={8} placeholder="再次输入密码" required /></div>
+                <label className="register-consent"><input name="terms" type="checkbox" required /><span>我已阅读并同意服务条款和隐私政策</span></label>
+                <button className="account-primary" type="submit">注册账号</button>
               </form>
             ) : (
               <form className="login-form" onSubmit={login}>
                 <div className="login-field"><label htmlFor="login-identifier">邮箱或手机号</label><input id="login-identifier" name="identifier" autoComplete="username" spellCheck={false} placeholder="请输入邮箱或手机号" required /></div>
                 <div className="login-field"><label htmlFor="login-password">密码</label><div className="password-control"><input id="login-password" name="password" type={showPassword ? "text" : "password"} autoComplete="current-password" placeholder="请输入密码" minLength={6} required /><button aria-label={showPassword ? "隐藏密码" : "显示密码"} aria-pressed={showPassword} onClick={() => setShowPassword((value) => !value)} type="button">{showPassword ? "隐藏" : "显示"}</button></div></div>
-                <div className="login-options"><label><input name="remember" type="checkbox" /> <span>记住密码</span></label><button onClick={() => { setForgot(true); setMessage(""); }} type="button">忘记密码？</button></div>
+                <div className="login-options"><label><input name="remember" type="checkbox" /> <span>记住密码</span></label><button onClick={() => { setAccountView("forgot"); setMessage(""); }} type="button">忘记密码？</button></div>
                 <button className="account-primary" type="submit">登录</button>
+                <div className="register-entry"><span>还没有账号？</span><button onClick={() => { setAccountView("register"); setMessage(""); }} type="button">免费注册</button></div>
               </form>
             )}
             {message ? <div className="account-message" role="status" aria-live="polite">{message}</div> : null}

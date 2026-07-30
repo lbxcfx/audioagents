@@ -268,11 +268,11 @@ export default function InboundConsole() {
   return (
     <main className="inbound-console">
       <aside className="inbound-sidebar">
-        <a href="/app/dashboard" className="inbound-brand"><img src="/assets/brand/call-logo.svg" alt="云声通" /></a>
+        <a href="/app/home" className="inbound-brand"><img src="/assets/brand/call-logo.svg" alt="云声通" /></a>
         <span className="sidebar-group">业务工作台</span>
-        <a href="/app/dashboard">智能外呼</a>
-        <a className="active" href="/app/inbound/agents">智能呼入</a>
-        <a href="/app/inbound/agents">Agent 管理</a>
+        <a href="/app/home">工作台首页</a>
+        <a className="active" href="/app/inbound/agents">智能客服</a>
+        <a href="/app/inbound/agents">Agent 配置</a>
         <span className="sidebar-group">设置</span>
         <a href="/app/dashboard">项目与成员</a>
       </aside>

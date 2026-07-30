@@ -3131,9 +3131,52 @@ td button {
 .brand-button:focus-visible,.login-back:focus-visible,.login-options button:focus-visible,.password-control button:focus-visible,.account-primary:focus-visible { outline:3px solid rgba(64,105,82,.25); outline-offset:3px; }
 .account-message { margin-top:18px; padding:12px; border-radius:8px; background:#f4f7fa; color:#536176; font-size:13px; line-height:1.6; }
 .login-note { display:block; margin-top:28px; color:#969b96; font-size:12px; line-height:1.6; text-align:center; }
+.register-entry { display:flex; align-items:center; justify-content:center; gap:8px; color:#78827c; font-size:14px; }
+.register-entry button { padding:5px; border:0; background:transparent; color:#315f47; cursor:pointer; font:inherit; font-weight:700; }
+.register-consent { display:flex; align-items:flex-start; gap:10px; color:#66716a; font-size:13px; line-height:1.55; }
+.register-consent input { width:17px; height:17px; margin-top:2px; accent-color:#315440; }
 @media (max-width:1180px) { .public-login{grid-template-columns:minmax(0,1fr) minmax(400px,.85fr)}.login-story-copy h1{font-size:clamp(36px,4vw,44px)}.login-panel{padding-right:30px;padding-left:30px}.login-box{padding:40px 36px} }
 @media (max-width:850px) { .public-nav nav{display:none}.public-nav img{width:160px}.public-nav .nav-login{margin-left:auto}.public-hero,.hero-copy{min-height:700px}.hero-photo{object-position:65% center}.hero-shade{background:linear-gradient(90deg,rgba(248,246,241,.98),rgba(248,246,241,.78))}.hero-copy{width:auto;margin:0;padding:90px 7vw 170px}.hero-copy h1{font-size:48px}.feature-grid,.scene-section{grid-template-columns:1fr}.scene-section{gap:55px}.public-login{grid-template-columns:1fr}.login-story{display:none}.login-mobile-logo{display:block}.login-panel{min-height:100vh;padding:32px 6vw}.login-box{max-width:480px;padding:38px 30px}.login-back{margin-bottom:34px} }
 @media (prefers-reduced-motion:reduce) { .feature-grid article{transition:none}.hero-copy a{scroll-behavior:auto} }
+
+/* Authenticated product choice: two clear business domains. */
+.workspace-home { min-height:100vh; padding-bottom:56px; color:#17233d; background:linear-gradient(145deg,#f6f3ec 0%,#edf1ed 100%); font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif; }
+.workspace-header { height:78px; padding:0 clamp(24px,6vw,92px); display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(23,35,61,.1); background:rgba(250,248,243,.88); }
+.workspace-header img { width:174px; display:block; }
+.workspace-header div { display:flex; align-items:center; gap:18px; color:#68758a; font-size:14px; }
+.workspace-header button { padding:9px 14px; border:1px solid #d2d8d3; border-radius:8px; color:#526158; background:rgba(255,255,255,.62); cursor:pointer; }
+.workspace-intro { max-width:1240px; margin:0 auto; padding:76px 32px 44px; }
+.workspace-intro > span,.workspace-product-copy > span { color:#47735b; font-size:13px; font-weight:750; letter-spacing:.14em; }
+.workspace-intro h1 { margin:16px 0 15px; font:500 clamp(42px,5vw,66px)/1.15 Georgia,"Songti SC",serif; letter-spacing:-.045em; }
+.workspace-intro p { max-width:720px; margin:0; color:#68758a; font-size:17px; line-height:1.8; }
+.workspace-products { max-width:1240px; margin:0 auto; padding:0 32px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px; }
+.workspace-product { position:relative; min-height:570px; padding:38px; display:flex; flex-direction:column; overflow:hidden; border:1px solid rgba(23,35,61,.11); border-radius:24px; box-shadow:0 24px 70px rgba(47,57,51,.08); }
+.service-product { background:linear-gradient(155deg,#fdfcf8,#e9f0ea); }
+.outbound-product { background:linear-gradient(155deg,#fbfcfd,#e8eef5); }
+.workspace-product-number { align-self:flex-end; color:rgba(23,35,61,.2); font:500 30px Georgia,serif; }
+.workspace-product-copy { max-width:500px; }
+.workspace-product h2 { margin:16px 0 15px; font:600 clamp(28px,3vw,39px)/1.3 Georgia,"Songti SC",serif; letter-spacing:-.035em; }
+.workspace-product p { margin:0; color:#647187; font-size:16px; line-height:1.8; }
+.workspace-product ul { margin:25px 0 0; padding:0; display:flex; flex-wrap:wrap; gap:8px; list-style:none; }
+.workspace-product li { padding:7px 11px; border:1px solid rgba(55,91,72,.16); border-radius:999px; color:#53685b; background:rgba(255,255,255,.5); font-size:12px; }
+.workspace-product-scene { margin:34px 0 28px; padding:22px; display:grid; gap:12px; border:1px solid rgba(23,35,61,.09); border-radius:16px; background:rgba(255,255,255,.57); }
+.workspace-product-scene div { max-width:84%; padding:11px 14px; border-radius:3px 13px 13px 13px; background:#fff; }
+.workspace-product-scene div + div { justify-self:end; background:#e7f1e9; }
+.workspace-product-scene i { color:#78877d; font-size:11px; font-style:normal; }
+.workspace-product-scene p { margin-top:4px; color:#405047; font-size:13px; line-height:1.55; }
+.workspace-product > a { margin-top:auto; display:flex; justify-content:space-between; padding-top:19px; border-top:1px solid rgba(23,35,61,.12); color:#244f39; text-decoration:none; font-weight:750; }
+.outbound-scene { align-content:center; min-height:106px; }
+.outbound-scene > span,.outbound-scene > small { color:#77869a; font-size:12px; }
+.outbound-scene > strong { color:#244f77; font:500 36px Georgia,serif; }
+.outbound-scene > div { max-width:none; padding:0; display:flex; gap:5px; background:transparent; }
+.outbound-scene i { width:18%; height:6px; border-radius:9px; background:#88a9c8; }
+.workspace-footer { max-width:1176px; margin:28px auto 0; padding:22px 32px; display:flex; justify-content:space-between; gap:20px; color:#7b8691; font-size:13px; }
+.workspace-auth-required { min-height:100vh; display:grid; place-content:center; justify-items:center; gap:12px; color:#17233d; background:#f5f1e9; text-align:center; }
+.workspace-auth-required img { width:185px; margin-bottom:24px; }
+.workspace-auth-required p { color:#6c7888; }
+.workspace-auth-required a { padding:11px 20px; color:#fff; background:#1769cf; text-decoration:none; }
+@media (max-width:850px) { .workspace-products{grid-template-columns:1fr}.workspace-product{min-height:520px}.workspace-footer{flex-direction:column}.workspace-intro{padding-top:55px} }
+@media (max-width:560px) { .workspace-header{height:66px;padding:0 18px}.workspace-header img{width:145px}.workspace-header span{display:none}.workspace-intro{padding:44px 20px 32px}.workspace-intro h1{font-size:40px}.workspace-products{padding:0 18px}.workspace-product{min-height:0;padding:28px 23px;border-radius:18px}.workspace-product h2{font-size:29px}.workspace-footer{padding:20px} }
 
 /* Public content refinement: editorial feature stories and a warmer case study. */
 .section-kicker { font-size:14px; letter-spacing:.15em; }
