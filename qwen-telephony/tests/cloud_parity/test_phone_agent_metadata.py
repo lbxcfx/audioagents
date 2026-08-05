@@ -20,7 +20,14 @@ import phone_agent
 
 def test_provider_dial_target_preserves_e164_without_prefix(monkeypatch) -> None:
     monkeypatch.delenv("QWEN_SIP_DIAL_PREFIX", raising=False)
+    monkeypatch.delenv("QWEN_SIP_STRIP_COUNTRY_CODE", raising=False)
     assert phone_agent._provider_dial_target("+8613812345678") == "+8613812345678"
+
+
+def test_provider_dial_target_strips_country_code_without_prefix(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_SIP_DIAL_PREFIX", raising=False)
+    monkeypatch.setenv("QWEN_SIP_STRIP_COUNTRY_CODE", "86")
+    assert phone_agent._provider_dial_target("+8613812345678") == "13812345678"
 
 
 def test_provider_dial_target_applies_numeric_carrier_prefix(monkeypatch) -> None:
@@ -39,6 +46,72 @@ def test_provider_dial_target_rejects_invalid_prefix(monkeypatch) -> None:
     monkeypatch.setenv("QWEN_SIP_DIAL_PREFIX", "carrier-")
     with pytest.raises(ValueError, match="digits only"):
         phone_agent._provider_dial_target("+8613812345678")
+
+
+def test_provider_dial_target_uses_selected_carrier_profile(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_SIP_DIAL_PREFIX", raising=False)
+    monkeypatch.setenv("QWEN_SIP_STRIP_COUNTRY_CODE", "86")
+    monkeypatch.setenv("QWEN_SIP_QINGSHANYUN_DIAL_PREFIX", "10012008")
+    monkeypatch.setenv("QWEN_SIP_QINGSHANYUN_STRIP_COUNTRY_CODE", "86")
+
+    assert (
+        phone_agent._provider_dial_target("+8613812345678", "qingshanyun")
+        == "1001200813812345678"
+    )
+    assert (
+        phone_agent._provider_dial_target("+8613812345678", "qingchuanyun")
+        == "13812345678"
+    )
+
+
+def test_provider_registration_profile_falls_back_to_primary(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_SIP_QINGCHUANYUN_REGISTER_ENABLED", raising=False)
+    monkeypatch.setenv("QWEN_SIP_QINGSHANYUN_REGISTER_ENABLED", "true")
+
+    assert (
+        phone_agent._provider_registration_env_prefix("qingshanyun")
+        == "QWEN_SIP_QINGSHANYUN_REGISTER"
+    )
+    assert (
+        phone_agent._provider_registration_env_prefix("qingchuanyun")
+        == "QWEN_SIP_REGISTER"
+    )
+
+
+def test_registration_refreshes_before_3600_second_expiry(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_SIP_REGISTER_REFRESH_SECONDS", "3540")
+
+    assert phone_agent._registration_refresh_seconds("QWEN_SIP_REGISTER", 3600) == 3540
+
+
+def test_registration_refresh_rejects_interval_after_expiry(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_SIP_REGISTER_REFRESH_SECONDS", "3601")
+
+    with pytest.raises(ValueError, match="between 30 and 3600"):
+        phone_agent._registration_refresh_seconds("QWEN_SIP_REGISTER", 3600)
+
+
+def test_outbound_sip_media_timeout_ends_missing_rtp_promptly(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_SIP_MEDIA_TIMEOUT_SECONDS", raising=False)
+
+    config = phone_agent._outbound_sip_media_config()
+
+    assert config.media_timeout.seconds == 5
+    assert config.only_listed_codecs is True
+    assert [(codec.name, codec.rate) for codec in config.codecs] == [("PCMU", 8_000)]
+
+
+def test_outbound_calls_use_agent_hangup_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", raising=False)
+
+    assert phone_agent._customer_hangup_only({"direction": "outbound"}) is False
+    assert phone_agent._customer_hangup_only({"direction": "inbound"}) is False
+
+
+def test_customer_hangup_only_can_be_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", "true")
+
+    assert phone_agent._customer_hangup_only({"direction": "outbound"}) is True
 
 
 def _payload() -> dict[str, str]:

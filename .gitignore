@@ -18,6 +18,7 @@ qwen-telephony/.docker/
 qwen-telephony/cache/
 qwen-telephony/logs/
 qwen-telephony/data/
+qwen-telephony/artifacts/
 qwen-telephony/node_modules/
 qwen-telephony/playwright-report/
 qwen-telephony/test-results/

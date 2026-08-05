@@ -57,6 +57,7 @@ def _call(**overrides):
         "destination_number": "+8613800000001",
         "source_number": "+8610000000000",
         "livekit_trunk_id": "ST_primary",
+        "trunk_provider": "qingshanyun",
         "room_name": "",
     }
     value.update(overrides)
@@ -88,6 +89,7 @@ def test_dispatcher_marks_dispatching_before_livekit_side_effect() -> None:
     assert request.room == "call-call-1"
     assert metadata["kind"] == "telephony.outbound"
     assert metadata["livekit_trunk_id"] == "ST_primary"
+    assert metadata["trunk_provider"] == "qingshanyun"
     assert metadata["lease_seconds"] == 30
     assert metadata["heartbeat_seconds"] == 10
     assert "service_token" not in metadata

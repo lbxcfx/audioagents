@@ -699,7 +699,7 @@ class AIModelConfigUpdate(BaseModel):
 
 
 class DialogueMicroSipTestRequest(BaseModel):
-    phone: str = "1000@127.0.0.1:5066"
+    phone: str = "1000@127.0.0.1:5065"
     visible: bool = True
 
 
@@ -1213,12 +1213,12 @@ def _sync_call_dialogue_state(conn) -> None:
         UPDATE calls
         SET room_name = ?,
             caller_name = '测试号'
-        WHERE phone = '1000@127.0.0.1:5066'
+        WHERE phone = '1000@127.0.0.1:5065'
           AND room_name LIKE 'microsip-script-test-%'
         """,
         (room_name,),
     )
-    conn.execute("UPDATE calls SET caller_name = '测试号' WHERE phone = '1000@127.0.0.1:5066' AND caller_name = ''")
+    conn.execute("UPDATE calls SET caller_name = '测试号' WHERE phone = '1000@127.0.0.1:5065' AND caller_name = ''")
     conn.execute(
         """
         UPDATE calls
@@ -1251,7 +1251,7 @@ def _sync_call_dialogue_state(conn) -> None:
                 ),
                 60
             )
-        WHERE phone = '1000@127.0.0.1:5066'
+        WHERE phone = '1000@127.0.0.1:5065'
           AND status = 'completed'
           AND duration_sec = 0
         """
@@ -1384,7 +1384,7 @@ def microsip_test(scene_id: int, payload: DialogueMicroSipTestRequest) -> dict:
             """,
             (
                 scene_id,
-                "测试号" if payload.phone == "1000@127.0.0.1:5066" else "",
+                "测试号" if payload.phone == "1000@127.0.0.1:5065" else "",
                 payload.phone,
                 room_name,
                 f"话术发布后 MicroSIP 测试：{scene['name']}",

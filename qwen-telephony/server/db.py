@@ -233,7 +233,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE calls ADD COLUMN scene_id INTEGER")
         if "caller_name" not in call_columns:
             conn.execute("ALTER TABLE calls ADD COLUMN caller_name TEXT NOT NULL DEFAULT ''")
-        conn.execute("UPDATE calls SET caller_name = '测试号' WHERE phone = '1000@127.0.0.1:5066' AND caller_name = ''")
+        conn.execute("UPDATE calls SET caller_name = '测试号' WHERE phone = '1000@127.0.0.1:5065' AND caller_name = ''")
         scene_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dialogue_scenes)").fetchall()}
         if "script_type" not in scene_columns:
             conn.execute("ALTER TABLE dialogue_scenes ADD COLUMN script_type TEXT NOT NULL DEFAULT 'common'")

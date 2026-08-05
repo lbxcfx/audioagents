@@ -2523,7 +2523,8 @@ class TelephonyService:
                 )
                 updated = conn.execute(
                     """
-                    SELECT c.*, COALESCE(t.livekit_trunk_id, '') AS livekit_trunk_id
+                    SELECT c.*, COALESCE(t.livekit_trunk_id, '') AS livekit_trunk_id,
+                           COALESCE(t.provider, '') AS trunk_provider
                     FROM call_jobs c
                     LEFT JOIN sip_trunks t ON t.id = c.trunk_id AND t.project_id = c.project_id
                       AND t.direction IN ('outbound', 'bidirectional') AND t.status = 'active'

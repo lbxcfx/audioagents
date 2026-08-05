@@ -58,8 +58,8 @@ services:
         ws_url: "ws://livekit:7880"
         redis:
           address: "redis:6379"
-        sip_port: ${SIP_PORT:-5066}
-        sip_port_listen: ${SIP_PORT:-5066}
+        sip_port: ${SIP_PORT:-5065}
+        sip_port_listen: ${SIP_PORT:-5065}
         sip_hostname: "${DEV_SIP_ADVERTISED_IP:-127.0.0.1}"
         rtp_port: ${SIP_RTP_PORT_RANGE:-10000-10100}
         use_external_ip: false
@@ -70,8 +70,8 @@ services:
         logging:
           level: info
     ports:
-      - "${SIP_PORT:-5066}:${SIP_PORT:-5066}/udp"
-      - "${SIP_PORT:-5066}:${SIP_PORT:-5066}/tcp"
+      - "${SIP_PORT:-5065}:${SIP_PORT:-5065}/udp"
+      - "${SIP_PORT:-5065}:${SIP_PORT:-5065}/tcp"
       - "${SIP_RTP_PORT_RANGE:-10000-10100}:${SIP_RTP_PORT_RANGE:-10000-10100}/udp"
     depends_on:
       redis:

@@ -9,6 +9,8 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
+import secrets
 import threading
 from time import perf_counter
 from typing import Any
@@ -37,6 +39,7 @@ from livekit.agents import (
     stt,
     utils,
 )
+from livekit.agents import llm
 from livekit.agents.inference_runner import _InferenceRunner
 from livekit.plugins import openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -45,11 +48,14 @@ from openai import AsyncOpenAI
 from dialogue_llm import ScriptFirstLLM
 from qwen_audio_realtime import (
     CLASSIC_PIPELINE,
+    DEFAULT_REALTIME_OPENINGS,
     QwenAudioRealtimeModel,
+    REALTIME_PIPELINE,
     load_realtime_instructions,
     voice_pipeline,
 )
 from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS, register_recorded_audio
+from sip_registration import SIPRegistrationError, register_from_env
 
 
 # Importing livekit.plugins.turn_detector registers both its English and
@@ -59,24 +65,114 @@ from qwen_providers import QwenASR, QwenRealtimeASR, QwenTTS, register_recorded_
 _InferenceRunner.registered_runners.pop("lk_end_of_utterance_en", None)
 
 
-def _provider_dial_target(phone_number: str) -> str:
+def _provider_env_prefix(provider: str) -> str:
+    normalized = provider.strip().upper().replace("-", "_").replace(".", "_")
+    if normalized and not re.fullmatch(r"[A-Z0-9_]+", normalized):
+        raise ValueError("SIP trunk provider contains unsupported characters")
+    return f"QWEN_SIP_{normalized}" if normalized else "QWEN_SIP"
+
+
+def _provider_dial_target(phone_number: str, provider: str = "") -> str:
     """Translate an E.164 contact number to the carrier's SIP dial string."""
     number = phone_number.strip()
-    prefix = os.getenv("QWEN_SIP_DIAL_PREFIX", "").strip()
-    if not prefix:
+    provider_prefix = _provider_env_prefix(provider)
+    prefix = os.getenv(
+        f"{provider_prefix}_DIAL_PREFIX", os.getenv("QWEN_SIP_DIAL_PREFIX", "")
+    ).strip()
+    strip_country_code = os.getenv(
+        f"{provider_prefix}_STRIP_COUNTRY_CODE",
+        os.getenv("QWEN_SIP_STRIP_COUNTRY_CODE", ""),
+    ).strip()
+    if not prefix and not strip_country_code:
         return number
-    if not prefix.isdigit():
+    if prefix and not prefix.isdigit():
         raise ValueError("QWEN_SIP_DIAL_PREFIX must contain digits only")
     normalized = number.removeprefix("+")
     if not normalized.isdigit():
         raise ValueError("outbound phone number must be E.164 digits")
-    strip_country_code = os.getenv("QWEN_SIP_STRIP_COUNTRY_CODE", "").strip()
     if strip_country_code:
         if not strip_country_code.isdigit():
             raise ValueError("QWEN_SIP_STRIP_COUNTRY_CODE must contain digits only")
         if normalized.startswith(strip_country_code):
             normalized = normalized[len(strip_country_code) :]
     return f"{prefix}{normalized}"
+
+
+def _provider_registration_env_prefix(provider: str) -> str:
+    provider_prefix = _provider_env_prefix(provider) + "_REGISTER"
+    if os.getenv(f"{provider_prefix}_ENABLED", "").strip():
+        return provider_prefix
+    return "QWEN_SIP_REGISTER"
+
+
+def _registration_refresh_seconds(env_prefix: str, expires: int) -> int:
+    """Renew before expiry while honoring an explicit carrier refresh period."""
+
+    configured = os.getenv(f"{env_prefix}_REFRESH_SECONDS", "").strip()
+    if configured:
+        refresh = int(configured)
+        if not 30 <= refresh <= expires:
+            raise ValueError(
+                f"{env_prefix}_REFRESH_SECONDS must be between 30 and {expires}"
+            )
+        return refresh
+    return max(30, expires - min(60, max(1, expires // 10)))
+
+
+async def _sip_registration_renewal_loop(env_prefix: str) -> None:
+    while True:
+        try:
+            registration = await asyncio.to_thread(register_from_env, env_prefix)
+            if registration is None:
+                logger.info("SIP registration keeper disabled: profile=%s", env_prefix)
+                return
+            refresh_seconds = _registration_refresh_seconds(
+                env_prefix, registration.expires
+            )
+            logger.info(
+                "SIP registration renewed: profile=%s status=%s realm=%s "
+                "expires=%ss next_refresh=%ss",
+                env_prefix,
+                registration.status_code,
+                registration.realm,
+                registration.expires,
+                refresh_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("SIP registration renewal failed: profile=%s", env_prefix)
+            refresh_seconds = min(
+                60,
+                max(
+                    5,
+                    int(os.getenv(f"{env_prefix}_RETRY_SECONDS", "15")),
+                ),
+            )
+        await asyncio.sleep(refresh_seconds)
+
+
+def _outbound_sip_media_config() -> api.SIPMediaConfig:
+    """End a call promptly once the carrier RTP stream disappears."""
+
+    return api.SIPMediaConfig(
+        codecs=[api.SIPCodec(name="PCMU", rate=8_000)],
+        only_listed_codecs=True,
+        media_timeout=_bounded_duration(
+            "QWEN_SIP_MEDIA_TIMEOUT_SECONDS",
+            5,
+            minimum=3,
+            maximum=600,
+        )
+    )
+
+
+def _customer_hangup_only(job: dict[str, Any] | None) -> bool:
+    """Whether a normal outbound conversation must wait for the callee to hang up."""
+
+    return bool(job and str(job.get("direction") or "") == "outbound") and os.getenv(
+        "QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -94,6 +190,11 @@ GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
 GREETING_ROOM_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_24k.wav"
 GREETING_AUDIO_LOCK_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav.lock"
 ROOM_AUDIO_SAMPLE_RATE = int(os.getenv("QWEN_ROOM_AUDIO_SAMPLE_RATE", str(QwenTTS.sample_rate_hz)))
+FINAL_GOODBYE_TEXT = "祝您生活愉快，再见"
+WECHAT_ADDED_NOTICE_TEXT = "好的，已经加您了，请您通过一下。"
+_REALTIME_FIXED_AUDIO: dict[str, bytes] = {}
+_REALTIME_SCENE_CACHE: dict[int, dict[str, Any]] = {}
+_REALTIME_SCENE_CACHE_UPDATED_AT: dict[int, float] = {}
 
 
 def _normalize_wav_bytes(audio_bytes: bytes) -> bytes:
@@ -174,6 +275,289 @@ def _convert_wav_to_sample_rate(audio_bytes: bytes, sample_rate: int) -> bytes:
 def _prepare_wav_for_room_playback(audio_bytes: bytes) -> bytes:
     normalized = _normalize_wav_bytes(audio_bytes)
     return _convert_wav_to_sample_rate(normalized, ROOM_AUDIO_SAMPLE_RATE)
+
+
+def _select_realtime_opening(scene: dict[str, Any] | None) -> str:
+    if not scene:
+        return secrets.choice(DEFAULT_REALTIME_OPENINGS)
+
+    flow = scene.get("flow") if isinstance(scene.get("flow"), dict) else {}
+    nodes = flow.get("nodes") if isinstance(flow.get("nodes"), list) else []
+    entry_id = str(flow.get("entry_node") or "").strip()
+    if entry_id == "rider_opening":
+        return secrets.choice(DEFAULT_REALTIME_OPENINGS)
+    entry = next(
+        (
+            node
+            for node in nodes
+            if isinstance(node, dict) and str(node.get("id") or "") == entry_id
+        ),
+        None,
+    )
+    opening = str((entry or {}).get("text") or "").strip()
+    return opening or DEFAULT_REALTIME_OPENINGS[0]
+
+
+def _is_wechat_added_notice(text: str) -> bool:
+    compact = re.sub(r"[\s，。！？、,.!?]", "", text)
+    return "已经加您了" in compact and "请您通过" in compact
+
+
+def _is_short_wechat_acknowledgement(text: str) -> bool:
+    compact = re.sub(r"[\s，。！？、,.!?]", "", text)
+    return compact in {
+        "好",
+        "好的",
+        "嗯好",
+        "嗯好的",
+        "行",
+        "可以",
+        "知道了",
+        "没问题",
+        "会通过",
+        "我会通过",
+    }
+
+
+def _function_call_requests_wechat_notice(function_call: Any) -> bool:
+    return str(getattr(function_call, "name", "")) == "complete_wechat_followup"
+
+
+def _cancel_tool_reply_for_programmatic_audio(event: Any) -> set[str]:
+    names = {
+        str(getattr(call, "name", ""))
+        for call in getattr(event, "function_calls", [])
+        if str(getattr(call, "name", ""))
+        in {"complete_wechat_followup", "end_call"}
+    }
+    if not names:
+        return set()
+    event.cancel_tool_reply()
+    return names
+
+
+def _programmatic_audio_action(tool_names: set[str]) -> str | None:
+    """Choose one deterministic transition when a model batches tool calls.
+
+    A confirmed WeChat follow-up must always be announced before a terminal
+    goodbye. Qwen can return multiple function calls in a single response, so
+    the transition order cannot depend on the order of those calls.
+    """
+
+    if "complete_wechat_followup" in tool_names:
+        return "wechat_notice"
+    if "end_call" in tool_names:
+        return "final_goodbye"
+    return None
+
+
+def _start_single_flight_task(
+    task: asyncio.Task[Any] | None,
+    coroutine_factory: Any,
+    *,
+    name: str,
+) -> asyncio.Task[Any]:
+    """Start a call-lifetime action once, even after its task has completed."""
+
+    if task is None:
+        return asyncio.create_task(coroutine_factory(), name=name)
+    return task
+
+
+def _finish_wechat_notice_playout(
+    *,
+    awaiting_acknowledgement: bool,
+    start_close_timer: Any,
+) -> None:
+    """Start the silence clock immediately after remote-bound media drains."""
+
+    if awaiting_acknowledgement:
+        start_close_timer()
+
+
+def _sip_call_status(participant: Any) -> str:
+    return str((getattr(participant, "attributes", {}) or {}).get("sip.callStatus", "")).lower()
+
+
+def _active_sip_participant(room: rtc.Room) -> rtc.RemoteParticipant | None:
+    for participant in room.remote_participants.values():
+        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            continue
+        if _sip_call_status(participant) in {"active", "answered", "established"}:
+            return participant
+    return None
+
+
+async def _wait_for_active_sip_participant(
+    room: rtc.Room,
+    *,
+    timeout: float,
+) -> rtc.RemoteParticipant:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if participant := _active_sip_participant(room):
+            return participant
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("SIP participant did not become active before opening")
+        await asyncio.sleep(0.02)
+
+
+async def ensure_realtime_fixed_audio_cache() -> None:
+    """Pre-generate deterministic Realtime phrases before any call is assigned."""
+
+    required_texts = (
+        *DEFAULT_REALTIME_OPENINGS,
+        WECHAT_ADDED_NOTICE_TEXT,
+        FINAL_GOODBYE_TEXT,
+    )
+    missing = [text for text in required_texts if text not in _REALTIME_FIXED_AUDIO]
+    if not missing:
+        return
+
+    qwen_tts = QwenTTS()
+    try:
+        for text in missing:
+            audio_bytes, _, _ = await qwen_tts.synthesize_audio_bytes(text)
+            _REALTIME_FIXED_AUDIO[text] = _prepare_wav_for_room_playback(audio_bytes)
+        logger.info("Realtime fixed audio cache ready: phrases=%d", len(_REALTIME_FIXED_AUDIO))
+    finally:
+        await qwen_tts.aclose()
+
+
+async def _audio_frames_from_wav_bytes(audio_bytes: bytes, *, label: str):
+    started = perf_counter()
+    frame_count = 0
+    audio_duration = 0.0
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        sample_rate = reader.getframerate()
+        channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        if (
+            sample_rate != ROOM_AUDIO_SAMPLE_RATE
+            or channels != QwenTTS.num_channels_count
+            or sample_width != 2
+        ):
+            raise ValueError(f"{label} wav has unexpected audio parameters")
+
+        samples_per_frame = sample_rate // 50
+        while True:
+            pcm = reader.readframes(samples_per_frame)
+            if not pcm:
+                break
+            samples = len(pcm) // (sample_width * channels)
+            if frame_count == 0:
+                logger.info(
+                    "fixed_audio_first_frame_ready label=%s elapsed=%.3fs",
+                    label,
+                    perf_counter() - started,
+                )
+            frame_count += 1
+            audio_duration += samples / sample_rate
+            yield rtc.AudioFrame(pcm, sample_rate, channels, samples)
+
+    logger.info(
+        "fixed_audio_source_exhausted label=%s frames=%d "
+        "audio_duration=%.3fs elapsed=%.3fs",
+        label,
+        frame_count,
+        audio_duration,
+        perf_counter() - started,
+    )
+
+
+async def _play_wav_bytes_direct(
+    room: rtc.Room,
+    audio_bytes: bytes,
+    *,
+    label: str,
+    track_name: str,
+    tail_silence_ms: int = 0,
+    on_first_frame_queued: Any = None,
+) -> float:
+    """Play a fixed phrase outside AgentSession so Realtime VAD cannot interrupt it."""
+
+    started = perf_counter()
+    source = rtc.AudioSource(
+        ROOM_AUDIO_SAMPLE_RATE,
+        QwenTTS.num_channels_count,
+        queue_size_ms=5000,
+    )
+    track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
+    publication = await room.local_participant.publish_track(track)
+    frame_count = 0
+    audio_duration = 0.0
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+            sample_rate = reader.getframerate()
+            channels = reader.getnchannels()
+            sample_width = reader.getsampwidth()
+            if (
+                sample_rate != ROOM_AUDIO_SAMPLE_RATE
+                or channels != QwenTTS.num_channels_count
+                or sample_width != 2
+            ):
+                raise ValueError(f"{label} wav has unexpected audio parameters")
+
+            samples_per_frame = sample_rate // 50
+            while True:
+                pcm = reader.readframes(samples_per_frame)
+                if not pcm:
+                    break
+                samples = len(pcm) // (sample_width * channels)
+                is_first_frame = frame_count == 0
+                await source.capture_frame(
+                    rtc.AudioFrame(pcm, sample_rate, channels, samples)
+                )
+                if is_first_frame:
+                    logger.info(
+                        "%s direct playback first frame queued in %.3fs",
+                        label,
+                        perf_counter() - started,
+                    )
+                    if on_first_frame_queued is not None:
+                        try:
+                            on_first_frame_queued()
+                        except Exception:
+                            logger.exception(
+                                "%s first-frame callback failed", label
+                            )
+                frame_count += 1
+                audio_duration += samples / sample_rate
+
+        # Keep the RTP track alive with actual media after the spoken phrase.
+        # Waiting after unpublishing the track does not protect carrier-side
+        # jitter buffers from losing the last spoken packet.
+        tail_samples = max(0, tail_silence_ms) * ROOM_AUDIO_SAMPLE_RATE // 1000
+        remaining_tail_samples = tail_samples
+        bytes_per_sample = 2 * QwenTTS.num_channels_count
+        while remaining_tail_samples > 0:
+            samples = min(ROOM_AUDIO_SAMPLE_RATE // 50, remaining_tail_samples)
+            await source.capture_frame(
+                rtc.AudioFrame(
+                    b"\x00" * samples * bytes_per_sample,
+                    ROOM_AUDIO_SAMPLE_RATE,
+                    QwenTTS.num_channels_count,
+                    samples,
+                )
+            )
+            remaining_tail_samples -= samples
+
+        await source.wait_for_playout()
+        logger.info(
+            "%s direct playback completed: frames=%d audio_duration=%.3fs "
+            "tail_silence_ms=%d elapsed=%.3fs",
+            label,
+            frame_count,
+            audio_duration,
+            max(0, tail_silence_ms),
+            perf_counter() - started,
+        )
+        return audio_duration
+    finally:
+        sid = getattr(publication, "sid", "")
+        if sid:
+            await room.local_participant.unpublish_track(sid)
+        await source.aclose()
 
 
 def _ensure_room_greeting_audio_cache() -> bool:
@@ -257,10 +641,14 @@ def prewarm_process(proc: JobProcess) -> None:
     # AgentSession and StreamAdapter keep their own state, while the ONNX model
     # is loaded only once per process.
     proc.userdata["vad"] = _build_session_vad()
+    async def prewarm_audio() -> None:
+        await ensure_greeting_audio_cache()
+        await ensure_realtime_fixed_audio_cache()
+
     try:
-        asyncio.run(ensure_greeting_audio_cache())
+        asyncio.run(prewarm_audio())
     except Exception:
-        logger.exception("Greeting audio cache prewarm failed")
+        logger.exception("Fixed audio cache prewarm failed")
 
 
 async def _logged_audio_frames_from_file(file_path: str):
@@ -405,10 +793,40 @@ async def fetch_realtime_scene(scene_id: int | None) -> dict[str, Any] | None:
             )
             response.raise_for_status()
             body = response.json()
-            return body if isinstance(body, dict) else None
+            if isinstance(body, dict):
+                _REALTIME_SCENE_CACHE[scene_id] = body
+                _REALTIME_SCENE_CACHE_UPDATED_AT[scene_id] = perf_counter()
+                return body
+            return None
     except Exception:
         logger.exception("Realtime scene fetch failed; using default prompt: scene=%s", scene_id)
         return None
+
+
+def _start_realtime_scene_fetch(
+    scene_id: int | None,
+) -> tuple[dict[str, Any] | None, asyncio.Task[dict[str, Any] | None] | None]:
+    if not scene_id:
+        return None, None
+    cached = _REALTIME_SCENE_CACHE.get(scene_id)
+    cached_at = _REALTIME_SCENE_CACHE_UPDATED_AT.get(scene_id)
+    cache_ttl = _configured_float(
+        "QWEN_REALTIME_SCENE_CACHE_TTL_SECONDS",
+        30.0,
+        minimum=1.0,
+        maximum=3600.0,
+    )
+    if (
+        cached is not None
+        and cached_at is not None
+        and perf_counter() - cached_at <= cache_ttl
+    ):
+        return cached, None
+    if cached is not None:
+        logger.info("Realtime scene cache expired; refreshing scene=%s", scene_id)
+    return cached, asyncio.create_task(
+        fetch_realtime_scene(scene_id), name=f"realtime-scene-{scene_id}"
+    )
 
 
 async def play_text_audio_direct(room: rtc.Room, text: str) -> None:
@@ -1185,11 +1603,12 @@ async def _telephony_record_recording(
 
 async def _start_managed_recording(
     ctx: JobContext,
-    session: AgentSession,
     job: dict[str, Any],
-) -> tuple[str, str]:
+    *,
+    on_created: Any = None,
+) -> tuple[list[str], str]:
     if str(job.get("recording_mode") or "off") != "always":
-        return "", ""
+        return [], ""
     disclosure = str(job.get("recording_disclosure_text") or "").strip()
     if not disclosure:
         raise RuntimeError("recording disclosure text is missing")
@@ -1201,45 +1620,144 @@ async def _start_managed_recording(
     if not prefix or ".." in prefix:
         raise RuntimeError("invalid QWEN_RECORDING_S3_PREFIX")
 
-    notice = session.say(disclosure, allow_interruptions=False)
-    await notice.wait_for_playout()
     filepath = f"{prefix}/{job['project_id']}/{job['call_id']}.mp3"
-    upload = api.S3Upload(
-        access_key=os.getenv("QWEN_RECORDING_S3_ACCESS_KEY", "").strip(),
-        secret=os.getenv("QWEN_RECORDING_S3_SECRET", "").strip(),
-        session_token=os.getenv("QWEN_RECORDING_S3_SESSION_TOKEN", "").strip(),
-        region=region,
-        endpoint=os.getenv("QWEN_RECORDING_S3_ENDPOINT", "").strip(),
-        bucket=bucket,
-        force_path_style=os.getenv(
-            "QWEN_RECORDING_S3_FORCE_PATH_STYLE", "false"
-        ).strip().lower() in {"1", "true", "yes", "on"},
-    )
+
+    def upload() -> api.S3Upload:
+        return api.S3Upload(
+            access_key=os.getenv("QWEN_RECORDING_S3_ACCESS_KEY", "").strip(),
+            secret=os.getenv("QWEN_RECORDING_S3_SECRET", "").strip(),
+            session_token=os.getenv("QWEN_RECORDING_S3_SESSION_TOKEN", "").strip(),
+            region=region,
+            endpoint=os.getenv("QWEN_RECORDING_S3_ENDPOINT", "").strip(),
+            bucket=bucket,
+            force_path_style=os.getenv(
+                "QWEN_RECORDING_S3_FORCE_PATH_STYLE", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+        )
+
     info = await ctx.api.egress.start_room_composite_egress(
         api.RoomCompositeEgressRequest(
             room_name=ctx.room.name,
             audio_only=True,
             audio_mixing=api.AudioMixing.DUAL_CHANNEL_AGENT,
+            # Egress otherwise defaults MP3 to 44.1 kHz/128 kbps. The PSTN
+            # side is 8 kHz PCMU, so 16 kHz/64 kbps stereo preserves all
+            # telephone-band content without wasteful upsampling.
+            advanced=api.EncodingOptions(
+                audio_codec=api.AudioCodec.AC_MP3,
+                audio_frequency=_configured_int(
+                    "QWEN_RECORDING_AUDIO_FREQUENCY_HZ",
+                    16_000,
+                    allowed={8_000, 16_000, 24_000, 32_000, 44_100, 48_000},
+                ),
+                audio_bitrate=_configured_int(
+                    "QWEN_RECORDING_AUDIO_BITRATE_KBPS",
+                    64,
+                    allowed={32, 48, 64, 96, 128, 160, 192, 256, 320},
+                ),
+            ),
             file_outputs=[
                 api.EncodedFileOutput(
                     file_type=api.EncodedFileType.MP3,
                     filepath=filepath,
-                    s3=upload,
+                    s3=upload(),
                 )
             ],
-        )
+        ),
     )
-    egress_id = str(info.egress_id or "")
-    if not egress_id:
-        raise RuntimeError("LiveKit Egress did not return an egress id")
+    egress_ids = [str(info.egress_id or "")]
+    if not egress_ids[0]:
+        raise RuntimeError("LiveKit RoomCompositeEgress did not return an egress id")
     storage_uri = f"s3://{bucket}/{filepath}"
+    if on_created is not None:
+        on_created(egress_ids, storage_uri)
+    await _wait_for_egress_active(ctx, egress_ids[0])
     await _telephony_record_recording(
         job,
-        egress_id=egress_id,
+        # The durable schema has one provider egress id; use the caller track
+        # as the primary id while the job retains and stops both ids.
+        egress_id=egress_ids[0],
         status="active",
         storage_uri=storage_uri,
     )
-    return egress_id, storage_uri
+    return egress_ids, storage_uri
+
+
+async def _wait_for_egress_active(
+    ctx: JobContext,
+    egress_id: str,
+    *,
+    timeout_seconds: float = 10.0,
+    poll_seconds: float = 0.05,
+) -> None:
+    """Wait for the media pipeline, rather than only the start RPC, to be active."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    terminal = {
+        api.EgressStatus.EGRESS_COMPLETE,
+        api.EgressStatus.EGRESS_FAILED,
+        api.EgressStatus.EGRESS_ABORTED,
+        api.EgressStatus.EGRESS_LIMIT_REACHED,
+    }
+    while True:
+        response = await ctx.api.egress.list_egress(
+            api.ListEgressRequest(egress_id=egress_id)
+        )
+        info = next(
+            (item for item in response.items if str(item.egress_id) == egress_id),
+            None,
+        )
+        if info is not None:
+            if info.status == api.EgressStatus.EGRESS_ACTIVE:
+                return
+            if info.status in terminal:
+                status = api.EgressStatus.Name(int(info.status))
+                raise RuntimeError(f"recording entered terminal state before active: {status}")
+        if loop.time() >= deadline:
+            raise TimeoutError(f"recording did not become active within {timeout_seconds}s")
+        await asyncio.sleep(poll_seconds)
+
+
+async def _wait_for_egress_complete(
+    ctx: JobContext,
+    egress_id: str,
+    *,
+    timeout_seconds: float = 15.0,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        response = await ctx.api.egress.list_egress(
+            api.ListEgressRequest(egress_id=egress_id)
+        )
+        info = next(
+            (item for item in response.items if str(item.egress_id) == egress_id),
+            None,
+        )
+        if info is not None:
+            if info.status == api.EgressStatus.EGRESS_COMPLETE:
+                return
+            if info.status in {
+                api.EgressStatus.EGRESS_FAILED,
+                api.EgressStatus.EGRESS_ABORTED,
+                api.EgressStatus.EGRESS_LIMIT_REACHED,
+            }:
+                status = api.EgressStatus.Name(int(info.status))
+                raise RuntimeError(f"track recording ended unsuccessfully: {status}")
+        if loop.time() >= deadline:
+            raise TimeoutError(f"track recording did not complete within {timeout_seconds}s")
+        await asyncio.sleep(0.05)
+
+
+async def _play_recording_disclosure(session: AgentSession, job: dict[str, Any]) -> None:
+    if str(job.get("recording_mode") or "off") != "always":
+        return
+    disclosure = str(job.get("recording_disclosure_text") or "").strip()
+    if not disclosure:
+        raise RuntimeError("recording disclosure text is missing")
+    notice = session.say(disclosure, allow_interruptions=False)
+    await notice.wait_for_playout()
 
 
 def _telephony_heartbeat_interval(job: dict[str, Any]) -> float:
@@ -1428,10 +1946,12 @@ class PhoneAgent(Agent):
         managed_job: dict[str, Any] | None = None,
         sip_identity: str = "",
         instructions: str | None = None,
+        chat_ctx: llm.ChatContext | None = None,
     ) -> None:
         self._job_ctx = ctx
         self._managed_job = managed_job
         self._sip_identity = sip_identity
+        self._pending_business_event_tasks: set[asyncio.Task[None]] = set()
         super().__init__(
             instructions=(
                 instructions
@@ -1446,11 +1966,24 @@ class PhoneAgent(Agent):
                     "通常不超过三句话，除非用户明确要求详细解释。"
                     ),
                 )
-            ).strip()
+            ).strip(),
+            chat_ctx=chat_ctx,
         )
 
     async def on_enter(self) -> None:
         logger.info("PhoneAgent.on_enter: ready")
+
+    async def wait_for_pending_business_events(self) -> None:
+        pending = [task for task in self._pending_business_event_tasks if not task.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting for %d pending business event(s)",
+                len(pending),
+            )
 
     @function_tool(
         description=(
@@ -1515,7 +2048,11 @@ class PhoneAgent(Agent):
         return "意向标签已保存。" if saved else "意向标签暂时无法保存。"
 
     @function_tool(description="Save a faithful summary before normally completing the call.")
-    async def save_call_result(self, summary: str, intent_label: str = "") -> str:
+    async def save_call_result(
+        self,
+        summary: str,
+        intent_label: str = "",
+    ) -> str:
         if not summary.strip():
             return "通话摘要为空，未保存。"
         saved = await self._record_realtime_business_event(
@@ -1526,6 +2063,36 @@ class PhoneAgent(Agent):
             },
         )
         return "通话结果已保存。" if saved else "通话结果暂时无法保存。"
+
+    @function_tool(
+        description=(
+            "Complete a confirmed WeChat follow-up. Use only after the customer has "
+            "confirmed the WeChat ID. The program immediately plays the fixed notice."
+        )
+    )
+    async def complete_wechat_followup(
+        self,
+        summary: str,
+        intent_label: str = "",
+    ) -> str:
+        if not summary.strip():
+            return "通话摘要为空，未提交。"
+
+        async def persist() -> None:
+            saved = await self._record_realtime_business_event(
+                "call.result",
+                {
+                    "summary": summary.strip()[:4000],
+                    "intent_label": intent_label.strip().upper()[:10],
+                },
+            )
+            if not saved:
+                logger.warning("Confirmed WeChat follow-up result was not persisted")
+
+        task = asyncio.create_task(persist(), name="persist-wechat-call-result")
+        self._pending_business_event_tasks.add(task)
+        task.add_done_callback(self._pending_business_event_tasks.discard)
+        return "微信跟进结果已提交。"
 
     @function_tool(
         description="Record a customer question that isn't covered by the supplied facts or knowledge."
@@ -1540,13 +2107,21 @@ class PhoneAgent(Agent):
 
     @function_tool(
         description=(
-            "End the current call after the final spoken sentence has had time to play. "
-            "Use only for a completed flow or an explicit customer rejection."
+            "Request deterministic call completion. Do not speak a goodbye before or "
+            "after calling this tool; the program plays the fixed goodbye in full."
         )
     )
     async def end_call(self, ctx: RunContext, reason: str) -> str:
+        if voice_pipeline() == REALTIME_PIPELINE:
+            return "结束请求已接收，程序将播放统一结束语。"
         if not self._job_ctx:
             return "当前通话不支持自动挂机。"
+        if _customer_hangup_only(self._managed_job):
+            logger.info(
+                "Ignoring AI end_call for customer-hangup-only outbound call: reason=%s",
+                reason[:200],
+            )
+            return "请说完结束语并等待客户先挂机；不要再次调用 end_call。"
         session = ctx.session
         current_speech = ctx.speech_handle
         next_speech: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -1599,6 +2174,24 @@ server = AgentServer(
     setup_fnc=prewarm_process,
     load_threshold=float(os.getenv("QWEN_AGENT_LOAD_THRESHOLD", "0.95")),
 )
+
+_sip_registration_tasks: set[asyncio.Task[None]] = set()
+
+
+@server.once("worker_started")
+def _start_sip_registration_keeper() -> None:
+    profiles = [
+        item.strip()
+        for item in os.getenv("QWEN_SIP_REGISTRATION_KEEPALIVE_PROFILES", "").split(",")
+        if item.strip()
+    ]
+    for env_prefix in dict.fromkeys(profiles):
+        task = asyncio.create_task(
+            _sip_registration_renewal_loop(env_prefix),
+            name=f"sip-registration-{env_prefix.lower()}",
+        )
+        _sip_registration_tasks.add(task)
+        task.add_done_callback(_sip_registration_tasks.discard)
 
 
 @server.rtc_session(agent_name=os.getenv("QWEN_AGENT_EXPLICIT_NAME", os.getenv("LIVEKIT_AGENT_NAME", "")))
@@ -1742,8 +2335,58 @@ async def entrypoint(ctx: JobContext) -> None:
 
     hangup_task: asyncio.Task[None] | None = None
     current_speech_handle: Any = None
-    recording_egress_id = ""
+    recording_egress_ids: list[str] = []
     recording_storage_uri = ""
+    recording_stop_lock = asyncio.Lock()
+    recording_start_task: asyncio.Task[bool] | None = None
+    sip_disconnect_task: asyncio.Task[None] | None = None
+
+    async def stop_managed_recording(*, request_stop: bool = True) -> None:
+        nonlocal recording_egress_ids
+        async with recording_stop_lock:
+            if not recording_egress_ids:
+                return
+            egress_ids = recording_egress_ids
+            # Clear first so a simultaneous JobContext shutdown cannot issue a
+            # second StopEgress request while this one is in flight.
+            recording_egress_ids = []
+            recording_status = "stopping"
+            try:
+                if request_stop:
+                    await asyncio.gather(
+                        *(
+                            ctx.api.egress.stop_egress(
+                                api.StopEgressRequest(egress_id=egress_id)
+                            )
+                            for egress_id in egress_ids
+                        )
+                    )
+                await asyncio.gather(
+                    *(
+                        _wait_for_egress_complete(ctx, egress_id)
+                        for egress_id in egress_ids
+                    )
+                )
+                recording_status = "completed"
+            except Exception:
+                logger.exception(
+                    "Unable to finalize dual-track recording: egress_ids=%s",
+                    egress_ids,
+                )
+                recording_status = "failed"
+            if managed_job:
+                try:
+                    await _telephony_record_recording(
+                        managed_job,
+                        egress_id=egress_ids[0],
+                        status=recording_status,
+                        storage_uri=recording_storage_uri,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to persist final recording status: call_id=%s",
+                        managed_job["call_id"],
+                    )
 
     def on_dialogue_result(result: dict) -> None:
         nonlocal hangup_task
@@ -1759,6 +2402,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
         if not result.get("should_hangup"):
             return
+        if _customer_hangup_only(managed_job):
+            logger.info(
+                "Ignoring dialogue should_hangup for customer-hangup-only outbound room=%s",
+                ctx.room.name,
+            )
+            return
         if hangup_task and not hangup_task.done():
             logger.info("Dialogue end hangup already scheduled for room=%s", ctx.room.name)
             return
@@ -1770,6 +2419,9 @@ async def entrypoint(ctx: JobContext) -> None:
         hangup_task = asyncio.create_task(hangup_room_after_dialogue_end(ctx.room.name, delay_ms))
 
     realtime_instructions = ""
+    realtime_scene: dict[str, Any] | None = None
+    realtime_scene_task: asyncio.Task[dict[str, Any] | None] | None = None
+    realtime_opening = ""
     if selected_pipeline == CLASSIC_PIPELINE:
         session = AgentSession(
             stt=asr_provider,
@@ -1805,7 +2457,18 @@ async def entrypoint(ctx: JobContext) -> None:
             aec_warmup_duration=1.0,
         )
     else:
-        realtime_scene = await fetch_realtime_scene(scene_id)
+        # Resolve a cold dynamic scene before exposing the Realtime session to
+        # caller audio. The fetch is bounded by QWEN_DIALOGUE_TIMEOUT and avoids
+        # ever playing the default recruitment opening for another scene.
+        realtime_scene, realtime_scene_task = _start_realtime_scene_fetch(scene_id)
+        if realtime_scene is None and realtime_scene_task is not None:
+            realtime_scene = await realtime_scene_task
+            realtime_scene_task = None
+            if realtime_scene is None:
+                raise RuntimeError(
+                    f"Realtime scene {scene_id} could not be loaded; refusing wrong fallback"
+                )
+        realtime_opening = _select_realtime_opening(realtime_scene)
         realtime_instructions = load_realtime_instructions(
             root=ROOT,
             session_id=ctx.room.name,
@@ -1830,6 +2493,195 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     metrics_event_count = 0
+    wechat_close_task: asyncio.Task[None] | None = None
+    wechat_notice_task: asyncio.Task[None] | None = None
+    final_goodbye_task: asyncio.Task[None] | None = None
+    programmatic_turn_tasks: set[asyncio.Task[None]] = set()
+    programmatic_turn_lock = asyncio.Lock()
+    awaiting_wechat_acknowledgement = False
+
+    async def fixed_realtime_audio(text: str, *, label: str) -> bytes:
+        audio = _REALTIME_FIXED_AUDIO.get(text)
+        if audio:
+            return audio
+        logger.warning("%s cache miss; synthesizing before playout", label)
+        qwen_tts = QwenTTS()
+        try:
+            generated, _, _ = await qwen_tts.synthesize_audio_bytes(text)
+            audio = _prepare_wav_for_room_playback(generated)
+            _REALTIME_FIXED_AUDIO[text] = audio
+            return audio
+        finally:
+            await qwen_tts.aclose()
+
+    async def sync_programmatic_assistant_turn(
+        text: str, *, source: str, persist_insights: bool
+    ) -> None:
+        try:
+            async with programmatic_turn_lock:
+                chat_ctx = phone_agent.chat_ctx.copy()
+                chat_ctx.add_message(role="assistant", content=text)
+                await phone_agent.update_chat_ctx(chat_ctx)
+        except Exception:
+            logger.exception("Unable to synchronize programmatic assistant turn")
+        logger.info("Programmatic assistant context synchronized: source=%s", source)
+        if persist_insights and managed_job and insights_session_id:
+            try:
+                await _insights_event(
+                    managed_job,
+                    insights_session_id,
+                    "agent.response",
+                    {"text": text, "source": source},
+                )
+            except Exception:
+                logger.exception("Unable to persist programmatic assistant response")
+
+    def schedule_programmatic_assistant_turn(
+        text: str, *, source: str, persist_insights: bool = True
+    ) -> None:
+        task = asyncio.create_task(
+            sync_programmatic_assistant_turn(
+                text,
+                source=source,
+                persist_insights=persist_insights,
+            ),
+            name=f"sync-{source}",
+        )
+        programmatic_turn_tasks.add(task)
+        task.add_done_callback(programmatic_turn_tasks.discard)
+
+    async def persist_preseeded_assistant_turn(text: str, *, source: str) -> None:
+        logger.info("Programmatic assistant response: source=%s text=%s", source, text)
+        if managed_job and insights_session_id:
+            try:
+                await _insights_event(
+                    managed_job,
+                    insights_session_id,
+                    "agent.response",
+                    {"text": text, "source": source},
+                )
+            except Exception:
+                logger.exception("Unable to persist preseeded assistant response")
+
+    def schedule_preseeded_assistant_turn(text: str, *, source: str) -> None:
+        task = asyncio.create_task(
+            persist_preseeded_assistant_turn(text, source=source),
+            name=f"persist-{source}",
+        )
+        programmatic_turn_tasks.add(task)
+        task.add_done_callback(programmatic_turn_tasks.discard)
+
+    async def play_wechat_added_notice() -> None:
+        nonlocal awaiting_wechat_acknowledgement
+        awaiting_wechat_acknowledgement = True
+        started = perf_counter()
+        try:
+            await session.interrupt(force=True)
+        except Exception:
+            logger.debug("No active model response to interrupt before WeChat notice")
+        audio = await fixed_realtime_audio(
+            WECHAT_ADDED_NOTICE_TEXT,
+            label="Realtime WeChat added notice",
+        )
+        await _play_wav_bytes_direct(
+            ctx.room,
+            audio,
+            label="Realtime WeChat added notice",
+            track_name="realtime-wechat-added-notice",
+            on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                WECHAT_ADDED_NOTICE_TEXT,
+                source="programmatic_wechat_added_notice",
+            ),
+        )
+        # The silence window is measured from the actual end of the notice,
+        # independent of model-context or Insights network latency.
+        _finish_wechat_notice_playout(
+            awaiting_acknowledgement=awaiting_wechat_acknowledgement,
+            start_close_timer=start_wechat_close_timer,
+        )
+        schedule_programmatic_assistant_turn(
+            WECHAT_ADDED_NOTICE_TEXT,
+            source="programmatic_wechat_added_notice",
+            persist_insights=False,
+        )
+        logger.info(
+            "Realtime WeChat added notice completed in %.3fs",
+            perf_counter() - started,
+        )
+
+    async def run_final_goodbye(reason: str, *, interrupt_model: bool) -> None:
+        nonlocal awaiting_wechat_acknowledgement
+        awaiting_wechat_acknowledgement = False
+        if interrupt_model:
+            try:
+                await session.interrupt(force=True)
+            except Exception:
+                logger.debug("No active model response to interrupt before final goodbye")
+        logger.info("Playing final goodbye: %s", reason)
+        audio = await fixed_realtime_audio(
+            FINAL_GOODBYE_TEXT,
+            label="Realtime final goodbye",
+        )
+
+        await _play_wav_bytes_direct(
+            ctx.room,
+            audio,
+            label="Realtime final goodbye",
+            track_name="realtime-final-goodbye",
+            tail_silence_ms=max(
+                0, _env_int("QWEN_AUDIO_REALTIME_PLAYOUT_TAIL_MS", 400)
+            ),
+            on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                FINAL_GOODBYE_TEXT,
+                source="programmatic_final_goodbye",
+            ),
+        )
+        schedule_programmatic_assistant_turn(
+            FINAL_GOODBYE_TEXT,
+            source="programmatic_final_goodbye",
+            persist_insights=False,
+        )
+        if not _customer_hangup_only(managed_job):
+            ctx.shutdown(reason=f"realtime programmatic goodbye completed: {reason}")
+
+    async def play_final_goodbye(reason: str, *, interrupt_model: bool) -> None:
+        nonlocal final_goodbye_task
+        final_goodbye_task = _start_single_flight_task(
+            final_goodbye_task,
+            lambda: run_final_goodbye(reason, interrupt_model=interrupt_model),
+            name="realtime-final-goodbye",
+        )
+        await asyncio.shield(final_goodbye_task)
+
+    async def close_wechat_followup_after_silence() -> None:
+        timeout_seconds = _configured_float(
+            "QWEN_REALTIME_WECHAT_CLOSE_TIMEOUT_SECONDS",
+            3.0,
+            minimum=1.0,
+            maximum=10.0,
+        )
+        await asyncio.sleep(timeout_seconds)
+        await play_final_goodbye(
+            f"wechat follow-up received no reply for {timeout_seconds:.1f}s",
+            interrupt_model=False,
+        )
+
+    def cancel_wechat_close_timer(reason: str, *, clear_waiting: bool = False) -> None:
+        nonlocal awaiting_wechat_acknowledgement, wechat_close_task
+        if wechat_close_task and not wechat_close_task.done():
+            logger.info("Wechat follow-up close timer cancelled: %s", reason)
+            wechat_close_task.cancel()
+        wechat_close_task = None
+        if clear_waiting:
+            awaiting_wechat_acknowledgement = False
+
+    def start_wechat_close_timer() -> None:
+        nonlocal wechat_close_task
+        cancel_wechat_close_timer("timer restarted")
+        wechat_close_task = asyncio.create_task(
+            close_wechat_followup_after_silence(),
+            name="realtime-wechat-close-timeout",
+        )
 
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
@@ -1857,14 +2709,99 @@ async def entrypoint(ctx: JobContext) -> None:
         nonlocal current_speech_handle
         current_speech_handle = ev.speech_handle
 
+    @session.on("function_tools_executed")
+    def _on_function_tools_executed(ev) -> None:
+        nonlocal wechat_notice_task
+        if selected_pipeline != REALTIME_PIPELINE:
+            return
+        programmatic_tools = _cancel_tool_reply_for_programmatic_audio(ev)
+        if not programmatic_tools:
+            return
+
+        action = _programmatic_audio_action(programmatic_tools)
+        if action == "wechat_notice":
+            if "end_call" in programmatic_tools:
+                logger.warning(
+                    "Deferring batched end_call until after confirmed WeChat follow-up"
+                )
+            wechat_notice_task = _start_single_flight_task(
+                wechat_notice_task,
+                play_wechat_added_notice,
+                name="realtime-wechat-added-notice",
+            )
+            return
+
+        if action == "final_goodbye":
+            reason = "normal flow completed"
+            for call in getattr(ev, "function_calls", []):
+                if str(getattr(call, "name", "")) != "end_call":
+                    continue
+                try:
+                    arguments = json.loads(str(getattr(call, "arguments", "") or "{}"))
+                except json.JSONDecodeError:
+                    arguments = {}
+                if isinstance(arguments, dict) and str(arguments.get("reason") or "").strip():
+                    reason = str(arguments["reason"]).strip()[:200]
+                break
+            asyncio.create_task(
+                play_final_goodbye(reason, interrupt_model=True),
+                name="realtime-end-call-goodbye",
+            )
+            return
+
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev) -> None:
+        state = str(getattr(ev, "new_state", ""))
+        if state == "speaking" and awaiting_wechat_acknowledgement:
+            cancel_wechat_close_timer("customer started speaking")
+        elif (
+            state == "listening"
+            and awaiting_wechat_acknowledgement
+            and (wechat_close_task is None or wechat_close_task.done())
+        ):
+            start_wechat_close_timer()
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(ev) -> None:
-        if not managed_job or not insights_session_id:
-            return
+        nonlocal awaiting_wechat_acknowledgement, wechat_close_task
         item = getattr(ev, "item", None)
         role = str(getattr(item, "role", ""))
         text = str(getattr(item, "text_content", "") or "").strip()
         if role not in {"user", "assistant"} or not text:
+            return
+
+        if selected_pipeline == REALTIME_PIPELINE:
+            if role == "user" and awaiting_wechat_acknowledgement:
+                cancel_wechat_close_timer("customer replied")
+                awaiting_wechat_acknowledgement = False
+                if _is_short_wechat_acknowledgement(text):
+                    async def goodbye_after_wechat_notice() -> None:
+                        try:
+                            await session.interrupt(force=True)
+                        except Exception:
+                            logger.debug(
+                                "No active model response to interrupt after WeChat acknowledgement"
+                            )
+                        if wechat_notice_task and not wechat_notice_task.done():
+                            await asyncio.shield(wechat_notice_task)
+                        await play_final_goodbye(
+                            "customer acknowledged the WeChat request",
+                            interrupt_model=False,
+                        )
+
+                    wechat_close_task = asyncio.create_task(
+                        goodbye_after_wechat_notice(),
+                        name="realtime-wechat-ack-goodbye",
+                    )
+            elif role == "assistant" and _is_wechat_added_notice(text):
+                # Transcript creation does not prove that remote SIP playout
+                # completed. Only complete_wechat_followup may enter the timed
+                # closing state; its handler interrupts and replays fixed audio.
+                logger.warning(
+                    "Model emitted reserved WeChat notice; awaiting deterministic tool path"
+                )
+
+        if not managed_job or not insights_session_id:
             return
         event_type = "user.transcript" if role == "user" else "agent.response"
         item_id = str(getattr(item, "id", "") or "")
@@ -1881,6 +2818,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 logger.exception("Unable to persist conversation item")
 
         asyncio.create_task(persist_conversation_item())
+
+    async def cancel_wechat_timer_on_shutdown(_reason: str = "") -> None:
+        cancel_wechat_close_timer("session shutdown", clear_waiting=True)
+        await _cancel_task(wechat_notice_task)
+
+    shutdown_finalizers.append(cancel_wechat_timer_on_shutdown)
 
     async def log_usage(_reason: str = "") -> None:
         logger.info("Usage: %s", session.usage)
@@ -1928,39 +2871,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     if managed_job:
         async def finalize_telephony_call(reason: str) -> None:
-            nonlocal telephony_terminal, recording_egress_id
+            nonlocal telephony_terminal
             await _cancel_task(heartbeat_task)
-            if recording_egress_id:
-                recording_status = "stopping"
-                try:
-                    stopped = await ctx.api.egress.stop_egress(
-                        api.StopEgressRequest(egress_id=recording_egress_id)
-                    )
-                    provider_status = api.EgressStatus.Name(int(stopped.status))
-                    recording_status = {
-                        "EGRESS_COMPLETE": "completed",
-                        "EGRESS_FAILED": "failed",
-                        "EGRESS_ABORTED": "failed",
-                        "EGRESS_LIMIT_REACHED": "failed",
-                    }.get(provider_status, "stopping")
-                except Exception:
-                    logger.exception(
-                        "Recording stop result is uncertain; awaiting Egress webhook: egress_id=%s",
-                        recording_egress_id,
-                    )
-                try:
-                    await _telephony_record_recording(
-                        managed_job,
-                        egress_id=recording_egress_id,
-                        status=recording_status,
-                        storage_uri=recording_storage_uri,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Unable to persist final recording status: call_id=%s",
-                        managed_job["call_id"],
-                    )
-                recording_egress_id = ""
+            await stop_managed_recording()
             if telephony_terminal:
                 return
             try:
@@ -1996,22 +2909,142 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(finalize_job)
 
-    await session.start(
-        agent=PhoneAgent(
-            ctx=ctx,
-            managed_job=managed_job,
-            sip_identity=managed_sip_identity,
-            instructions=realtime_instructions or None,
-        ),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
-            audio_output=room_io.AudioOutputOptions(
-                sample_rate=ROOM_AUDIO_SAMPLE_RATE,
-                num_channels=QwenTTS.num_channels_count,
+    initial_chat_ctx: llm.ChatContext | None = None
+    if selected_pipeline == REALTIME_PIPELINE:
+        # Seed the exact opening before Realtime starts accepting caller audio.
+        # The fixed audio is media transport only; Qwen needs the corresponding
+        # assistant turn, not a copy of the WAV bytes.
+        initial_chat_ctx = llm.ChatContext.empty()
+        initial_chat_ctx.add_message(role="assistant", content=realtime_opening)
+
+    phone_agent = PhoneAgent(
+        ctx=ctx,
+        managed_job=managed_job,
+        sip_identity=managed_sip_identity,
+        instructions=realtime_instructions or None,
+        chat_ctx=initial_chat_ctx,
+    )
+
+    async def flush_pending_business_events(_reason: str = "") -> None:
+        await phone_agent.wait_for_pending_business_events()
+
+    shutdown_finalizers.append(flush_pending_business_events)
+
+    async def flush_programmatic_turns(_reason: str = "") -> None:
+        pending = [task for task in programmatic_turn_tasks if not task.done()]
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting for %d programmatic assistant event(s)",
+                len(pending),
+            )
+
+    shutdown_finalizers.append(flush_programmatic_turns)
+    session_start_task = asyncio.create_task(
+        session.start(
+            agent=phone_agent,
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(),
+                audio_output=room_io.AudioOutputOptions(
+                    sample_rate=ROOM_AUDIO_SAMPLE_RATE,
+                    num_channels=QwenTTS.num_channels_count,
+                ),
             ),
         ),
+        name="agent-session-start",
     )
+
+    early_realtime_opening_task: asyncio.Task[str | None] | None = None
+    if selected_pipeline == REALTIME_PIPELINE and not managed_job:
+        async def play_opening_while_realtime_connects() -> str | None:
+            try:
+                # session.start connects the same JobContext. This idempotent
+                # call waits only for the room connection, while the Realtime
+                # WebSocket continues warming in session_start_task.
+                await ctx.connect()
+                await _wait_for_active_sip_participant(
+                    ctx.room,
+                    timeout=_configured_float(
+                        "QWEN_SIP_OPENING_WAIT_SECONDS",
+                        45.0,
+                        minimum=1.0,
+                        maximum=120.0,
+                    ),
+                )
+                opening_text = realtime_opening
+                audio = await fixed_realtime_audio(
+                    opening_text,
+                    label="Realtime opening",
+                )
+                await _play_wav_bytes_direct(
+                    ctx.room,
+                    audio,
+                    label="Realtime opening",
+                    track_name="realtime-opening",
+                    on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                        opening_text,
+                        source="programmatic_opening_during_realtime_warmup",
+                    ),
+                )
+                return opening_text
+            except Exception:
+                logger.exception(
+                    "Unable to play opening while Realtime connects; using normal fallback"
+                )
+                return None
+
+        early_realtime_opening_task = asyncio.create_task(
+            play_opening_while_realtime_connects(),
+            name="realtime-opening-during-session-start",
+        )
+
+    try:
+        await session_start_task
+    except Exception:
+        await _cancel_task(early_realtime_opening_task)
+        raise
+
+    realtime_scene_apply_task: asyncio.Task[None] | None = None
+    if selected_pipeline == REALTIME_PIPELINE and realtime_scene_task is not None:
+        async def apply_realtime_scene_when_ready() -> None:
+            scene = await realtime_scene_task
+            if not scene:
+                return
+            updated_instructions = load_realtime_instructions(
+                root=ROOT,
+                session_id=ctx.room.name,
+                scene_id=scene_id,
+                customer_name=str((managed_job or {}).get("customer_name") or ""),
+                customer_company=str((managed_job or {}).get("customer_company") or ""),
+                customer_phone=str(
+                    (managed_job or {}).get("phone_number")
+                    or (managed_job or {}).get("source_number")
+                    or ""
+                ),
+                customer_profile=str((managed_job or {}).get("customer_profile") or ""),
+                scene=scene,
+            )
+            await phone_agent.update_instructions(updated_instructions)
+            logger.info(
+                "Realtime scene applied without blocking opening: scene=%s",
+                scene_id,
+            )
+
+        realtime_scene_apply_task = asyncio.create_task(
+            apply_realtime_scene_when_ready(),
+            name=f"realtime-scene-apply-{scene_id}",
+        )
+
+        async def cancel_realtime_scene_apply(_reason: str = "") -> None:
+            await _cancel_task(realtime_scene_apply_task)
+
+        shutdown_finalizers.append(cancel_realtime_scene_apply)
 
     if managed_job and insights_session_id:
         console_task = asyncio.create_task(
@@ -2024,15 +3057,62 @@ async def entrypoint(ctx: JobContext) -> None:
             )
         )
 
+    async def handle_sip_disconnect() -> None:
+        """Release the room first, then finalize recordings and durable state."""
+
+        try:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+            logger.info(
+                "Released room immediately after customer disconnect: call_id=%s room=%s",
+                str((managed_job or {}).get("call_id") or ""),
+                ctx.room.name,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to delete room after customer disconnect: room=%s",
+                ctx.room.name,
+            )
+        # Deleting the room causes RoomCompositeEgress to finish. Do not issue
+        # a redundant StopEgress RPC; only wait for completion.
+        await stop_managed_recording(request_stop=False)
+        await session.aclose()
+        ctx.shutdown(reason="customer sip participant disconnected")
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+        nonlocal sip_disconnect_task
+        if participant.identity != managed_sip_identity or telephony_terminal:
+            return
+        if sip_disconnect_task is not None and not sip_disconnect_task.done():
+            return
+        logger.info(
+            "Customer SIP participant disconnected; releasing room immediately: "
+            "call_id=%s identity=%s",
+            str((managed_job or {}).get("call_id") or ""),
+            participant.identity,
+        )
+        sip_disconnect_task = asyncio.create_task(handle_sip_disconnect())
+
     async def ensure_required_recording() -> bool:
-        nonlocal recording_egress_id, recording_storage_uri, telephony_terminal
+        nonlocal recording_egress_ids, recording_storage_uri
+        nonlocal telephony_terminal
         if not managed_job or str(managed_job.get("recording_mode") or "off") != "always":
             return True
-        if recording_egress_id:
+        if recording_egress_ids:
             return True
         try:
-            recording_egress_id, recording_storage_uri = await _start_managed_recording(
-                ctx, session, managed_job
+            def capture_created_egress(
+                egress_ids: list[str],
+                storage_uri: str,
+            ) -> None:
+                nonlocal recording_egress_ids, recording_storage_uri
+                recording_egress_ids = egress_ids
+                recording_storage_uri = storage_uri
+
+            await _start_managed_recording(
+                ctx,
+                managed_job,
+                on_created=capture_created_egress,
             )
             return True
         except Exception as exc:
@@ -2072,6 +3152,27 @@ async def entrypoint(ctx: JobContext) -> None:
             )
             heartbeat_task = asyncio.create_task(_telephony_heartbeat(outbound_job))
 
+            registration = await asyncio.to_thread(
+                register_from_env,
+                _provider_registration_env_prefix(
+                    str(outbound_job.get("trunk_provider") or "")
+                ),
+            )
+            if registration is not None:
+                logger.info(
+                    "SIP registration completed before outbound dial: "
+                    "call_id=%s status=%s realm=%s expires=%s",
+                    outbound_job["call_id"],
+                    registration.status_code,
+                    registration.realm,
+                    registration.expires,
+                )
+
+            # Start Chrome RoomComposite before dialing.  The mandatory
+            # recording must be active before disclosure and business audio.
+            if str(outbound_job.get("recording_mode") or "off") == "always":
+                recording_start_task = asyncio.create_task(ensure_required_recording())
+
             async def dial_and_activate() -> None:
                 nonlocal call_active, outbound_call_answered
                 participant = await ctx.api.sip.create_sip_participant(
@@ -2079,7 +3180,8 @@ async def entrypoint(ctx: JobContext) -> None:
                         room_name=ctx.room.name,
                         sip_trunk_id=str(outbound_job["livekit_trunk_id"]),
                         sip_call_to=_provider_dial_target(
-                            str(outbound_job["phone_number"])
+                            str(outbound_job["phone_number"]),
+                            str(outbound_job.get("trunk_provider") or ""),
                         ),
                         sip_number=str(outbound_job.get("source_number") or ""),
                         participant_identity=managed_sip_identity,
@@ -2100,6 +3202,10 @@ async def entrypoint(ctx: JobContext) -> None:
                             minimum=60,
                             maximum=14400,
                         ),
+                        # PCMU sends a continuous RTP packet clock, including
+                        # silence. If that clock disappears, release the call
+                        # promptly; a real SIP BYE still disconnects immediately.
+                        media=_outbound_sip_media_config(),
                     )
                 )
                 await ctx.wait_for_participant(identity=managed_sip_identity)
@@ -2160,8 +3266,14 @@ async def entrypoint(ctx: JobContext) -> None:
                     amd_category,
                 )
             if amd_category == "machine-vm":
-                if not await ensure_required_recording():
+                recording_ready = (
+                    await recording_start_task
+                    if recording_start_task is not None
+                    else await ensure_required_recording()
+                )
+                if not recording_ready:
                     return
+                await _play_recording_disclosure(session, outbound_job)
                 voicemail = os.getenv(
                     "QWEN_AMD_VOICEMAIL_MESSAGE",
                     "您好，这里是智能语音服务。稍后我们会再次联系您，谢谢。",
@@ -2187,6 +3299,23 @@ async def entrypoint(ctx: JobContext) -> None:
                 await _cancel_task(heartbeat_task)
                 ctx.shutdown(reason="amd:machine-unavailable")
                 return
+        except SIPRegistrationError as exc:
+            logger.error(
+                "SIP registration failed before outbound dial: call_id=%s error=%s",
+                outbound_job["call_id"],
+                exc,
+            )
+            await _telephony_transition(
+                outbound_job,
+                "failed",
+                failure_code="sip_registration_failed",
+                failure_detail=str(exc)[:500],
+                retryable=True,
+            )
+            telephony_terminal = True
+            await _cancel_task(heartbeat_task)
+            ctx.shutdown(reason="outbound SIP registration failed")
+            return
         except api.SipCallError as exc:
             status, code, retryable = _sip_failure(exc)
             await _telephony_transition(
@@ -2234,8 +3363,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 ctx.shutdown(reason="outbound call setup failed")
                 return
 
-    if not await ensure_required_recording():
+    recording_ready = (
+        await recording_start_task
+        if recording_start_task is not None
+        else await ensure_required_recording()
+    )
+    if not recording_ready:
         return
+
+    if managed_job:
+        await _play_recording_disclosure(session, managed_job)
 
     if selected_pipeline == CLASSIC_PIPELINE:
         # Warm the classic LLM concurrently with the welcome message so the
@@ -2257,17 +3394,44 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             await play_greeting_audio_direct(ctx.room)
     else:
-        # In Realtime mode the model owns both generation and speech. Trigger
-        # the start node only after the SIP participant is ready/recording is
-        # active, so the caller cannot miss the opening sentence.
-        speech = session.generate_reply(
-            instructions=(
-                "现在开始通话。严格只播报系统指令中定义的开场白，"
-                "不要解释规则，不要提前进入下一节点。"
-            ),
-            allow_interruptions=True,
+        # In direct/manual calls the fixed opening may already have played on
+        # an independent track while session.start warmed Qwen. Once the
+        # Realtime session is ready, synchronize only the assistant text.
+        early_opening_text = (
+            await early_realtime_opening_task
+            if early_realtime_opening_task is not None
+            else None
         )
-        await speech.wait_for_playout()
+        if early_opening_text:
+            logger.info(
+                "realtime_opening_playout_completed context_preseeded=true "
+                "mode=parallel text=%s",
+                early_opening_text,
+            )
+        else:
+            # The opening text is already in Qwen's initial context. Play only
+            # deterministic media, avoiding a second generated/duplicated turn.
+            started = perf_counter()
+            opening_audio = await fixed_realtime_audio(
+                realtime_opening,
+                label="Realtime opening",
+            )
+            await _play_wav_bytes_direct(
+                ctx.room,
+                opening_audio,
+                label="Realtime opening",
+                track_name="realtime-opening",
+                on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                    realtime_opening,
+                    source="programmatic_opening_after_realtime_warmup",
+                ),
+            )
+            logger.info(
+                "realtime_opening_playout_completed context_preseeded=true "
+                "mode=post_start elapsed=%.3fs text=%s",
+                perf_counter() - started,
+                realtime_opening,
+            )
 
 
 if __name__ == "__main__":

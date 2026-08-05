@@ -83,12 +83,120 @@ QWEN_TTS_VOICE=Cherry
 QWEN_TURN_DETECTION_MODE=multilingual
 QWEN_ENDPOINTING_MODE=dynamic
 
-SIP_PORT=5066
+SIP_PORT=5065
 SIP_RTP_PORT_RANGE=10000-10100
 SIP_INBOUND_NUMBER=1000
 ```
 
 如果 Windows 局域网 IP 变化，且 SIP/RTP 出现不可达问题，请更新 `LIVEKIT_NODE_IP` 后重启基础设施。
+
+### 默认外呼线路：青川云非注册中继
+
+青川云是当前默认外呼线路，青山云仅作为备用线路。以下配置已在真实手机通话中
+验证：成功协商 `PCMU/8000`，连续下行 RTP 超过 218 秒，没有原线路约 95 秒的
+固定断流现象。
+
+当前默认线路的非敏感参数如下：
+
+```env
+# LiveKit SIP 对外公布的公网信令/媒体地址，不能使用 127.0.0.1。
+LIVEKIT_NODE_IP=120.55.185.55
+DEV_SIP_ADVERTISED_IP=120.55.185.55
+SIP_PORT=5065
+SIP_RTP_PORT_RANGE=10000-10100
+
+# 青川云是 IP 白名单非注册中继；E.164 的 +86 在发送 INVITE 前移除。
+QWEN_SIP_DIAL_PREFIX=
+QWEN_SIP_STRIP_COUNTRY_CODE=86
+QWEN_SIP_REGISTER_ENABLED=false
+QWEN_SIP_REGISTER_HOST=160.202.254.71
+QWEN_SIP_REGISTER_PORT=5060
+QWEN_SIP_REGISTER_USERNAME=83450325
+QWEN_SIP_REGISTER_AUTH_USERNAME=83450325
+QWEN_SIP_REGISTER_DOMAIN=160.202.254.71
+QWEN_SIP_REGISTER_CONTACT_HOST=120.55.185.55
+QWEN_SIP_REGISTER_CONTACT_PORT=5065
+QWEN_SIP_REGISTRATION_KEEPALIVE_PROFILES=
+```
+
+密码属于 Secret，只写入仓库根目录 `.env`，不要提交到 Git 或复制到本文：
+
+```env
+QWEN_SIP_QINGCHUANYUN_AUTH_PASSWORD=your_sip_password
+```
+
+LiveKit outbound trunk 应与注册配置一致：
+
+```text
+name: qingchuanyun-83450325-outbound
+address: 160.202.254.71:5060
+transport: UDP
+number / auth username: 83450325
+from host: cc.qingchuanyun.cn
+advertised signaling address: 120.55.185.55:5065
+media codecs: PCMU/8000
+```
+
+### 青川云外呼拨号方式
+
+2026-08-05 的真实外呼日志已确认，青川云线路发送 INVITE 时必须把线路账号和
+被叫号码分别传递，不能把两者拼接成一个号码：
+
+```text
+LiveKit SIP trunk ID: ST_Dg6YGoNir6S5
+sip_number / From user: 83450325
+sip_call_to / Request-URI user / To user: 11 位手机号码
+codec: PCMU/8000
+```
+
+例如拨打 `18911129833`：
+
+```python
+participant = await lk.sip.create_sip_participant(
+    api.CreateSIPParticipantRequest(
+        room_name=room_name,
+        sip_trunk_id="ST_Dg6YGoNir6S5",
+        sip_number="83450325",
+        sip_call_to="18911129833",
+        participant_identity="callee",
+        wait_until_answered=True,
+        media=api.SIPMediaConfig(
+            codecs=[api.SIPCodec(name="PCMU", rate=8000)],
+            only_listed_codecs=True,
+        ),
+    )
+)
+```
+
+号码规范化规则：输入为 `+86` 或 `86` 开头的中国大陆手机号时，先去掉国家码，
+最终发送 11 位手机号。正确格式是 `sip_call_to="18911129833"`；不要使用
+`83450325+18911129833`、`8345032518911129833` 或 `+8618911129833`。成功日志中的
+实际 SIP 字段为 `fromUser=83450325`、`toUser=reqUser=18911129833`。
+
+控制面默认使用 `qingchuanyun-83450325`（trunk ID
+`8d004bd7-09dd-4937-a09c-c0c98d846de2`），对应 LiveKit trunk
+`ST_Dg6YGoNir6S5`。旧青川云 trunk 已禁用；青山云 trunk 保持启用，仅用于人工选择
+或故障切换。
+
+该地址会响应 SIP OPTIONS，但不会响应 REGISTER，因此青川云不能加入
+`QWEN_SIP_REGISTRATION_KEEPALIVE_PROFILES`。Agent 直接通过 LiveKit outbound trunk
+发送 INVITE；若服务器要求 Digest，LiveKit 使用 trunk 中保存的账号和 Secret 完成鉴权。
+青山云备用线路使用独立的 carrier-specific REGISTER profile，不受此配置影响。
+
+正式通话必须把 UDP/TCP `5065` 和 UDP `10000-10100` 映射到本机，并确保云防火墙
+仅对所需运营商地址放行。外发 INVITE 的 Via、Contact 和公网源端口必须统一为
+`120.55.185.55:5065`；只做 `5065:5066` 端口映射不能保证外发源端口正确。
+修改 `DEV_SIP_ADVERTISED_IP` 后需要重建 LiveKit SIP 容器：
+
+```bash
+docker compose --env-file qwen-telephony/config/dev.env \
+  -f docker-compose.dev.yml up -d --no-deps --force-recreate livekit-sip
+```
+
+拨通后不要立即删除 LiveKit room。`CreateSIPParticipant(wait_until_answered=true)` 返回
+表示电话已经接通，而不是通话已经结束；room 必须一直保留到对端挂机、Agent 请求结束
+或达到最大通话时长。调用 `DeleteRoom` 会让 LiveKit SIP 立即发送 BYE，日志中表现为
+`reason: ROOM_DELETED`。
 
 ## 安装依赖
 
@@ -167,7 +275,7 @@ wsl -d Ubuntu -- bash -lc "cd /mnt/f/ai-login-replica/agent && qwen-telephony/sc
 ```text
 System healthy
 LiveKit: ws://127.0.0.1:7880
-SIP: sip:1000@127.0.0.1:5066
+SIP: sip:1000@127.0.0.1:5065
 ```
 
 ## 启动运营台
@@ -252,20 +360,20 @@ wsl -d Ubuntu -- bash -lc "cd /mnt/f/ai-login-replica/agent && tail -n 120 qwen-
 
 ```powershell
 cd F:\ai-login-replica\agent
-Start-Process .\tools\microsip\MicroSIP.exe -ArgumentList "sip:1000@127.0.0.1:5066"
+Start-Process .\tools\microsip\MicroSIP.exe -ArgumentList "sip:1000@127.0.0.1:5065"
 ```
 
 也可以打开 MicroSIP 后手动拨：
 
 ```text
-sip:1000@127.0.0.1:5066
+sip:1000@127.0.0.1:5065
 ```
 
 MicroSIP 要点：
 
 - 使用 Local Account。
 - 不需要 SIP 注册账号。
-- 服务端 SIP 端口是 `5066`。
+- 服务端 SIP 端口是 `5065`。
 - MicroSIP 的 `Source Port=5062`、`RTP Ports=20000-20020` 可保持默认。
 - 媒体编码建议启用 `G.711 A-law` 和 `G.711 u-law`。
 
@@ -307,7 +415,7 @@ POST /api/calls/{call_id}/simulate
 3. 点击“模拟挂断”，状态进入 `completed`，统计数据会随刷新更新。
 4. 也可以点击“无人接听”或“忙线”，验证失败分支和统计。
 
-该模拟只覆盖运营台业务流程和状态机，不产生真实 SIP 信令或 RTP 音频。真实语音链路仍需 MicroSIP 拨入 `sip:1000@127.0.0.1:5066`，或配置 outbound SIP trunk 后由 `/api/calls/{call_id}/dial` 发起真实外呼。
+该模拟只覆盖运营台业务流程和状态机，不产生真实 SIP 信令或 RTP 音频。真实语音链路仍需 MicroSIP 拨入 `sip:1000@127.0.0.1:5065`，或配置 outbound SIP trunk 后由 `/api/calls/{call_id}/dial` 发起真实外呼。
 
 ## 停止服务
 

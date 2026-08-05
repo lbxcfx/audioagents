@@ -446,7 +446,7 @@ async function runMicroSipTest() {
   if (!state.activeScene?.id) return;
   const testResult = await api(`/api/dialogue/scenes/${state.activeScene.id}/microsip-test`, {
     method: "POST",
-    body: JSON.stringify({ phone: "1000@127.0.0.1:5066", visible: true }),
+    body: JSON.stringify({ phone: "1000@127.0.0.1:5065", visible: true }),
   });
   showToast(testResult.started ? "MicroSIP 测试呼叫已发起" : "MicroSIP 环境未就绪");
   $("#trainingResult").textContent = JSON.stringify(testResult, null, 2);

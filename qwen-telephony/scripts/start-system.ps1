@@ -312,7 +312,7 @@ Start-Agent
 Start-MicroSIP
 
 $sipNumber = Env-OrDefault "SIP_INBOUND_NUMBER" "1000"
-$sipPort = Env-OrDefault "SIP_PORT" "5066"
+$sipPort = Env-OrDefault "SIP_PORT" "5065"
 Write-Step "System ready"
 Write-Host "Ops UI:     http://127.0.0.1:8091/"
 Write-Host "LiveKit:    $(Env-OrDefault 'LIVEKIT_URL' 'ws://127.0.0.1:7880')"

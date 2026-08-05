@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from importlib.metadata import version
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import wave
 
 import pytest
 from livekit.agents.inference_runner import _InferenceRunner
@@ -115,14 +117,359 @@ def test_silero_vad_is_prewarmed_once_per_job_process(monkeypatch) -> None:
     async def greeting_cache() -> None:
         await asyncio.sleep(0)
 
+    async def realtime_fixed_cache() -> None:
+        await asyncio.sleep(0)
+
     monkeypatch.setattr(phone_agent, "_build_session_vad", build_vad)
     monkeypatch.setattr(phone_agent, "ensure_greeting_audio_cache", greeting_cache)
+    monkeypatch.setattr(
+        phone_agent,
+        "ensure_realtime_fixed_audio_cache",
+        realtime_fixed_cache,
+    )
     process = SimpleNamespace(userdata={})
 
     phone_agent.prewarm_process(process)
 
     assert process.userdata["vad"] is vad
     assert calls == 1
+
+
+def test_realtime_opening_selection_uses_default_variants_and_scene_entry(
+    monkeypatch,
+) -> None:
+    selected = phone_agent.DEFAULT_REALTIME_OPENINGS[2]
+    monkeypatch.setattr(phone_agent.secrets, "choice", lambda _items: selected)
+    assert phone_agent._select_realtime_opening(None) == selected
+    assert phone_agent._select_realtime_opening(
+        {
+            "flow": {
+                "entry_node": "rider_opening",
+                "nodes": [{"id": "rider_opening", "text": "前端默认骑手开场"}],
+            }
+        }
+    ) == selected
+
+    scene = {
+        "flow": {
+            "entry_node": "welcome",
+            "nodes": [
+                {"id": "other", "text": "不是入口"},
+                {"id": "welcome", "text": "您好，这是动态开场。"},
+            ],
+        }
+    }
+    assert phone_agent._select_realtime_opening(scene) == "您好，这是动态开场。"
+
+
+def test_realtime_scene_fetch_is_started_without_blocking_opening(monkeypatch) -> None:
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def slow_fetch(_scene_id: int):
+            await release.wait()
+            return {"name": "late scene"}
+
+        monkeypatch.setattr(phone_agent, "fetch_realtime_scene", slow_fetch)
+        phone_agent._REALTIME_SCENE_CACHE.pop(987654, None)
+
+        scene, task = phone_agent._start_realtime_scene_fetch(987654)
+
+        assert scene is None
+        assert task is not None
+        assert not task.done()
+        release.set()
+        assert await task == {"name": "late scene"}
+
+    asyncio.run(run())
+
+
+def test_wait_for_active_sip_participant_ignores_ringing_until_active() -> None:
+    async def run() -> None:
+        participant = SimpleNamespace(
+            kind=phone_agent.rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+            attributes={"sip.callStatus": "ringing"},
+        )
+        room = SimpleNamespace(remote_participants={"callee": participant})
+
+        async def activate() -> None:
+            await asyncio.sleep(0.03)
+            participant.attributes["sip.callStatus"] = "active"
+
+        activation = asyncio.create_task(activate())
+        selected = await phone_agent._wait_for_active_sip_participant(
+            room,
+            timeout=0.2,
+        )
+        await activation
+        assert selected is participant
+
+    asyncio.run(run())
+
+
+def test_complete_wechat_followup_returns_before_persistence_finishes(monkeypatch) -> None:
+    async def run() -> None:
+        agent = phone_agent.PhoneAgent()
+        persist_started = asyncio.Event()
+        release_persist = asyncio.Event()
+
+        async def slow_record(_event_type, _payload) -> bool:
+            persist_started.set()
+            await release_persist.wait()
+            return True
+
+        monkeypatch.setattr(agent, "_record_realtime_business_event", slow_record)
+        result = await phone_agent.PhoneAgent.complete_wechat_followup.__wrapped__(
+            agent,
+            summary="微信已确认",
+        )
+
+        assert result == "微信跟进结果已提交。"
+        await asyncio.wait_for(persist_started.wait(), timeout=0.1)
+        assert any(not task.done() for task in agent._pending_business_event_tasks)
+        release_persist.set()
+        await agent.wait_for_pending_business_events()
+
+    asyncio.run(run())
+
+
+def test_realtime_end_call_defers_goodbye_to_programmatic_handler(monkeypatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(phone_agent, "voice_pipeline", lambda: phone_agent.REALTIME_PIPELINE)
+        agent = phone_agent.PhoneAgent()
+        result = await phone_agent.PhoneAgent.end_call.__wrapped__(
+            agent,
+            SimpleNamespace(),
+            reason="normal completion",
+        )
+        assert result == "结束请求已接收，程序将播放统一结束语。"
+
+    asyncio.run(run())
+
+
+def test_phone_agent_accepts_preseeded_opening_context() -> None:
+    opening = "您好，这是已经播放的开场。"
+    chat_ctx = phone_agent.llm.ChatContext.empty()
+    chat_ctx.add_message(role="assistant", content=opening)
+
+    agent = phone_agent.PhoneAgent(chat_ctx=chat_ctx)
+
+    assert len(agent.chat_ctx.items) == 1
+    assert opening in str(agent.chat_ctx.items[0].content)
+
+
+def test_outbound_agent_hangup_is_default(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", raising=False)
+    assert not phone_agent._customer_hangup_only({"direction": "outbound"})
+    monkeypatch.setenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", "true")
+    assert phone_agent._customer_hangup_only({"direction": "outbound"})
+
+
+def test_wechat_added_notice_matches_spoken_punctuation_variants() -> None:
+    assert phone_agent._is_wechat_added_notice(
+        "好的，已经加您了，请您通过一下。"
+    )
+    assert phone_agent._is_wechat_added_notice("已经加您了 请您通过")
+    assert not phone_agent._is_wechat_added_notice("好的，已记下您的微信。")
+
+
+@pytest.mark.parametrize("text", ["好的。", "嗯，好的", "行", "知道了", "我会通过"])
+def test_short_wechat_acknowledgement_is_detected(text: str) -> None:
+    assert phone_agent._is_short_wechat_acknowledgement(text)
+
+
+@pytest.mark.parametrize("text", ["好的，我还有个问题", "不用了", "微信怎么加"])
+def test_wechat_questions_are_not_treated_as_closing_acknowledgements(
+    text: str,
+) -> None:
+    assert not phone_agent._is_short_wechat_acknowledgement(text)
+
+
+def test_only_dedicated_tool_requests_programmatic_wechat_notice() -> None:
+    assert phone_agent._function_call_requests_wechat_notice(
+        SimpleNamespace(
+            name="complete_wechat_followup",
+            arguments='{"summary":"confirmed"}',
+        )
+    )
+    assert not phone_agent._function_call_requests_wechat_notice(
+        SimpleNamespace(
+            name="save_call_result",
+            arguments='{"summary":"ordinary result"}',
+        )
+    )
+
+
+def test_programmatic_audio_tools_cancel_model_tool_reply() -> None:
+    cancelled = False
+
+    def cancel_tool_reply() -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    event = SimpleNamespace(
+        function_calls=[
+            SimpleNamespace(
+                name="complete_wechat_followup",
+                arguments='{"summary":"confirmed"}',
+            ),
+            SimpleNamespace(name="end_call", arguments='{"reason":"done"}'),
+        ],
+        cancel_tool_reply=cancel_tool_reply,
+    )
+
+    assert phone_agent._cancel_tool_reply_for_programmatic_audio(event) == {
+        "complete_wechat_followup",
+        "end_call",
+    }
+    assert cancelled
+
+
+def test_wechat_notice_precedes_batched_end_call() -> None:
+    assert phone_agent._programmatic_audio_action(
+        {"complete_wechat_followup", "end_call"}
+    ) == "wechat_notice"
+    assert phone_agent._programmatic_audio_action({"end_call"}) == "final_goodbye"
+
+
+def test_wechat_silence_timer_starts_when_playout_finishes() -> None:
+    events: list[str] = []
+
+    phone_agent._finish_wechat_notice_playout(
+        awaiting_acknowledgement=True,
+        start_close_timer=lambda: events.append("timer-started"),
+    )
+
+    assert events == ["timer-started"]
+
+
+def test_completed_single_flight_task_is_not_restarted() -> None:
+    async def run() -> None:
+        calls = 0
+
+        async def action() -> None:
+            nonlocal calls
+            calls += 1
+
+        task = phone_agent._start_single_flight_task(
+            None, action, name="single-flight-test"
+        )
+        await task
+        same_task = phone_agent._start_single_flight_task(
+            task, action, name="single-flight-test"
+        )
+        await same_task
+
+        assert same_task is task
+        assert calls == 1
+
+    asyncio.run(run())
+
+
+def test_non_programmatic_tool_keeps_model_tool_reply() -> None:
+    event = SimpleNamespace(
+        function_calls=[SimpleNamespace(name="save_call_result", arguments="{}")],
+        cancel_tool_reply=lambda: pytest.fail("reply must not be cancelled"),
+    )
+    assert phone_agent._cancel_tool_reply_for_programmatic_audio(event) == set()
+
+
+def test_direct_fixed_audio_waits_for_playout_before_unpublishing(monkeypatch) -> None:
+    events: list[str] = []
+    captured_samples: list[int] = []
+
+    class FakeAudioSource:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.frames = 0
+
+        async def capture_frame(self, _frame) -> None:
+            self.frames += 1
+            captured_samples.append(_frame.samples_per_channel)
+            if self.frames == 1:
+                events.append("first-frame-captured")
+
+        async def wait_for_playout(self) -> None:
+            events.append("playout-complete")
+
+        async def aclose(self) -> None:
+            events.append("source-closed")
+
+    class FakeParticipant:
+        async def publish_track(self, _track):
+            events.append("published")
+            return SimpleNamespace(sid="track-1")
+
+        async def unpublish_track(self, sid: str) -> None:
+            events.append(f"unpublished:{sid}")
+
+    monkeypatch.setattr(phone_agent.rtc, "AudioSource", FakeAudioSource)
+    monkeypatch.setattr(
+        phone_agent.rtc,
+        "LocalAudioTrack",
+        SimpleNamespace(create_audio_track=lambda _name, source: source),
+    )
+
+    sample_rate = phone_agent.ROOM_AUDIO_SAMPLE_RATE
+    samples = sample_rate // 25
+    output = io.BytesIO()
+    with wave.open(output, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(b"\x00\x00" * samples)
+
+    duration = asyncio.run(
+        phone_agent._play_wav_bytes_direct(
+            SimpleNamespace(local_participant=FakeParticipant()),
+            output.getvalue(),
+            label="test goodbye",
+            track_name="test-track",
+            tail_silence_ms=400,
+            on_first_frame_queued=lambda: events.append("first-frame-callback"),
+        )
+    )
+
+    assert duration == pytest.approx(0.04)
+    assert sum(captured_samples) == samples + sample_rate * 400 // 1000
+    assert events == [
+        "published",
+        "first-frame-captured",
+        "first-frame-callback",
+        "playout-complete",
+        "unpublished:track-1",
+        "source-closed",
+    ]
+
+
+def test_realtime_scene_cache_expires(monkeypatch) -> None:
+    async def run() -> None:
+        scene_id = 234567
+        old_scene = {"name": "old"}
+        new_scene = {"name": "new"}
+        phone_agent._REALTIME_SCENE_CACHE[scene_id] = old_scene
+        phone_agent._REALTIME_SCENE_CACHE_UPDATED_AT[scene_id] = 100.0
+        monkeypatch.setattr(phone_agent, "perf_counter", lambda: 105.0)
+        monkeypatch.setenv("QWEN_REALTIME_SCENE_CACHE_TTL_SECONDS", "30")
+
+        cached, task = phone_agent._start_realtime_scene_fetch(scene_id)
+        assert cached is old_scene
+        assert task is None
+
+        async def refresh(_scene_id: int):
+            assert _scene_id == scene_id
+            return new_scene
+
+        monkeypatch.setattr(phone_agent, "fetch_realtime_scene", refresh)
+        monkeypatch.setattr(phone_agent, "perf_counter", lambda: 131.0)
+        cached, task = phone_agent._start_realtime_scene_fetch(scene_id)
+        assert cached is old_scene
+        assert task is not None
+        assert await task is new_scene
+
+        phone_agent._REALTIME_SCENE_CACHE.pop(scene_id, None)
+        phone_agent._REALTIME_SCENE_CACHE_UPDATED_AT.pop(scene_id, None)
+
+    asyncio.run(run())
 
 
 def test_dynamic_endpointing_defaults_are_bounded(monkeypatch) -> None:

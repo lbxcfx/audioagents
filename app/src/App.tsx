@@ -810,7 +810,7 @@ function LegacyApp() {
     if (!sceneId) return;
     const result = await api<Record<string, unknown>>(`/api/dialogue/scenes/${sceneId}/microsip-test`, {
       method: "POST",
-      body: JSON.stringify({ phone: "1000@127.0.0.1:5066", visible: true }),
+      body: JSON.stringify({ phone: "1000@127.0.0.1:5065", visible: true }),
     });
     setTrainingResult(result);
     await loadData();
@@ -4423,7 +4423,7 @@ function SystemSettingReplica() {
           <LabeledInput label="系统名称" placeholder="AI智能机器人" />
           <LabeledInput label="LiveKit地址" placeholder="ws://127.0.0.1:7880" />
           <LabeledInput label="Agents API" placeholder="http://127.0.0.1:8091" />
-          <LabeledInput label="SIP端口" placeholder="5066" />
+          <LabeledInput label="SIP端口" placeholder="5065" />
           <label><span>默认ASR：</span><select><option>Qwen Realtime ASR</option><option>Qwen HTTP ASR</option></select></label>
           <label><span>默认TTS：</span><select><option>Qwen TTS</option></select></label>
           <label><span>话术优先：</span><select><option>开启</option><option>关闭</option></select></label>

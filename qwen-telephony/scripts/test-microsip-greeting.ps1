@@ -1,5 +1,5 @@
 param(
-    [string]$Number = "1000@127.0.0.1:5066",
+    [string]$Number = "1000@127.0.0.1:5065",
     [int]$Seconds = 10,
     [double]$MaxFirstFrameSeconds = 3.0
 )

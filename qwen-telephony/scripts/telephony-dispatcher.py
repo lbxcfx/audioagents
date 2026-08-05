@@ -369,6 +369,7 @@ async def dispatch_call(
             "phone_number": call["destination_number"],
             "source_number": call.get("source_number") or "",
             "livekit_trunk_id": trunk_id,
+            "trunk_provider": call.get("trunk_provider") or "",
             "heartbeat_seconds": heartbeat_seconds,
             "lease_seconds": lease_seconds,
             "recording_mode": call.get("recording_mode") or "off",

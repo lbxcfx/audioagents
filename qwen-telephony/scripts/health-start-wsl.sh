@@ -210,7 +210,7 @@ main() {
 
   status "System healthy"
   echo "LiveKit: $LIVEKIT_URL"
-  echo "SIP: sip:1000@127.0.0.1:${SIP_PORT:-5066}"
+  echo "SIP: sip:1000@127.0.0.1:${SIP_PORT:-5065}"
   echo "Agent log: $AGENT_LOG"
 }
 

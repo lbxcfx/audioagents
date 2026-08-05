@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "agent"))
 
 from qwen_audio_realtime import (  # noqa: E402
+    DEFAULT_REALTIME_OPENINGS,
     QwenAudioRealtimeModel,
     load_realtime_instructions,
     voice_pipeline,
@@ -47,17 +48,49 @@ def test_prompt_loader_replaces_call_variables(monkeypatch: pytest.MonkeyPatch) 
     assert "场景编号：7" in prompt
     assert "客户姓名：林晓" in prompt
     assert "建筑设计师" in prompt
-    assert "脉脉公司负责骑手招聘的招聘顾问" in prompt
-    assert "您好，我是脉脉招聘顾问。有个职位机会分享给您。" in prompt
+    assert "脉脉公司负责骑手招聘的招聘专员" in prompt
+    assert "您好，我是脉脉招聘专员，有个骑手职位机会分享给您，请问您现在方便吗？" in prompt
+    assert "开场话术四选一" in prompt
+    assert "4. 您好，脉脉招聘这边有个骑手机会" in prompt
+    assert "避免连续通话固定使用同一句" in prompt
     assert "rider_opening" in prompt
-    assert "骑手配送岗位" in prompt
-    assert "rider_wechat_collect" in prompt
-    assert "少于 11 位" in prompt
-    assert "您接着说，我在听" in prompt
+    assert "rider_employment" in prompt
+    assert "美团骑手配送岗位" in prompt
+    assert "只有全职岗位" in prompt
+    assert "您现在是在职，还是已经离职？" in prompt
+    assert "rider_wechat_phone_check" in prompt
+    assert "rider_wechat_request" in prompt
+    assert "方便后续给您分享机会，可以加您微信吗？" in prompt
+    assert "不同意 -> rider_phone_followup" in prompt
+    assert "节点 rider_phone_followup" in prompt
+    assert "您这个手机号是微信号吗？" in prompt
+    assert "好的，已经加您了，请您通过一下" in prompt
+    assert "调用 complete_wechat_followup" in prompt
+    assert "程序会立即播放上述对客话术" in prompt
+    assert "进入任意 end 节点时直接调用 end_call" in prompt
+    assert "好的，已记下您的微信" not in prompt
+    assert "客户回答“好的”“好”“行”“知道了”“会通过”等确认语时" in prompt
+    assert "3 秒内没有任何回复时" in prompt
+    assert "客户在 3 秒内提出其他问题时，先处理问题" in prompt
+    assert "您什么时候方便，我再给您电话？" in prompt
+    assert "进入任意 end 节点时直接调用 end_call" in prompt
+    assert "完整播放“祝您生活愉快，再见”" in prompt
+    assert "您更想全职，还是时间灵活一些？" not in prompt
+    assert "您现在最关心收入、时间还是配送距离？" not in prompt
+    assert "您之前做过配送吗？没做过也没关系。" not in prompt
     assert "一次只问一个问题" in prompt
-    assert "不超过 20 个汉字" in prompt
+    assert "不超过 25 个汉字" in prompt
     assert "不得每轮固定说“好的”" in prompt
     assert "{{" not in prompt
+
+
+def test_default_realtime_openings_have_four_distinct_variants() -> None:
+    assert len(DEFAULT_REALTIME_OPENINGS) == 4
+    assert len(set(DEFAULT_REALTIME_OPENINGS)) == 4
+    for opening in DEFAULT_REALTIME_OPENINGS:
+        assert "脉脉招聘" in opening
+        assert "骑手" in opening
+        assert "方便" in opening
 
 
 def test_prompt_loader_compiles_frontend_scene(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,7 +145,7 @@ def test_realtime_model_uses_dashscope_beta_compatibility() -> None:
         assert model._opts.turn_detection.threshold == 0.65
         assert model._opts.turn_detection.prefix_padding_ms == 200
         assert model._opts.turn_detection.silence_duration_ms == 650
-        assert model.capabilities.auto_tool_reply_generation is True
+        assert model.capabilities.auto_tool_reply_generation is False
     finally:
         # No session was opened, so there is no async resource to close.
         pass

@@ -121,6 +121,7 @@ def test_trunks_limits_and_fine_grained_permissions(telephony_stack) -> None:
         worker_id="trunk-worker",
     )
     assert claimed[0]["livekit_trunk_id"] == "ST_test"
+    assert claimed[0]["trunk_provider"] == "telco"
     viewer_call = service.get_call(
         project_id=project_id, user_id="viewer", call_id=claimed[0]["id"]
     )
