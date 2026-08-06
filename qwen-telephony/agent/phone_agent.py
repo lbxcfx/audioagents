@@ -301,6 +301,38 @@ def _select_realtime_opening(scene: dict[str, Any] | None) -> str:
     return opening or DEFAULT_REALTIME_OPENINGS[0]
 
 
+def _initial_realtime_chat_context(
+    *,
+    selected_pipeline: str,
+    realtime_opening: str,
+    task_prompt_override: str,
+) -> llm.ChatContext | None:
+    if selected_pipeline != REALTIME_PIPELINE:
+        return None
+    if realtime_opening:
+        # Seed the exact opening before Realtime starts accepting caller audio.
+        # The fixed audio is media transport only; Qwen needs the corresponding
+        # assistant turn, not a copy of the WAV bytes.
+        chat_ctx = llm.ChatContext.empty()
+        chat_ctx.add_message(role="assistant", content=realtime_opening)
+        return chat_ctx
+    if task_prompt_override:
+        # Qwen Realtime rejects response.create when the conversation has no
+        # user message. This synthetic event unlocks an AI-first business
+        # opening immediately after answer and is never persisted as customer
+        # speech.
+        chat_ctx = llm.ChatContext.empty()
+        chat_ctx.add_message(
+            role="user",
+            content=(
+                "[外呼接通事件]电话已接通，请立即主动说本任务第一句开场，"
+                "不要等待客户先说话。"
+            ),
+        )
+        return chat_ctx
+    return None
+
+
 def _append_local_transcript(
     *, room_name: str, role: str, text: str, item_id: str = "", source: str = "realtime"
 ) -> None:
@@ -2961,7 +2993,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def close_after_customer_silence() -> None:
         timeout_seconds = _configured_float(
             "QWEN_CUSTOMER_RESPONSE_TIMEOUT_SECONDS",
-            3.0,
+            5.0,
             minimum=1.0,
             maximum=30.0,
         )
@@ -3261,13 +3293,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(finalize_job)
 
-    initial_chat_ctx: llm.ChatContext | None = None
-    if selected_pipeline == REALTIME_PIPELINE and realtime_opening:
-        # Seed the exact opening before Realtime starts accepting caller audio.
-        # The fixed audio is media transport only; Qwen needs the corresponding
-        # assistant turn, not a copy of the WAV bytes.
-        initial_chat_ctx = llm.ChatContext.empty()
-        initial_chat_ctx.add_message(role="assistant", content=realtime_opening)
+    initial_chat_ctx = _initial_realtime_chat_context(
+        selected_pipeline=selected_pipeline,
+        realtime_opening=realtime_opening,
+        task_prompt_override=task_prompt_override,
+    )
 
     phone_agent = PhoneAgent(
         ctx=ctx,

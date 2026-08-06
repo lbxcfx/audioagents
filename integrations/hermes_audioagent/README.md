@@ -29,6 +29,10 @@ does not show a preview, ask follow-up questions about missing business facts,
 or require a confirmation boolean. Cancellation remains separately confirmed.
 Every submitted prompt is prefixed with the invariant caller identity
 `我是李宝祥的智能助理。`; unknown facts are omitted rather than invented.
+An LLM request middleware recognizes WeChat messages containing both a phone
+number and an outbound-call intent. It removes prior conversation turns from
+that DeepSeek request and injects the direct-execution rules, while preserving
+the current turn's tool calls and results.
 
 Set `AUDIOAGENT_RESULT_FORWARDING=true` to run the plugin's terminal-campaign
 watcher inside the Hermes Gateway. It sends each completed Hermes campaign to

@@ -355,6 +355,20 @@ def test_phone_agent_accepts_preseeded_opening_context() -> None:
     assert opening in str(agent.chat_ctx.items[0].content)
 
 
+def test_task_realtime_context_seeds_ai_first_outbound_event() -> None:
+    chat_ctx = phone_agent._initial_realtime_chat_context(
+        selected_pipeline=phone_agent.REALTIME_PIPELINE,
+        realtime_opening="",
+        task_prompt_override="邀请客户吃饭",
+    )
+
+    assert chat_ctx is not None
+    assert len(chat_ctx.items) == 1
+    assert str(chat_ctx.items[0].role) == "user"
+    assert "外呼接通事件" in str(chat_ctx.items[0].content)
+    assert "不要等待客户先说话" in str(chat_ctx.items[0].content)
+
+
 def test_outbound_agent_hangup_is_default(monkeypatch) -> None:
     monkeypatch.delenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", raising=False)
     assert not phone_agent._customer_hangup_only({"direction": "outbound"})

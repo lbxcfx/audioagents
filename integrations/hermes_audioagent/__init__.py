@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import delivery, schemas, tools
+from . import delivery, middleware, schemas, tools
 
 
 def register(ctx) -> None:
@@ -40,4 +40,5 @@ def register(ctx) -> None:
     skill = Path(__file__).parent / "skills" / "outbound-calling" / "SKILL.md"
     if skill.exists():
         ctx.register_skill("outbound-calling", skill)
+    ctx.register_middleware("llm_request", middleware.isolate_wechat_outbound_request)
     delivery.start_result_forwarder()

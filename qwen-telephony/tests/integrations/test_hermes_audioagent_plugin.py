@@ -13,7 +13,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations import hermes_audioagent
-from integrations.hermes_audioagent import delivery, result_card, schemas, tools
+from integrations.hermes_audioagent import (
+    delivery,
+    middleware,
+    result_card,
+    schemas,
+    tools,
+)
 
 
 class SubmitClient:
@@ -42,6 +48,7 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
             self.tools = []
             self.skills = []
             self.hooks = []
+            self.middleware = []
 
         def register_tool(self, **options) -> None:
             self.tools.append(options)
@@ -51,6 +58,9 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
 
         def register_hook(self, name, handler) -> None:
             self.hooks.append((name, handler))
+
+        def register_middleware(self, name, handler) -> None:
+            self.middleware.append((name, handler))
 
     context = Context()
     hermes_audioagent.register(context)
@@ -64,6 +74,90 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
     assert context.skills[0][0] == "outbound-calling"
     assert context.skills[0][1].is_file()
     assert context.hooks == []
+    assert context.middleware == [
+        ("llm_request", middleware.isolate_wechat_outbound_request)
+    ]
+
+
+def test_wechat_outbound_request_drops_history_and_injects_direct_execution() -> None:
+    request = {
+        "messages": [
+            {"role": "system", "content": "Hermes system"},
+            {"role": "user", "content": "以后请先给我看 Prompt。"},
+            {"role": "assistant", "content": "好的，会先确认。"},
+            {
+                "role": "user",
+                "content": "给任总打电话，18332362029，问今晚是否吃饭。",
+            },
+        ],
+        "model": "deepseek-v4-pro",
+    }
+
+    result = middleware.isolate_wechat_outbound_request(
+        request=request,
+        platform="weixin",
+    )
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert len(messages) == 2
+    assert messages[0] == {"role": "system", "content": "Hermes system"}
+    assert "给任总打电话" in messages[1]["content"]
+    assert "不得参考或延续任何历史对话" in messages[1]["content"]
+    assert "不预览、不要求确认" in messages[1]["content"]
+    assert "以后请先给我看" not in str(messages)
+    assert request["messages"][3]["content"].endswith("是否吃饭。")
+
+
+def test_wechat_outbound_request_preserves_current_tool_loop() -> None:
+    request = {
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "旧任务"},
+            {"role": "assistant", "content": "旧回答"},
+            {"role": "user", "content": "外呼13800000000提醒续费"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+            {"role": "tool", "content": "schema loaded"},
+        ]
+    }
+
+    result = middleware.isolate_wechat_outbound_request(
+        request=request,
+        platform="weixin",
+    )
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert messages[-1]["content"] == "schema loaded"
+
+
+def test_non_outbound_or_non_weixin_request_is_unchanged() -> None:
+    request = {"messages": [{"role": "user", "content": "查询13800000000"}]}
+
+    assert (
+        middleware.isolate_wechat_outbound_request(
+            request=request,
+            platform="weixin",
+        )
+        is None
+    )
+    assert (
+        middleware.isolate_wechat_outbound_request(
+            request={
+                "messages": [
+                    {"role": "user", "content": "打电话给13800000000"}
+                ]
+            },
+            platform="cli",
+        )
+        is None
+    )
 
 
 def test_submit_schema_requires_no_confirmation() -> None:
