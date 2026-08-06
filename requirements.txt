@@ -1,0 +1,9 @@
+# Unified Python runtime dependencies for the AudioAgent services and the
+# Hermes AudioAgent integration. Production images consume the same fully
+# pinned lock file, so a host installation and Docker deployment resolve to
+# identical package versions.
+-r qwen-telephony/requirements.lock
+
+# Hermes itself is intentionally not installed from this file. The server
+# deployment uses the pinned Hermes container image, while source development
+# in hermes-agent/ is managed by that project's pyproject.toml and uv.lock.

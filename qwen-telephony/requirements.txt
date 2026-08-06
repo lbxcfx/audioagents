@@ -1,6 +1,12 @@
 python-dotenv==1.2.2
 httpx==0.28.1
 openai==2.43.0
+aiohttp==3.14.1
+av==17.1.0
+numpy==2.4.6
+pydantic==2.13.4
+protobuf==6.33.6
+websockets==15.0.1
 # Keep the LiveKit SDK family aligned. livekit-agents pins the native SDK exactly.
 livekit==1.1.13
 livekit-api==1.2.0
