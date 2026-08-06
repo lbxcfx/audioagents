@@ -59,20 +59,28 @@ def _required_text(args: dict[str, Any], key: str, limit: int) -> str:
     return value
 
 
-def _validate_prompt_snapshot(prompt: str) -> None:
-    unresolved_patterns = (
-        (r"(?<![A-Za-z])X{2,}(?![A-Za-z])", "XXX placeholder"),
-        (r"\[[^\]\n]*(?:待补充|待确认|公司名称|产品名称|联系人)[^\]\n]*\]", "bracketed placeholder"),
-        (r"(?:如知道|若知道)[^。；\n]{0,40}(?:请补充|补充)", "conditional missing fact"),
-        (r"根据实际情况", "unspecified task fact"),
+_FIXED_CALLER_POLICY = """# 固定身份与信息规则（最高优先级）
+- 你的身份固定为李宝祥的智能助理。
+- 对客自我介绍时统一使用“我是李宝祥的智能助理”，不得使用其他身份。
+- 仅使用微信任务已经提供的信息；缺失信息直接省略，不询问任务发起人。
+- 不朗读 XXX、方括号等未填写占位符，也不得编造缺失信息。
+
+# 微信任务
+"""
+
+
+def _prepare_prompt_snapshot(prompt: str) -> str:
+    """Apply invariant caller policy without blocking direct WeChat execution."""
+    normalized = re.sub(
+        r"我是\s*(?<![A-Za-z])X{2,}(?![A-Za-z])\s*的(?:智能)?助理",
+        "我是李宝祥的智能助理",
+        prompt,
+        flags=re.I,
     )
-    problems = [label for pattern, label in unresolved_patterns if re.search(pattern, prompt, re.I)]
-    if problems:
-        raise ValueError(
-            "prompt contains unresolved task facts: "
-            + ", ".join(problems)
-            + "; ask the operator for the missing facts before submission"
-        )
+    normalized = re.sub(
+        r"(?<![A-Za-z])X{2,}(?![A-Za-z])", "李宝祥", normalized, flags=re.I
+    )
+    return _FIXED_CALLER_POLICY + normalized.strip()
 
 
 def _normalize_phone(value: Any) -> str:
@@ -236,15 +244,10 @@ def _task_status(
 
 @_handler
 def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-    if args.get("confirmed") is not True:
-        raise ValueError(
-            "explicit operator confirmation is required before placing external calls"
-        )
     task_name = _required_text(args, "task_name", 200)
-    prompt = _required_text(args, "prompt", 24_000)
+    prompt = _prepare_prompt_snapshot(_required_text(args, "prompt", 24_000))
     if len(prompt.encode("utf-8")) > 24_000:
         raise ValueError("prompt exceeds 24000 UTF-8 bytes")
-    _validate_prompt_snapshot(prompt)
     client = AudioAgentClient()
     customers = args.get("customers")
     if not isinstance(customers, list) or not 1 <= len(customers) <= 100:

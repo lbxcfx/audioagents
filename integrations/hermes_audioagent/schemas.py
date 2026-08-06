@@ -24,9 +24,8 @@ _CUSTOMER = {
 SUBMIT_OUTBOUND_TASK = {
     "name": "audioagent_submit_outbound_task",
     "description": (
-        "Submit an outbound calling task only after the operator has reviewed the phone "
-        "numbers, task objective, generated prompt, schedule, and concurrency and explicitly "
-        "confirmed execution. The backend rejects confirmed=false."
+        "Immediately submit an outbound calling task requested in WeChat. The original task "
+        "message authorizes execution; do not show a preview or ask for confirmation."
     ),
     "parameters": {
         "type": "object",
@@ -49,10 +48,6 @@ SUBMIT_OUTBOUND_TASK = {
                 "maxItems": 100,
                 "items": _CUSTOMER,
             },
-            "confirmed": {
-                "type": "boolean",
-                "description": "Must be true only after explicit operator confirmation.",
-            },
             "task_id": {"type": "string", "maxLength": 120},
             "scene_id": {"type": "integer", "minimum": 1},
             "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -65,7 +60,7 @@ SUBMIT_OUTBOUND_TASK = {
             "trunk_id": {"type": "string", "maxLength": 200},
             "source_number": {"type": "string", "maxLength": 16},
         },
-        "required": ["task_name", "prompt", "customers", "confirmed"],
+        "required": ["task_name", "prompt", "customers"],
     },
 }
 

@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations import hermes_audioagent
-from integrations.hermes_audioagent import delivery, result_card, tools
+from integrations.hermes_audioagent import delivery, result_card, schemas, tools
 
 
 class SubmitClient:
@@ -66,36 +66,24 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
     assert context.hooks == []
 
 
-def test_submit_requires_explicit_confirmation() -> None:
-    result = json.loads(
-        tools.submit_outbound_task(
-            {
-                "task_name": "续费提醒",
-                "prompt": "提醒续费",
-                "customers": [{"phone": "13800000000"}],
-                "confirmed": False,
-            }
-        )
+def test_submit_schema_requires_no_confirmation() -> None:
+    schema = schemas.SUBMIT_OUTBOUND_TASK["parameters"]
+
+    assert "confirmed" not in schema["properties"]
+    assert schema["required"] == ["task_name", "prompt", "customers"]
+
+
+def test_prompt_preparation_fixes_identity_without_missing_fact_check() -> None:
+    prompt = tools._prepare_prompt_snapshot(
+        "我是XXX的助理；餐厅如知道请补充，根据实际情况沟通。"
     )
 
-    assert result["ok"] is False
-    assert "confirmation" in result["error"]
-
-
-def test_submit_rejects_unresolved_prompt_facts() -> None:
-    result = json.loads(
-        tools.submit_outbound_task(
-            {
-                "task_name": "晚餐邀约",
-                "prompt": "我是XXX的助理；餐厅如知道请补充，根据实际情况沟通。",
-                "customers": [{"phone": "13800000000"}],
-                "confirmed": True,
-            }
-        )
-    )
-
-    assert result["ok"] is False
-    assert "unresolved task facts" in result["error"]
+    assert prompt.startswith("# 固定身份与信息规则（最高优先级）")
+    assert "我是李宝祥的智能助理" in prompt
+    task_prompt = prompt.split("# 微信任务\n", 1)[1]
+    assert "XXX" not in task_prompt
+    assert task_prompt.startswith("我是李宝祥的智能助理")
+    assert "餐厅如知道请补充，根据实际情况沟通" in prompt
 
 
 def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
@@ -121,7 +109,6 @@ def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
                         "profile": {"plan": "enterprise"},
                     }
                 ],
-                "confirmed": True,
                 "max_concurrency": 2,
                 "scene_id": 42,
             },
@@ -145,7 +132,10 @@ def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
         "profile": {"plan": "enterprise"},
     }
     campaign_payload = client.requests[1][2]
-    assert campaign_payload["metadata"]["task"]["prompt_snapshot"].startswith("请向")
+    prompt_snapshot = campaign_payload["metadata"]["task"]["prompt_snapshot"]
+    assert prompt_snapshot.startswith("# 固定身份与信息规则（最高优先级）")
+    assert "我是李宝祥的智能助理" in prompt_snapshot
+    assert prompt_snapshot.endswith("请向 {{customer_name}} 确认续费。")
     assert campaign_payload["metadata"]["task"]["scene_id"] == 42
     assert campaign_payload["metadata"]["delivery"] == {
         "hermes_session_id": "hermes-session-1"

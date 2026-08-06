@@ -1,7 +1,7 @@
 # Hermes AudioAgent plugin
 
-This standalone Hermes plugin turns a confirmed messaging task into an
-AudioAgent campaign. One immutable prompt snapshot is shared by the task's
+This standalone Hermes plugin turns a WeChat task directly into an AudioAgent
+campaign. One immutable prompt snapshot is shared by the task's
 customers; customer variables remain isolated per call.
 
 ## Install
@@ -24,9 +24,11 @@ for the AudioAgent development authentication mode.
 
 For Weixin, set `WEIXIN_DM_POLICY=allowlist`, populate `WEIXIN_ALLOWED_USERS`,
 and disable unrelated high-privilege tools on the `hermes-weixin` surface.
-The submit and cancel tools independently require an explicit confirmation
-boolean. The operator's reply to the task preview is the single interactive
-confirmation; the plugin does not add a redundant Hermes `/approve` prompt.
+The original WeChat task message authorizes immediate submission. The plugin
+does not show a preview, ask follow-up questions about missing business facts,
+or require a confirmation boolean. Cancellation remains separately confirmed.
+Every submitted prompt is prefixed with the invariant caller identity
+`我是李宝祥的智能助理。`; unknown facts are omitted rather than invented.
 
 Set `AUDIOAGENT_RESULT_FORWARDING=true` to run the plugin's terminal-campaign
 watcher inside the Hermes Gateway. It sends each completed Hermes campaign to
@@ -37,8 +39,6 @@ watcher persists an at-most-once claim before sending, so concurrent plugin
 loads or a partial media send cannot produce duplicate cards. If card rendering
 is unavailable, the same single attempt falls back to the complete text result.
 
-After submission, delegate one self-contained wait task with `delegate_task`.
-Top-level Hermes delegation is asynchronous and its result re-enters the same
-messaging session, so the final summary is delivered back to Weixin without
-blocking the foreground turn. If delegation is disabled, the operator can use
-`/background` with the returned campaign ID.
+After submission, return the task and campaign IDs once. Do not delegate or poll
+for a second chat response: the result forwarder owns terminal notification and
+sends one deduplicated result card to Weixin.

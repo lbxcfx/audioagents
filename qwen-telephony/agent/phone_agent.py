@@ -3771,7 +3771,8 @@ async def entrypoint(ctx: JobContext) -> None:
             opening_speech = session.generate_reply(
                 instructions=(
                     "现在直接说本次任务的第一句业务开场。只说一句，不超过24个汉字；"
-                    "不要提录音、系统测试，也不要使用其他场景的人名或身份。"
+                    "自然包含‘我是李宝祥的智能助理’，不要提录音、系统测试，"
+                    "也不要使用其他场景的人名或身份。"
                 )
             )
             await opening_speech.wait_for_playout()

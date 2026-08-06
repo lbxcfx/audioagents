@@ -1,6 +1,6 @@
 name: audioagent
-version: 0.3.1
-description: "Submit confirmed outbound calling tasks to AudioAgent and return structured call results."
+version: 0.4.0
+description: "Submit WeChat outbound calling tasks directly to AudioAgent and return structured call results."
 author: audioagents
 kind: standalone
 requires_env:
