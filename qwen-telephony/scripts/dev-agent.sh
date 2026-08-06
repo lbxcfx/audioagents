@@ -18,5 +18,10 @@ export LIVEKIT_AGENT_NAME="${LIVEKIT_AGENT_NAME:-commercial-agent}"
 export QWEN_AGENT_EXPLICIT_NAME="${QWEN_AGENT_EXPLICIT_NAME:-commercial-agent}"
 export PYTHONPATH="$DEV_APP/agent:${PYTHONPATH:-}"
 
+# The turn detector is provisioned locally during bootstrap. Keep startup
+# deterministic and prevent the model loader from reaching external hubs.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
 cd "$DEV_APP/agent"
 exec "$DEV_VENV/bin/python" -u phone_agent.py dev
