@@ -310,7 +310,19 @@ def load_realtime_instructions(
     task_prompt = prompt_override.strip()
     environment_override = os.getenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", "").strip()
     if task_prompt:
-        prompt = task_prompt
+        prompt = (
+            "# 电话沟通硬约束（最高优先级）\n"
+            "- 接通后直接进入本任务正题，不播报录音、系统测试等说明。\n"
+            "- 不使用其他场景的固定开场，不猜测或重复确认无关身份。\n"
+            "- 每次只说一句，每句最多24个汉字（标点不计），然后等待客户。\n"
+            "- 一次只表达一个信息点或询问一个问题，禁止长段介绍和连续提问。\n"
+            "- 整通电话最多8轮；达到上限时立即结束，不延长对话。\n"
+            "- 正常结束时不要自行扩写告别语，调用 end_call；程序固定播放“感谢您的时间，再见。”。\n"
+            "- 客户明确拒绝时立即礼貌结束；客户沉默时由程序在3秒后挂机。\n"
+            "- 必须根据已提供的真实资料沟通；禁止朗读方括号占位符或编造产品信息。\n\n"
+            "# 本次任务\n"
+            + task_prompt
+        )
     elif environment_override:
         prompt = environment_override
     else:

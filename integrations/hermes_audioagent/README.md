@@ -28,6 +28,12 @@ The submit and cancel tools independently require an explicit confirmation
 boolean. The operator's reply to the task preview is the single interactive
 confirmation; the plugin does not add a redundant Hermes `/approve` prompt.
 
+Set `AUDIOAGENT_RESULT_FORWARDING=true` to run the plugin's terminal-campaign
+watcher inside the Hermes Gateway. It sends each completed Hermes campaign to
+`AUDIOAGENT_RESULT_TARGET` (default `weixin`) and persists successfully delivered
+campaign IDs under `HERMES_HOME` to deduplicate notifications across normal
+gateway restarts.
+
 After submission, delegate one self-contained wait task with `delegate_task`.
 Top-level Hermes delegation is asynchronous and its result re-enters the same
 messaging session, so the final summary is delivered back to Weixin without

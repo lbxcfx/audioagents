@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations import hermes_audioagent
-from integrations.hermes_audioagent import tools
+from integrations.hermes_audioagent import delivery, tools
 
 
 class SubmitClient:
@@ -218,3 +218,30 @@ def test_get_task_can_include_transcript(monkeypatch) -> None:
     assert result["results"][0]["transcript"] == [
         {"role": "user", "text": "下周续费。"}
     ]
+
+
+def test_result_forwarder_formats_hangup_without_saved_summary() -> None:
+    message = delivery.format_result_message(
+        {
+            "campaign_name": "产品介绍",
+            "status": "completed",
+            "results": [
+                {
+                    "status": "completed",
+                    "phone": "+8613800000000",
+                    "customer": {"name": "林经理"},
+                    "answered_at": "2026-08-06T04:00:00Z",
+                    "ended_at": "2026-08-06T04:00:42Z",
+                    "failure_detail": "room disconnected",
+                    "last_user_messages": ["可以", "我再看看"],
+                }
+            ],
+        }
+    )
+
+    assert "外呼任务结果" in message
+    assert "产品介绍" in message
+    assert "0000" in message
+    assert "通话时长：42秒" in message
+    assert "客户主动挂断" in message
+    assert "可以；我再看看" in message

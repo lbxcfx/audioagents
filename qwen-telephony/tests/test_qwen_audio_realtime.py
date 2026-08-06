@@ -96,7 +96,13 @@ def test_task_prompt_snapshot_overrides_global_configuration(
         customer_name="林经理",
     )
 
-    assert prompt == "给 林经理 执行续费提醒，任务 hermes-room。"
+    assert "给 林经理 执行续费提醒，任务 hermes-room。" in prompt
+    assert "每句最多24个汉字" in prompt
+    assert "每次只说一句" in prompt
+    assert "整通电话最多8轮" in prompt
+    assert "感谢您的时间，再见。" in prompt
+    assert "客户沉默时由程序在3秒后挂机" in prompt
+    assert "不播报录音、系统测试等说明" in prompt
     assert "旧的全局任务" not in prompt
 
 

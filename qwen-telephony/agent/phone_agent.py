@@ -190,7 +190,7 @@ GREETING_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav"
 GREETING_ROOM_AUDIO_PATH = ROOT / "qwen-telephony" / "cache" / "greeting_24k.wav"
 GREETING_AUDIO_LOCK_PATH = ROOT / "qwen-telephony" / "cache" / "greeting.wav.lock"
 ROOM_AUDIO_SAMPLE_RATE = int(os.getenv("QWEN_ROOM_AUDIO_SAMPLE_RATE", str(QwenTTS.sample_rate_hz)))
-FINAL_GOODBYE_TEXT = "祝您生活愉快，再见"
+FINAL_GOODBYE_TEXT = "感谢您的时间，再见。"
 WECHAT_ADDED_NOTICE_TEXT = "好的，已经加您了，请您通过一下。"
 _REALTIME_FIXED_AUDIO: dict[str, bytes] = {}
 _REALTIME_SCENE_CACHE: dict[int, dict[str, Any]] = {}
@@ -2062,6 +2062,9 @@ class PhoneAgent(Agent):
         self._configured_audio_ab_test_played = False
         self._agent_session: AgentSession | None = None
         self._pending_business_event_tasks: set[asyncio.Task[None]] = set()
+        self._business_result_saved = False
+        self._business_result_lock = asyncio.Lock()
+        self._last_user_messages: list[str] = []
         super().__init__(
             instructions=(
                 instructions
@@ -2094,6 +2097,28 @@ class PhoneAgent(Agent):
                 "Timed out waiting for %d pending business event(s)",
                 len(pending),
             )
+
+    def note_user_transcript(self, text: str) -> None:
+        normalized = text.strip()
+        if normalized:
+            self._last_user_messages = [*self._last_user_messages[-4:], normalized[:500]]
+
+    async def persist_fallback_call_result(self, reason: str) -> None:
+        if not self._managed_job or self._business_result_saved:
+            return
+        async with self._business_result_lock:
+            if self._business_result_saved:
+                return
+            normalized_reason = reason.strip() or "通话结束"
+            summary = normalized_reason
+            if self._last_user_messages:
+                summary += "；客户最后回应：" + "；".join(self._last_user_messages[-3:])
+            saved = await self._record_realtime_business_event(
+                "call.result",
+                {"summary": summary[:4000], "intent_label": ""},
+            )
+            if saved:
+                self._business_result_saved = True
 
     @function_tool(
         description=(
@@ -2278,13 +2303,16 @@ class PhoneAgent(Agent):
     ) -> str:
         if not summary.strip():
             return "通话摘要为空，未保存。"
-        saved = await self._record_realtime_business_event(
-            "call.result",
-            {
-                "summary": summary.strip()[:4000],
-                "intent_label": intent_label.strip().upper()[:10],
-            },
-        )
+        async with self._business_result_lock:
+            saved = await self._record_realtime_business_event(
+                "call.result",
+                {
+                    "summary": summary.strip()[:4000],
+                    "intent_label": intent_label.strip().upper()[:10],
+                },
+            )
+            if saved:
+                self._business_result_saved = True
         return "通话结果已保存。" if saved else "通话结果暂时无法保存。"
 
     @function_tool(
@@ -2302,15 +2330,18 @@ class PhoneAgent(Agent):
             return "通话摘要为空，未提交。"
 
         async def persist() -> None:
-            saved = await self._record_realtime_business_event(
-                "call.result",
-                {
-                    "summary": summary.strip()[:4000],
-                    "intent_label": intent_label.strip().upper()[:10],
-                },
-            )
-            if not saved:
-                logger.warning("Confirmed WeChat follow-up result was not persisted")
+            async with self._business_result_lock:
+                saved = await self._record_realtime_business_event(
+                    "call.result",
+                    {
+                        "summary": summary.strip()[:4000],
+                        "intent_label": intent_label.strip().upper()[:10],
+                    },
+                )
+                if not saved:
+                    logger.warning("Confirmed WeChat follow-up result was not persisted")
+                else:
+                    self._business_result_saved = True
 
         task = asyncio.create_task(persist(), name="persist-wechat-call-result")
         self._pending_business_event_tasks.add(task)
@@ -2646,6 +2677,7 @@ async def entrypoint(ctx: JobContext) -> None:
     realtime_scene: dict[str, Any] | None = None
     realtime_scene_task: asyncio.Task[dict[str, Any] | None] | None = None
     realtime_opening = ""
+    task_prompt_override = str((managed_job or {}).get("realtime_prompt") or "").strip()
     if selected_pipeline == CLASSIC_PIPELINE:
         session = AgentSession(
             stt=asr_provider,
@@ -2692,12 +2724,14 @@ async def entrypoint(ctx: JobContext) -> None:
                 raise RuntimeError(
                     f"Realtime scene {scene_id} could not be loaded; refusing wrong fallback"
                 )
-        realtime_opening = _select_realtime_opening(realtime_scene)
+        # A task-owned prompt must supply its own business opening. Reusing the
+        # global recruitment greeting leaks an unrelated scene into the call.
+        realtime_opening = "" if task_prompt_override else _select_realtime_opening(realtime_scene)
         realtime_instructions = load_realtime_instructions(
             root=ROOT,
             session_id=ctx.room.name,
             scene_id=scene_id,
-            prompt_override=str((managed_job or {}).get("realtime_prompt") or ""),
+            prompt_override=task_prompt_override,
             customer_name=str((managed_job or {}).get("customer_name") or ""),
             customer_company=str((managed_job or {}).get("customer_company") or ""),
             customer_phone=str(
@@ -2721,9 +2755,14 @@ async def entrypoint(ctx: JobContext) -> None:
     wechat_close_task: asyncio.Task[None] | None = None
     wechat_notice_task: asyncio.Task[None] | None = None
     final_goodbye_task: asyncio.Task[None] | None = None
+    customer_silence_task: asyncio.Task[None] | None = None
     programmatic_turn_tasks: set[asyncio.Task[None]] = set()
     programmatic_turn_lock = asyncio.Lock()
     awaiting_wechat_acknowledgement = False
+    assistant_business_turns = 0
+    max_conversation_turns = max(
+        1, min(_env_int("QWEN_MAX_CONVERSATION_TURNS", 8), 8)
+    )
 
     async def fixed_realtime_audio(text: str, *, label: str) -> bytes:
         audio = _REALTIME_FIXED_AUDIO.get(text)
@@ -2914,6 +2953,50 @@ async def entrypoint(ctx: JobContext) -> None:
             name="realtime-wechat-close-timeout",
         )
 
+    def cancel_customer_silence_timer(reason: str) -> None:
+        nonlocal customer_silence_task
+        if customer_silence_task and not customer_silence_task.done():
+            logger.info("Customer silence timer cancelled: %s", reason)
+            customer_silence_task.cancel()
+        customer_silence_task = None
+
+    async def close_after_customer_silence() -> None:
+        timeout_seconds = _configured_float(
+            "QWEN_CUSTOMER_RESPONSE_TIMEOUT_SECONDS",
+            3.0,
+            minimum=1.0,
+            maximum=30.0,
+        )
+        await asyncio.sleep(timeout_seconds)
+        reason = f"客户连续{timeout_seconds:g}秒未回应，系统主动挂机"
+        logger.info("%s: room=%s", reason, ctx.room.name)
+        await phone_agent.persist_fallback_call_result(reason)
+        try:
+            await session.interrupt(force=True)
+        except Exception:
+            logger.debug("No active response to interrupt before silence hangup")
+        try:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+        finally:
+            ctx.shutdown(reason="customer response timeout")
+
+    def start_customer_silence_timer() -> None:
+        nonlocal customer_silence_task
+        if not (task_prompt_override and outbound_job and assistant_business_turns > 0):
+            return
+        cancel_customer_silence_timer("timer restarted")
+        customer_silence_task = asyncio.create_task(
+            close_after_customer_silence(),
+            name="customer-response-timeout",
+        )
+
+    async def finish_at_conversation_limit() -> None:
+        await phone_agent.persist_fallback_call_result("已达到8轮对话上限")
+        await play_final_goodbye(
+            "maximum conversation turns reached",
+            interrupt_model=True,
+        )
+
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
         nonlocal metrics_event_count
@@ -2983,6 +3066,8 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("user_state_changed")
     def _on_user_state_changed(ev) -> None:
         state = str(getattr(ev, "new_state", ""))
+        if state == "speaking":
+            cancel_customer_silence_timer("customer started speaking")
         if state == "speaking" and awaiting_wechat_acknowledgement:
             cancel_wechat_close_timer("customer started speaking")
         elif (
@@ -2992,14 +3077,42 @@ async def entrypoint(ctx: JobContext) -> None:
         ):
             start_wechat_close_timer()
 
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev) -> None:
+        state = str(getattr(ev, "new_state", ""))
+        if state == "listening":
+            start_customer_silence_timer()
+        elif state in {"thinking", "speaking"}:
+            cancel_customer_silence_timer(f"agent state changed to {state}")
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(ev) -> None:
         nonlocal awaiting_wechat_acknowledgement, wechat_close_task
+        nonlocal assistant_business_turns
         item = getattr(ev, "item", None)
         role = str(getattr(item, "role", ""))
         text = str(getattr(item, "text_content", "") or "").strip()
         if role not in {"user", "assistant"} or not text:
             return
+
+        if role == "user":
+            phone_agent.note_user_transcript(text)
+            cancel_customer_silence_timer("customer transcript received")
+            if (
+                task_prompt_override
+                and assistant_business_turns >= max_conversation_turns - 1
+            ):
+                asyncio.create_task(
+                    finish_at_conversation_limit(),
+                    name="conversation-turn-limit",
+                )
+        elif task_prompt_override and text != FINAL_GOODBYE_TEXT:
+            assistant_business_turns += 1
+            if assistant_business_turns >= max_conversation_turns:
+                asyncio.create_task(
+                    finish_at_conversation_limit(),
+                    name="conversation-turn-limit",
+                )
 
         _append_local_transcript(
             room_name=ctx.room.name,
@@ -3059,6 +3172,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def cancel_wechat_timer_on_shutdown(_reason: str = "") -> None:
         cancel_wechat_close_timer("session shutdown", clear_waiting=True)
+        cancel_customer_silence_timer("session shutdown")
         await _cancel_task(wechat_notice_task)
 
     shutdown_finalizers.append(cancel_wechat_timer_on_shutdown)
@@ -3150,7 +3264,7 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(finalize_job)
 
     initial_chat_ctx: llm.ChatContext | None = None
-    if selected_pipeline == REALTIME_PIPELINE:
+    if selected_pipeline == REALTIME_PIPELINE and realtime_opening:
         # Seed the exact opening before Realtime starts accepting caller audio.
         # The fixed audio is media transport only; Qwen needs the corresponding
         # assistant turn, not a copy of the WAV bytes.
@@ -3263,7 +3377,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 root=ROOT,
                 session_id=ctx.room.name,
                 scene_id=scene_id,
-                prompt_override=str((managed_job or {}).get("realtime_prompt") or ""),
+                prompt_override=task_prompt_override,
                 customer_name=str((managed_job or {}).get("customer_name") or ""),
                 customer_company=str((managed_job or {}).get("customer_company") or ""),
                 customer_phone=str(
@@ -3302,8 +3416,9 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     async def handle_sip_disconnect() -> None:
-        """Release the room first, then finalize recordings and durable state."""
+        """Persist a fallback result, then release the disconnected room."""
 
+        await phone_agent.persist_fallback_call_result("客户主动挂断")
         try:
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
             logger.info(
@@ -3639,44 +3754,56 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             await play_greeting_audio_direct(ctx.room)
     else:
-        # In direct/manual calls the fixed opening may already have played on
-        # an independent track while session.start warmed Qwen. Once the
-        # Realtime session is ready, synchronize only the assistant text.
-        early_opening_text = (
-            await early_realtime_opening_task
-            if early_realtime_opening_task is not None
-            else None
-        )
-        if early_opening_text:
-            logger.info(
-                "realtime_opening_playout_completed context_preseeded=true "
-                "mode=parallel text=%s",
-                early_opening_text,
+        if task_prompt_override:
+            # Start with the actual task instead of a recording/test notice or
+            # a global scene greeting. The hard guardrails in the instructions
+            # constrain this generated opening to one short sentence.
+            opening_speech = session.generate_reply(
+                instructions=(
+                    "现在直接说本次任务的第一句业务开场。只说一句，不超过24个汉字；"
+                    "不要提录音、系统测试，也不要使用其他场景的人名或身份。"
+                )
             )
+            await opening_speech.wait_for_playout()
         else:
-            # The opening text is already in Qwen's initial context. Play only
-            # deterministic media, avoiding a second generated/duplicated turn.
-            started = perf_counter()
-            opening_audio = await fixed_realtime_audio(
-                realtime_opening,
-                label="Realtime opening",
+            # In direct/manual calls the fixed opening may already have played
+            # on an independent track while session.start warmed Qwen. Once the
+            # Realtime session is ready, synchronize only the assistant text.
+            early_opening_text = (
+                await early_realtime_opening_task
+                if early_realtime_opening_task is not None
+                else None
             )
-            await _play_wav_bytes_direct(
-                ctx.room,
-                opening_audio,
-                label="Realtime opening",
-                track_name="realtime-opening",
-                on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+            if early_opening_text:
+                logger.info(
+                    "realtime_opening_playout_completed context_preseeded=true "
+                    "mode=parallel text=%s",
+                    early_opening_text,
+                )
+            else:
+                # The opening text is already in Qwen's initial context. Play only
+                # deterministic media, avoiding a second generated/duplicated turn.
+                started = perf_counter()
+                opening_audio = await fixed_realtime_audio(
                     realtime_opening,
-                    source="programmatic_opening_after_realtime_warmup",
-                ),
-            )
-            logger.info(
-                "realtime_opening_playout_completed context_preseeded=true "
-                "mode=post_start elapsed=%.3fs text=%s",
-                perf_counter() - started,
-                realtime_opening,
-            )
+                    label="Realtime opening",
+                )
+                await _play_wav_bytes_direct(
+                    ctx.room,
+                    opening_audio,
+                    label="Realtime opening",
+                    track_name="realtime-opening",
+                    on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                        realtime_opening,
+                        source="programmatic_opening_after_realtime_warmup",
+                    ),
+                )
+                logger.info(
+                    "realtime_opening_playout_completed context_preseeded=true "
+                    "mode=post_start elapsed=%.3fs text=%s",
+                    perf_counter() - started,
+                    realtime_opening,
+                )
 
 
 if __name__ == "__main__":

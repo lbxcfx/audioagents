@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import schemas, tools
+from . import delivery, schemas, tools
 
 
 def register(ctx) -> None:
@@ -40,3 +40,4 @@ def register(ctx) -> None:
     skill = Path(__file__).parent / "skills" / "outbound-calling" / "SKILL.md"
     if skill.exists():
         ctx.register_skill("outbound-calling", skill)
+    delivery.start_result_forwarder()
