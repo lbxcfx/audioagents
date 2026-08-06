@@ -59,6 +59,22 @@ def _required_text(args: dict[str, Any], key: str, limit: int) -> str:
     return value
 
 
+def _validate_prompt_snapshot(prompt: str) -> None:
+    unresolved_patterns = (
+        (r"(?<![A-Za-z])X{2,}(?![A-Za-z])", "XXX placeholder"),
+        (r"\[[^\]\n]*(?:待补充|待确认|公司名称|产品名称|联系人)[^\]\n]*\]", "bracketed placeholder"),
+        (r"(?:如知道|若知道)[^。；\n]{0,40}(?:请补充|补充)", "conditional missing fact"),
+        (r"根据实际情况", "unspecified task fact"),
+    )
+    problems = [label for pattern, label in unresolved_patterns if re.search(pattern, prompt, re.I)]
+    if problems:
+        raise ValueError(
+            "prompt contains unresolved task facts: "
+            + ", ".join(problems)
+            + "; ask the operator for the missing facts before submission"
+        )
+
+
 def _normalize_phone(value: Any) -> str:
     raw = str(value or "").strip().replace(" ", "").replace("-", "")
     if re.fullmatch(r"1\d{10}", raw):
@@ -224,11 +240,12 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         raise ValueError(
             "explicit operator confirmation is required before placing external calls"
         )
-    client = AudioAgentClient()
     task_name = _required_text(args, "task_name", 200)
     prompt = _required_text(args, "prompt", 24_000)
     if len(prompt.encode("utf-8")) > 24_000:
         raise ValueError("prompt exceeds 24000 UTF-8 bytes")
+    _validate_prompt_snapshot(prompt)
+    client = AudioAgentClient()
     customers = args.get("customers")
     if not isinstance(customers, list) or not 1 <= len(customers) <= 100:
         raise ValueError("customers must contain between 1 and 100 entries")

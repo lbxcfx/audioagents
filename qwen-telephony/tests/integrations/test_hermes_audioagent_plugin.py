@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations import hermes_audioagent
-from integrations.hermes_audioagent import delivery, tools
+from integrations.hermes_audioagent import delivery, result_card, tools
 
 
 class SubmitClient:
@@ -80,6 +80,22 @@ def test_submit_requires_explicit_confirmation() -> None:
 
     assert result["ok"] is False
     assert "confirmation" in result["error"]
+
+
+def test_submit_rejects_unresolved_prompt_facts() -> None:
+    result = json.loads(
+        tools.submit_outbound_task(
+            {
+                "task_name": "晚餐邀约",
+                "prompt": "我是XXX的助理；餐厅如知道请补充，根据实际情况沟通。",
+                "customers": [{"phone": "13800000000"}],
+                "confirmed": True,
+            }
+        )
+    )
+
+    assert result["ok"] is False
+    assert "unresolved task facts" in result["error"]
 
 
 def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
@@ -282,6 +298,15 @@ def test_result_card_renders_clear_customer_summary(monkeypatch, tmp_path) -> No
         assert image.height >= 600
 
 
+def test_result_card_uses_failed_business_outcome_for_terminal_campaign() -> None:
+    assert result_card.result_outcome(
+        {
+            "status": "completed",
+            "results": [{"status": "failed", "failure_code": "sip_500"}],
+        }
+    ) == "failed"
+
+
 def test_result_delivery_sends_card_as_weixin_media(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
     card = tmp_path / "result.png"
@@ -297,5 +322,27 @@ def test_result_delivery_sends_card_as_weixin_media(monkeypatch, tmp_path) -> No
 
     assert delivery._send_message("任务已结束", card_path=card) is True
     command = captured["command"]
-    assert command[-1] == f"MEDIA:{card}\n任务已结束"
+    assert command[-1] == f"MEDIA:{card}"
     assert command[command.index("--to") + 1] == "weixin"
+    assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDING"] == "false"
+    assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDER_CHILD"] == "1"
+
+
+def test_result_delivery_claim_is_persistent_and_at_most_once(monkeypatch, tmp_path) -> None:
+    state_file = tmp_path / "deliveries.json"
+    monkeypatch.setenv("AUDIOAGENT_DELIVERY_STATE_FILE", str(state_file))
+
+    assert delivery._claim_delivery("campaign-1") is True
+    assert delivery._claim_delivery("campaign-1") is False
+
+    delivery._mark_delivered("campaign-1")
+    payload = json.loads(state_file.read_text(encoding="utf-8"))
+    assert payload["attempted_campaign_ids"] == ["campaign-1"]
+    assert payload["delivered_campaign_ids"] == ["campaign-1"]
+
+
+def test_result_forwarder_is_disabled_inside_hermes_send_child(monkeypatch) -> None:
+    monkeypatch.setenv("AUDIOAGENT_RESULT_FORWARDING", "true")
+    monkeypatch.setenv("AUDIOAGENT_RESULT_FORWARDER_CHILD", "1")
+
+    assert delivery._enabled() is False

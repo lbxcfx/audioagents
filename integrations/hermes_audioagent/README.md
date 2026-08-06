@@ -32,9 +32,10 @@ Set `AUDIOAGENT_RESULT_FORWARDING=true` to run the plugin's terminal-campaign
 watcher inside the Hermes Gateway. It sends each completed Hermes campaign to
 `AUDIOAGENT_RESULT_TARGET` (default `weixin`) and persists successfully delivered
 campaign IDs under `HERMES_HOME` to deduplicate notifications across normal
-gateway restarts. Weixin receives a PNG result card plus a concise searchable
-caption; if card rendering or media delivery is unavailable, the watcher falls
-back to the complete text result.
+gateway restarts. Weixin receives one self-contained PNG result card. The
+watcher persists an at-most-once claim before sending, so concurrent plugin
+loads or a partial media send cannot produce duplicate cards. If card rendering
+is unavailable, the same single attempt falls back to the complete text result.
 
 After submission, delegate one self-contained wait task with `delegate_task`.
 Top-level Hermes delegation is asynchronous and its result re-enters the same

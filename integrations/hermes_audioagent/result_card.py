@@ -116,6 +116,7 @@ def _duration_label(seconds: int | None) -> str:
 def _status_label(value: str) -> str:
     return {
         "completed": "已完成",
+        "partially_completed": "部分完成",
         "failed": "失败",
         "cancelled": "已取消",
         "canceled": "已取消",
@@ -136,11 +137,34 @@ def _status_color(value: str) -> str:
     return WARNING
 
 
+def result_outcome(status: dict[str, Any]) -> str:
+    """Return the business outcome instead of the campaign workflow state."""
+
+    results = [item for item in status.get("results") or [] if isinstance(item, dict)]
+    if not results:
+        return str(status.get("status") or "unknown")
+    completed = sum(
+        str(item.get("status") or "").lower() == "completed" for item in results
+    )
+    unsuccessful = len(results) - completed
+    if unsuccessful and completed:
+        return "partially_completed"
+    if unsuccessful:
+        return "failed"
+    return "completed"
+
+
 def _summary(item: dict[str, Any]) -> str:
     summary = str(item.get("summary") or "").strip()
     if summary:
         return summary
     detail = str(item.get("failure_detail") or "")
+    failure_code = str(item.get("failure_code") or "").strip()
+    if str(item.get("status") or "").lower() == "failed":
+        if failure_code == "sip_500":
+            return "运营商线路返回500，电话未接通。"
+        reason = "；".join(value for value in (failure_code, detail) if value)
+        return f"呼叫失败{f'：{reason}' if reason else ''}。"
     if "room disconnected" in detail.lower():
         return "客户主动挂断，未形成完整业务摘要。"
     return "本次通话未形成业务摘要。"
@@ -186,7 +210,7 @@ def render_result_card(
     )
     for index, line in enumerate(title_lines):
         draw.text((CARD_MARGIN, 108 + index * 40), line, font=body_font, fill="#EAF2FF")
-    campaign_status = str(status.get("status") or "")
+    campaign_status = result_outcome(status)
     badge_text = _status_label(campaign_status)
     badge_width = _text_width(draw, badge_text, badge_font) + 44
     draw.rounded_rectangle(

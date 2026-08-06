@@ -1,5 +1,5 @@
 name: audioagent
-version: 0.3.0
+version: 0.3.1
 description: "Submit confirmed outbound calling tasks to AudioAgent and return structured call results."
 author: audioagents
 kind: standalone

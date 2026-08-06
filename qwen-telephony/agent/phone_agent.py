@@ -3416,7 +3416,8 @@ async def entrypoint(ctx: JobContext) -> None:
     async def handle_sip_disconnect() -> None:
         """Persist a fallback result, then release the disconnected room."""
 
-        await phone_agent.persist_fallback_call_result("客户主动挂断")
+        if outbound_call_answered:
+            await phone_agent.persist_fallback_call_result("客户主动挂断")
         try:
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
             logger.info(
@@ -3439,6 +3440,14 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         nonlocal sip_disconnect_task, outbound_call_ended_normally
         if participant.identity != managed_sip_identity or telephony_terminal:
+            return
+        if outbound_job and not outbound_call_answered:
+            logger.info(
+                "SIP participant disconnected before answer; dial result owns cleanup: "
+                "call_id=%s identity=%s",
+                str((managed_job or {}).get("call_id") or ""),
+                participant.identity,
+            )
             return
         if sip_disconnect_task is not None and not sip_disconnect_task.done():
             return
@@ -3566,6 +3575,10 @@ async def entrypoint(ctx: JobContext) -> None:
                         media=_outbound_sip_media_config(),
                     )
                 )
+                # wait_until_answered=True means a successful API return is the
+                # authoritative answer boundary. Set this before any later
+                # awaits so an immediate customer hangup is not misclassified.
+                outbound_call_answered = True
                 await ctx.wait_for_participant(identity=managed_sip_identity)
                 await _telephony_transition(
                     outbound_job,
@@ -3574,7 +3587,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     room_name=ctx.room.name,
                 )
                 call_active = True
-                outbound_call_answered = True
 
             amd_enabled = os.getenv("QWEN_AMD_ENABLED", "true").strip().lower() in {
                 "1", "true", "yes", "on"
