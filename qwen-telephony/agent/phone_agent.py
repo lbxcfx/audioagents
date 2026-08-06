@@ -310,6 +310,15 @@ def _outbound_identity_opening(customer_name: str) -> str:
     return f"您好，我是李宝祥的智能助理，请问您是{normalized}吗？"
 
 
+def _set_session_audio_io_enabled(session: AgentSession, enabled: bool) -> None:
+    """Gate Realtime media while deterministic audio owns the opening."""
+
+    if session.input.audio:
+        session.input.set_audio_enabled(enabled)
+    if session.output.audio:
+        session.output.set_audio_enabled(enabled)
+
+
 def _initial_realtime_chat_context(
     *,
     selected_pipeline: str,
@@ -3638,11 +3647,17 @@ async def entrypoint(ctx: JobContext) -> None:
 
     outbound_identity_opening = ""
     outbound_identity_audio: bytes | None = None
+    outbound_realtime_io_suspended = False
     if (
         outbound_job
         and task_prompt_override
         and selected_pipeline == REALTIME_PIPELINE
     ):
+        # Keep the Realtime model from hearing line noise or its own fixed
+        # opening and producing a duplicate response. Direct playout uses an
+        # independent room track, so it remains audible while this IO is gated.
+        _set_session_audio_io_enabled(session, False)
+        outbound_realtime_io_suspended = True
         outbound_identity_opening = _outbound_identity_opening(
             str(outbound_job.get("customer_name") or "")
         )
@@ -3932,16 +3947,31 @@ async def entrypoint(ctx: JobContext) -> None:
                     outbound_identity_opening,
                     label="Realtime outbound identity opening",
                 )
-            await _play_wav_bytes_direct(
-                ctx.room,
-                outbound_identity_audio,
-                label="Realtime outbound identity opening",
-                track_name="realtime-outbound-identity-opening",
-                on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
-                    outbound_identity_opening,
-                    source="programmatic_outbound_identity_opening",
-                ),
-            )
+            try:
+                try:
+                    await session.interrupt(force=True)
+                except Exception:
+                    logger.debug("No active response before fixed outbound opening")
+                await _play_wav_bytes_direct(
+                    ctx.room,
+                    outbound_identity_audio,
+                    label="Realtime outbound identity opening",
+                    track_name="realtime-outbound-identity-opening",
+                    on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                        outbound_identity_opening,
+                        source="programmatic_outbound_identity_opening",
+                    ),
+                )
+            finally:
+                # Cancel any response created before the gate took effect,
+                # then let Qwen hear the customer's first real reply.
+                try:
+                    await session.interrupt(force=True)
+                except Exception:
+                    logger.debug("No duplicate opening response to interrupt")
+                if outbound_realtime_io_suspended:
+                    _set_session_audio_io_enabled(session, True)
+                    outbound_realtime_io_suspended = False
             phone_agent.note_assistant_transcript(outbound_identity_opening)
             assistant_business_turns += 1
             start_customer_silence_timer()

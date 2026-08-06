@@ -374,6 +374,26 @@ def test_outbound_identity_opening_uses_customer_name_exactly() -> None:
     )
 
 
+def test_realtime_audio_io_gate_controls_input_and_output() -> None:
+    class AudioIO:
+        def __init__(self) -> None:
+            self.audio = object()
+            self.states: list[bool] = []
+
+        def set_audio_enabled(self, enabled: bool) -> None:
+            self.states.append(enabled)
+
+    input_io = AudioIO()
+    output_io = AudioIO()
+    session = SimpleNamespace(input=input_io, output=output_io)
+
+    phone_agent._set_session_audio_io_enabled(session, False)
+    phone_agent._set_session_audio_io_enabled(session, True)
+
+    assert input_io.states == [False, True]
+    assert output_io.states == [False, True]
+
+
 def test_fallback_summary_reports_agreed_business_outcome_and_reminder() -> None:
     summary = phone_agent._fallback_business_summary(
         customer_name="任总",
