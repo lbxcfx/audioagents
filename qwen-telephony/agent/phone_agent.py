@@ -1910,10 +1910,10 @@ def _outbound_shutdown_transition(
     normalized = reason.strip().lower()
     if not answered:
         return "reconciling", "agent_shutdown_before_answer"
-    # Deleting the LiveKit room after a remote SIP BYE may surface to the job
-    # finalizer as "parent process shutdown".  Preserve the earlier, explicit
-    # SIP disconnect observation so a successfully answered call is not
-    # rewritten as an agent runtime failure.
+    # Deleting the LiveKit room after a remote SIP BYE or an intentional local
+    # hangup may surface to the finalizer as "parent process shutdown".
+    # Preserve the earlier explicit completion observation so a successfully
+    # answered call is not rewritten as an agent runtime failure.
     if normal_disconnect:
         return "completed", ""
     failure_markers = (
@@ -3016,7 +3016,7 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     async def run_final_goodbye(reason: str, *, interrupt_model: bool) -> None:
-        nonlocal awaiting_wechat_acknowledgement
+        nonlocal awaiting_wechat_acknowledgement, outbound_call_ended_normally
         awaiting_wechat_acknowledgement = False
         if interrupt_model:
             try:
@@ -3048,6 +3048,10 @@ async def entrypoint(ctx: JobContext) -> None:
             persist_insights=False,
         )
         if not _customer_hangup_only(managed_job):
+            # Mark the call before shutdown. The worker may otherwise surface
+            # only a generic parent-process reason to the finalizer.
+            if outbound_job and outbound_call_answered:
+                outbound_call_ended_normally = True
             ctx.shutdown(reason=f"realtime programmatic goodbye completed: {reason}")
 
     async def play_final_goodbye(reason: str, *, interrupt_model: bool) -> None:
@@ -3097,6 +3101,7 @@ async def entrypoint(ctx: JobContext) -> None:
         customer_silence_task = None
 
     async def close_after_customer_silence() -> None:
+        nonlocal outbound_call_ended_normally
         timeout_seconds = _configured_float(
             "QWEN_CUSTOMER_RESPONSE_TIMEOUT_SECONDS",
             5.0,
@@ -3111,6 +3116,11 @@ async def entrypoint(ctx: JobContext) -> None:
             await session.interrupt(force=True)
         except Exception:
             logger.debug("No active response to interrupt before silence hangup")
+        # Room deletion can win the race against ctx.shutdown() and make the
+        # framework report "parent process shutdown". Record that this is an
+        # intentional, answered-call completion before deleting the room.
+        if outbound_job and outbound_call_answered:
+            outbound_call_ended_normally = True
         try:
             await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
         finally:
