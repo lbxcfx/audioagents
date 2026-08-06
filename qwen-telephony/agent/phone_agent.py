@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import threading
-from time import perf_counter
+from time import perf_counter, time_ns
 from typing import Any
 import uuid
 import wave
@@ -278,6 +278,9 @@ def _prepare_wav_for_room_playback(audio_bytes: bytes) -> bytes:
 
 
 def _select_realtime_opening(scene: dict[str, Any] | None) -> str:
+    configured = os.getenv("QWEN_REALTIME_OPENING_TEXT", "").strip()
+    if configured:
+        return configured
     if not scene:
         return secrets.choice(DEFAULT_REALTIME_OPENINGS)
 
@@ -296,6 +299,27 @@ def _select_realtime_opening(scene: dict[str, Any] | None) -> str:
     )
     opening = str((entry or {}).get("text") or "").strip()
     return opening or DEFAULT_REALTIME_OPENINGS[0]
+
+
+def _append_local_transcript(
+    *, room_name: str, role: str, text: str, item_id: str = "", source: str = "realtime"
+) -> None:
+    directory = os.getenv("QWEN_REALTIME_TRANSCRIPT_DIR", "").strip()
+    if not directory or role not in {"user", "assistant"} or not text.strip():
+        return
+    safe_room = re.sub(r"[^A-Za-z0-9_.-]+", "_", room_name).strip("._") or "unknown-room"
+    target_dir = Path(directory).expanduser()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp_ns": time_ns(),
+        "room": room_name,
+        "role": role,
+        "text": text.strip(),
+        "item_id": item_id,
+        "source": source,
+    }
+    with (target_dir / f"{safe_room}.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _is_wechat_added_notice(text: str) -> bool:
@@ -405,8 +429,10 @@ async def _wait_for_active_sip_participant(
 async def ensure_realtime_fixed_audio_cache() -> None:
     """Pre-generate deterministic Realtime phrases before any call is assigned."""
 
+    configured_opening = os.getenv("QWEN_REALTIME_OPENING_TEXT", "").strip()
     required_texts = (
         *DEFAULT_REALTIME_OPENINGS,
+        *((configured_opening,) if configured_opening else ()),
         WECHAT_ADDED_NOTICE_TEXT,
         FINAL_GOODBYE_TEXT,
     )
@@ -558,6 +584,81 @@ async def _play_wav_bytes_direct(
         if sid:
             await room.local_participant.unpublish_track(sid)
         await source.aclose()
+
+
+def _wav_pcm_sha256(audio_bytes: bytes) -> str:
+    with wave.open(io.BytesIO(audio_bytes), "rb") as reader:
+        return hashlib.sha256(reader.readframes(reader.getnframes())).hexdigest()
+
+
+def _write_audio_ab_mapping(
+    *,
+    room_name: str,
+    source: Path,
+    prepared_audio: bytes,
+    pcm_sha256: str,
+    mapping: dict[str, str],
+) -> Path:
+    configured_dir = os.getenv("QWEN_REALTIME_AB_RESULT_DIR", "").strip()
+    target_dir = (
+        Path(configured_dir).expanduser()
+        if configured_dir
+        else ROOT / "qwen-telephony" / "data" / "ab-tests"
+    )
+    safe_room = re.sub(r"[^A-Za-z0-9_.-]+", "_", room_name).strip("._") or "unknown-room"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{safe_room}.mapping.json"
+    with wave.open(io.BytesIO(prepared_audio), "rb") as reader:
+        payload = {
+            "room": room_name,
+            "source_file": str(source.resolve()),
+            "source_file_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "prepared_wav_sha256": hashlib.sha256(prepared_audio).hexdigest(),
+            "pcm_sha256": pcm_sha256,
+            "sample_rate": reader.getframerate(),
+            "channels": reader.getnchannels(),
+            "sample_width_bytes": reader.getsampwidth(),
+            "pcm_frames": reader.getnframes(),
+            "mapping": mapping,
+            "blinded": True,
+            "created_at_ns": time_ns(),
+        }
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("Blind A/B mapping saved: room=%s path=%s", room_name, target)
+    return target
+
+
+async def _play_wav_bytes_via_agent_output(
+    audio_output: Any,
+    audio_bytes: bytes,
+    *,
+    label: str,
+) -> float:
+    """Feed PCM through the exact AgentSession output used by Qwen Realtime."""
+
+    started = perf_counter()
+    audio_duration = 0.0
+    frame_count = 0
+    async for frame in _audio_frames_from_wav_bytes(audio_bytes, label=label):
+        await audio_output.capture_frame(frame)
+        audio_duration += frame.duration
+        frame_count += 1
+    audio_output.flush()
+    playback = await audio_output.wait_for_playout()
+    if getattr(playback, "interrupted", False):
+        raise RuntimeError(f"{label} playback was interrupted")
+    logger.info(
+        "%s AgentSession playback completed: frames=%d audio_duration=%.3fs "
+        "elapsed=%.3fs",
+        label,
+        frame_count,
+        audio_duration,
+        perf_counter() - started,
+    )
+    return audio_duration
 
 
 def _ensure_room_greeting_audio_cache() -> bool:
@@ -1951,6 +2052,9 @@ class PhoneAgent(Agent):
         self._job_ctx = ctx
         self._managed_job = managed_job
         self._sip_identity = sip_identity
+        self._configured_audio_sample_played = False
+        self._configured_audio_ab_test_played = False
+        self._agent_session: AgentSession | None = None
         self._pending_business_event_tasks: set[asyncio.Task[None]] = set()
         super().__init__(
             instructions=(
@@ -1984,6 +2088,119 @@ class PhoneAgent(Agent):
                 "Timed out waiting for %d pending business event(s)",
                 len(pending),
             )
+
+    @function_tool(
+        description=(
+            "Play the single operator-configured WAV sample to the caller in full. "
+            "Use only when the active prompt explicitly asks for an audio rating, and "
+            "only after confirming the caller's identity. The tool has no path argument."
+        )
+    )
+    async def play_configured_audio_sample(self) -> str:
+        if self._configured_audio_sample_played:
+            return "音频已经播放过，不要重复播放；现在继续询问评分。"
+        if not self._job_ctx:
+            return "当前通话无法播放配置的音频。"
+        configured = os.getenv("QWEN_REALTIME_SAMPLE_AUDIO_FILE", "").strip()
+        if not configured:
+            return "没有配置待播放音频。"
+        source = Path(configured).expanduser()
+        if source.suffix.lower() != ".wav" or not source.is_file():
+            return "配置的 WAV 音频不存在或格式不受支持。"
+        if source.stat().st_size > 50 * 1024 * 1024:
+            return "配置的 WAV 音频过大，无法播放。"
+        audio = _prepare_wav_for_room_playback(source.read_bytes())
+        await _play_wav_bytes_direct(
+            self._job_ctx.room,
+            audio,
+            label="Configured rating audio sample",
+            track_name="realtime-rating-audio-sample",
+        )
+        self._configured_audio_sample_played = True
+        _append_local_transcript(
+            room_name=self._job_ctx.room.name,
+            role="assistant",
+            text=f"[已完整播放音频：{source.name}]",
+            source="programmatic_audio_sample",
+        )
+        return "音频已完整播放。现在立即询问客户：如果满分为10分，请问您给几分？"
+
+    @function_tool(
+        description=(
+            "Run the operator-configured blind A/B playback exactly once. The same "
+            "WAV/PCM content is randomized between a direct LiveKit audio track and "
+            "the active AgentSession RoomIO output. Use only when the active prompt "
+            "explicitly asks for a strict audio-path A/B test and after confirming "
+            "the caller's identity. Never reveal the hidden mapping to the caller."
+        )
+    )
+    async def play_configured_audio_ab_test(self, ctx: RunContext) -> str:
+        if self._configured_audio_ab_test_played:
+            return "样本A和样本B已经播放过，不要重复播放；现在继续收集两个评分。"
+        if not self._job_ctx or not self._agent_session:
+            return "当前通话无法运行A/B测试。"
+        configured = os.getenv("QWEN_REALTIME_AB_AUDIO_FILE", "").strip()
+        if not configured:
+            return "没有配置A/B测试音频。"
+        source = Path(configured).expanduser()
+        if source.suffix.lower() != ".wav" or not source.is_file():
+            return "配置的A/B测试 WAV 音频不存在或格式不受支持。"
+        if source.stat().st_size > 50 * 1024 * 1024:
+            return "配置的A/B测试 WAV 音频过大，无法播放。"
+
+        # A spoken lead-in can precede a tool call in the same model response.
+        # Waiting here prevents that lead-in from overlapping the first sample.
+        await ctx.wait_for_playout()
+        audio = _prepare_wav_for_room_playback(source.read_bytes())
+        pcm_sha256 = _wav_pcm_sha256(audio)
+        paths = ["direct_local_audio_track", "agent_session_roomio"]
+        secrets.SystemRandom().shuffle(paths)
+        mapping = {"A": paths[0], "B": paths[1]}
+        _write_audio_ab_mapping(
+            room_name=self._job_ctx.room.name,
+            source=source,
+            prepared_audio=audio,
+            pcm_sha256=pcm_sha256,
+            mapping=mapping,
+        )
+
+        async def play(label: str, path: str) -> None:
+            if path == "direct_local_audio_track":
+                await _play_wav_bytes_direct(
+                    self._job_ctx.room,
+                    audio,
+                    label=f"Blind A/B sample {label} direct",
+                    track_name=f"realtime-ab-{label.lower()}-direct",
+                )
+            else:
+                audio_output = self._agent_session.output.audio
+                if audio_output is None:
+                    raise RuntimeError("AgentSession RoomIO audio output is unavailable")
+                await _play_wav_bytes_via_agent_output(
+                    audio_output,
+                    audio,
+                    label=f"Blind A/B sample {label} RoomIO",
+                )
+            _append_local_transcript(
+                room_name=self._job_ctx.room.name,
+                role="assistant",
+                text=f"[样本{label}已完整播放]",
+                source="programmatic_audio_ab_test",
+            )
+
+        await play("A", mapping["A"])
+        await asyncio.sleep(1.5)
+        await play("B", mapping["B"])
+        self._configured_audio_ab_test_played = True
+        logger.info(
+            "Blind A/B playback completed: room=%s pcm_sha256=%s",
+            self._job_ctx.room.name,
+            pcm_sha256,
+        )
+        return (
+            "样本A和样本B均已完整播放。不要透露后台映射。"
+            "现在先询问样本A的0到10分并确认，再询问样本B的0到10分并确认。"
+        )
 
     @function_tool(
         description=(
@@ -2552,6 +2769,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def persist_preseeded_assistant_turn(text: str, *, source: str) -> None:
         logger.info("Programmatic assistant response: source=%s text=%s", source, text)
+        _append_local_transcript(
+            room_name=ctx.room.name,
+            role="assistant",
+            text=text,
+            source=source,
+        )
         if managed_job and insights_session_id:
             try:
                 await _insights_event(
@@ -2770,6 +2993,13 @@ async def entrypoint(ctx: JobContext) -> None:
         if role not in {"user", "assistant"} or not text:
             return
 
+        _append_local_transcript(
+            room_name=ctx.room.name,
+            role=role,
+            text=text,
+            item_id=str(getattr(item, "id", "") or ""),
+        )
+
         if selected_pipeline == REALTIME_PIPELINE:
             if role == "user" and awaiting_wechat_acknowledgement:
                 cancel_wechat_close_timer("customer replied")
@@ -2924,6 +3154,9 @@ async def entrypoint(ctx: JobContext) -> None:
         instructions=realtime_instructions or None,
         chat_ctx=initial_chat_ctx,
     )
+    # The blind A/B tool uses this exact output object so its RoomIO arm is the
+    # same production path used by Qwen Realtime responses.
+    phone_agent._agent_session = session
 
     async def flush_pending_business_events(_reason: str = "") -> None:
         await phone_agent.wait_for_pending_business_events()

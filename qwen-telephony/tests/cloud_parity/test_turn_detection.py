@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from importlib.metadata import version
 from pathlib import Path
 import sys
@@ -138,6 +139,7 @@ def test_silero_vad_is_prewarmed_once_per_job_process(monkeypatch) -> None:
 def test_realtime_opening_selection_uses_default_variants_and_scene_entry(
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("QWEN_REALTIME_OPENING_TEXT", raising=False)
     selected = phone_agent.DEFAULT_REALTIME_OPENINGS[2]
     monkeypatch.setattr(phone_agent.secrets, "choice", lambda _items: selected)
     assert phone_agent._select_realtime_opening(None) == selected
@@ -160,6 +162,101 @@ def test_realtime_opening_selection_uses_default_variants_and_scene_entry(
         }
     }
     assert phone_agent._select_realtime_opening(scene) == "您好，这是动态开场。"
+
+
+def test_realtime_opening_selection_accepts_runtime_override(monkeypatch) -> None:
+    monkeypatch.setenv("QWEN_REALTIME_OPENING_TEXT", "您好，请问是晓旭老师吗？")
+    assert phone_agent._select_realtime_opening(None) == "您好，请问是晓旭老师吗？"
+    assert phone_agent._select_realtime_opening({"flow": {}}) == "您好，请问是晓旭老师吗？"
+
+
+def test_local_realtime_transcript_is_saved(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("QWEN_REALTIME_TRANSCRIPT_DIR", str(tmp_path))
+    monkeypatch.setattr(phone_agent, "time_ns", lambda: 123)
+    phone_agent._append_local_transcript(
+        room_name="recorded/room",
+        role="user",
+        text=" 是的。 ",
+        item_id="item-1",
+    )
+    record = json.loads((tmp_path / "recorded_room.jsonl").read_text(encoding="utf-8"))
+    assert record == {
+        "timestamp_ns": 123,
+        "room": "recorded/room",
+        "role": "user",
+        "text": "是的。",
+        "item_id": "item-1",
+        "source": "realtime",
+    }
+
+
+def test_blind_ab_mapping_records_identical_pcm_and_hidden_paths(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "source.wav"
+    pcm = (b"\x01\x00\xff\xff" * 240)
+    with wave.open(str(source), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(24_000)
+        output.writeframes(pcm)
+    prepared = phone_agent._prepare_wav_for_room_playback(source.read_bytes())
+    monkeypatch.setenv("QWEN_REALTIME_AB_RESULT_DIR", str(tmp_path / "results"))
+
+    target = phone_agent._write_audio_ab_mapping(
+        room_name="strict/ab",
+        source=source,
+        prepared_audio=prepared,
+        pcm_sha256=phone_agent._wav_pcm_sha256(prepared),
+        mapping={"A": "agent_session_roomio", "B": "direct_local_audio_track"},
+    )
+
+    record = json.loads(target.read_text(encoding="utf-8"))
+    assert record["pcm_sha256"] == phone_agent.hashlib.sha256(pcm).hexdigest()
+    assert record["sample_rate"] == 24_000
+    assert record["channels"] == 1
+    assert record["mapping"] == {
+        "A": "agent_session_roomio",
+        "B": "direct_local_audio_track",
+    }
+    assert record["blinded"] is True
+
+
+def test_agent_output_ab_arm_receives_the_exact_pcm() -> None:
+    async def run() -> None:
+        pcm = b"".join(value.to_bytes(2, "little", signed=True) for value in range(1000))
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(24_000)
+            output.writeframes(pcm)
+
+        class Output:
+            def __init__(self) -> None:
+                self.captured = bytearray()
+                self.flushed = False
+
+            async def capture_frame(self, frame) -> None:
+                self.captured.extend(bytes(frame.data))
+
+            def flush(self) -> None:
+                self.flushed = True
+
+            async def wait_for_playout(self):
+                return SimpleNamespace(interrupted=False)
+
+        sink = Output()
+        duration = await phone_agent._play_wav_bytes_via_agent_output(
+            sink,
+            wav_buffer.getvalue(),
+            label="test A/B RoomIO arm",
+        )
+        assert bytes(sink.captured) == pcm
+        assert sink.flushed is True
+        assert duration == pytest.approx(1000 / 24_000)
+
+    asyncio.run(run())
 
 
 def test_realtime_scene_fetch_is_started_without_blocking_opening(monkeypatch) -> None:

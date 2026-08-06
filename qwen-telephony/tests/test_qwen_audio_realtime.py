@@ -84,6 +84,23 @@ def test_prompt_loader_replaces_call_variables(monkeypatch: pytest.MonkeyPatch) 
     assert "{{" not in prompt
 
 
+def test_blind_ab_prompt_is_loadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompt_file = ROOT / "docs" / "qwen-audio-realtime-ab-test-prompt.md"
+    monkeypatch.delenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", raising=False)
+    monkeypatch.setenv("QWEN_AUDIO_REALTIME_PROMPT_FILE", str(prompt_file))
+
+    prompt = load_realtime_instructions(
+        root=ROOT.parent,
+        session_id="audio-ab-test",
+        scene_id=0,
+    )
+
+    assert "play_configured_audio_ab_test" in prompt
+    assert "样本A" in prompt
+    assert "样本B" in prompt
+    assert "不得向对方透露" in prompt
+
+
 def test_default_realtime_openings_have_four_distinct_variants() -> None:
     assert len(DEFAULT_REALTIME_OPENINGS) == 4
     assert len(set(DEFAULT_REALTIME_OPENINGS)) == 4
