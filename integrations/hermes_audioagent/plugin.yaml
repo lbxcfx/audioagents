@@ -1,5 +1,5 @@
 name: audioagent
-version: 0.1.0
+version: 0.1.1
 description: "Submit confirmed outbound calling tasks to AudioAgent and return structured call results."
 author: audioagents
 kind: standalone
@@ -11,5 +11,3 @@ provides_tools:
   - audioagent_get_outbound_task
   - audioagent_wait_outbound_task
   - audioagent_cancel_outbound_task
-hooks:
-  - pre_tool_call

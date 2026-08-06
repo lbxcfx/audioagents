@@ -25,7 +25,8 @@ for the AudioAgent development authentication mode.
 For Weixin, set `WEIXIN_DM_POLICY=allowlist`, populate `WEIXIN_ALLOWED_USERS`,
 and disable unrelated high-privilege tools on the `hermes-weixin` surface.
 The submit and cancel tools independently require an explicit confirmation
-boolean.
+boolean. The operator's reply to the task preview is the single interactive
+confirmation; the plugin does not add a redundant Hermes `/approve` prompt.
 
 After submission, delegate one self-contained wait task with `delegate_task`.
 Top-level Hermes delegation is asynchronous and its result re-enters the same

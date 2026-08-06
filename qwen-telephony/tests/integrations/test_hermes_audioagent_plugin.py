@@ -60,15 +60,7 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
     }
     assert context.skills[0][0] == "outbound-calling"
     assert context.skills[0][1].is_file()
-    assert context.hooks[0][0] == "pre_tool_call"
-    directive = context.hooks[0][1](
-        "audioagent_submit_outbound_task",
-        {"task_name": "续费提醒", "customers": [{"phone": "13800000000"}]},
-        tool_call_id="call-123",
-    )
-    assert directive["action"] == "approve"
-    assert "1 个号码" in directive["message"]
-    assert directive["rule_key"] == "audioagent:submit:call-123"
+    assert context.hooks == []
 
 
 def test_submit_requires_explicit_confirmation() -> None:
