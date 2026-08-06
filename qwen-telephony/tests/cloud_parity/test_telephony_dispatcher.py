@@ -95,6 +95,67 @@ def test_dispatcher_marks_dispatching_before_livekit_side_effect() -> None:
     assert "service_token" not in metadata
 
 
+def test_dispatcher_passes_only_allowlisted_task_snapshot() -> None:
+    control = FakeControl()
+    livekit = SimpleNamespace(agent_dispatch=FakeAgentDispatch())
+    call = _call(
+        metadata={
+            "task": {
+                "id": "hermes-task-1",
+                "prompt_snapshot": "请向 {{customer_name}} 确认续费安排。",
+                "scene_id": 42,
+            },
+            "customer": {
+                "name": "林经理",
+                "company": "示例科技",
+                "profile": {"plan": "enterprise"},
+            },
+            "delivery": {"platform": "weixin", "chat_id": "private-chat"},
+        }
+    )
+
+    asyncio.run(
+        dispatcher.dispatch_call(_settings(), control, livekit, "project-1", call)
+    )
+
+    metadata = json.loads(livekit.agent_dispatch.requests[0].metadata)
+    assert metadata["task_id"] == "hermes-task-1"
+    assert metadata["realtime_prompt"].startswith("请向")
+    assert metadata["scene_id"] == 42
+    assert metadata["customer_name"] == "林经理"
+    assert metadata["customer_company"] == "示例科技"
+    assert json.loads(metadata["customer_profile"])["plan"] == "enterprise"
+    assert "delivery" not in metadata
+    assert "private-chat" not in json.dumps(metadata, ensure_ascii=False)
+
+
+def test_dispatcher_rejects_invalid_task_metadata_before_dispatch() -> None:
+    control = FakeControl()
+    livekit = SimpleNamespace(agent_dispatch=FakeAgentDispatch())
+
+    asyncio.run(
+        dispatcher.dispatch_call(
+            _settings(),
+            control,
+            livekit,
+            "project-1",
+            _call(metadata={"task": {"scene_id": "not-an-integer"}}),
+        )
+    )
+
+    assert control.transitions == [
+        (
+            "failed",
+            {
+                "failure_code": "task_metadata_invalid",
+                "failure_detail": "scene id must be an integer",
+                "retryable": False,
+            },
+        )
+    ]
+    assert livekit.agent_dispatch.requests == []
+
+
 def test_dispatcher_derives_heartbeat_from_short_project_lease() -> None:
     control = FakeControl()
     livekit = SimpleNamespace(agent_dispatch=FakeAgentDispatch())

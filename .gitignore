@@ -37,3 +37,7 @@ __pycache__/
 *.log
 *.pid
 *.wav
+
+# Upstream Hermes checkout used for local integration testing. The maintained
+# AudioAgent plugin lives under integrations/hermes_audioagent instead.
+/hermes-agent/

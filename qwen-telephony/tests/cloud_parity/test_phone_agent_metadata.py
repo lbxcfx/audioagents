@@ -176,6 +176,11 @@ def test_phone_agent_shutdown_does_not_complete_unanswered_call() -> None:
     assert phone_agent._outbound_shutdown_transition(
         answered=True, reason="worker shutdown"
     ) == ("failed", "agent_runtime_terminated")
+    assert phone_agent._outbound_shutdown_transition(
+        answered=True,
+        reason="parent process shutdown",
+        normal_disconnect=True,
+    ) == ("completed", "")
 
 
 def test_phone_agent_executes_console_dtmf_and_say_commands() -> None:

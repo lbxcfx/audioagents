@@ -173,6 +173,9 @@ def test_projects_are_isolated_and_roles_are_enforced(store: PlatformStore) -> N
     assert store.require_permission(
         alpha["id"], "agent-worker", "session.write"
     ) == "worker"
+    assert store.require_permission(
+        alpha["id"], "agent-worker", "session.read"
+    ) == "worker"
     with pytest.raises(AccessDeniedError):
         store.require_permission(alpha["id"], "agent-worker", "telephony.operate")
     with pytest.raises(AccessDeniedError):

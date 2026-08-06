@@ -910,6 +910,73 @@ def test_production_campaign_pause_resume_and_trunk_cps(telephony_stack) -> None
     assert len(second) == 1
 
 
+def test_campaign_materialization_snapshots_task_and_customer_metadata(
+    telephony_stack,
+) -> None:
+    _, service, project_id = telephony_stack
+    trunk = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="hermes-trunk",
+        direction="outbound",
+        provider="carrier",
+        livekit_trunk_id="ST_hermes",
+        numbers=["+8610000000000"],
+    )
+    contact = service.upsert_contact(
+        project_id=project_id,
+        user_id="owner",
+        external_id="hermes-customer-1",
+        name="林经理",
+        phone_number="+8613800000888",
+        metadata={"company": "示例科技", "profile": {"plan": "enterprise"}},
+    )
+    campaign = service.create_campaign(
+        project_id=project_id,
+        user_id="owner",
+        name="Hermes renewal task",
+        agent_name="commercial-agent",
+        trunk_id=trunk["id"],
+        source_number="+8610000000000",
+        metadata={
+            "integration": "hermes",
+            "task": {
+                "id": "hermes-task-1",
+                "prompt_snapshot": "请向 {{customer_name}} 确认续费。",
+                "scene_id": 42,
+            },
+            "delivery": {"platform": "weixin", "chat_id": "chat-1"},
+        },
+    )
+    service.add_campaign_contacts(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        contact_ids=[contact["id"]],
+    )
+    running = service.set_campaign_status(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        status="running",
+    )
+
+    assert running["enqueue_result"] == {"queued": 1, "blocked": 0}
+    calls = service.list_calls(project_id=project_id, user_id="owner")
+    assert len(calls) == 1
+    metadata = calls[0]["metadata"]
+    assert metadata["task"]["id"] == "hermes-task-1"
+    assert metadata["task"]["scene_id"] == 42
+    assert metadata["campaign_id"] == campaign["id"]
+    assert metadata["contact_id"] == contact["id"]
+    assert metadata["customer"] == {
+        "name": "林经理",
+        "company": "示例科技",
+        "profile": {"plan": "enterprise"},
+    }
+    assert metadata["delivery"]["chat_id"] == "chat-1"
+
+
 def test_saturated_trunk_does_not_starve_another_ready_trunk(
     telephony_stack,
 ) -> None:

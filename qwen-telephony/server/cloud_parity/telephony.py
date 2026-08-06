@@ -1231,9 +1231,12 @@ class TelephonyService:
             )
             contacts = conn.execute(
                 f"""
-                SELECT cc.contact_id, c.phone_number, c.status AS contact_status,
+                SELECT cc.contact_id, c.phone_number, c.name AS contact_name,
+                       c.metadata_json AS contact_metadata_json,
+                       c.status AS contact_status,
                        cp.id AS campaign_id, cp.source_number, cp.agent_name,
-                       cp.trunk_id, cp.priority, cp.max_attempts, cp.scheduled_at
+                       cp.trunk_id, cp.priority, cp.max_attempts, cp.scheduled_at,
+                       cp.metadata_json AS campaign_metadata_json
                 FROM telephony_campaign_contacts cc
                 JOIN telephony_contacts c ON c.id = cc.contact_id
                 JOIN telephony_campaigns cp ON cp.id = cc.campaign_id
@@ -1272,6 +1275,31 @@ class TelephonyService:
                 call = None
             else:
                 try:
+                    campaign_metadata = self._reveal_json(
+                        contact["campaign_metadata_json"]
+                    )
+                    contact_metadata = self._reveal_json(
+                        contact["contact_metadata_json"]
+                    )
+                    metadata = dict(campaign_metadata)
+                    metadata["campaign_id"] = current_campaign_id
+                    metadata["contact_id"] = contact_id
+                    customer = (
+                        dict(metadata.get("customer") or {})
+                        if isinstance(metadata.get("customer"), dict)
+                        else {}
+                    )
+                    nested_contact = contact_metadata.get("customer")
+                    if isinstance(nested_contact, dict):
+                        customer.update(nested_contact)
+                    for field in ("name", "company", "profile"):
+                        contact_value = contact_metadata.get(field)
+                        if contact_value is not None and contact_value != "":
+                            customer[field] = contact_value
+                    if contact["contact_name"] and not customer.get("name"):
+                        customer["name"] = str(contact["contact_name"])
+                    if customer:
+                        metadata["customer"] = customer
                     scheduled_at = datetime.fromisoformat(
                         str(contact["scheduled_at"]).replace("Z", "+00:00")
                     )
@@ -1287,10 +1315,7 @@ class TelephonyService:
                         priority=int(contact["priority"]),
                         max_attempts=int(contact["max_attempts"]),
                         available_at=scheduled_at,
-                        metadata={
-                            "campaign_id": current_campaign_id,
-                            "contact_id": contact_id,
-                        },
+                        metadata=metadata,
                     )
                     reason = ""
                 except (ComplianceBlockedError, ValueError, ResourceNotFoundError) as exc:

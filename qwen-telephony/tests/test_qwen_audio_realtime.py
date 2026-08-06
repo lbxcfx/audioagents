@@ -84,6 +84,22 @@ def test_prompt_loader_replaces_call_variables(monkeypatch: pytest.MonkeyPatch) 
     assert "{{" not in prompt
 
 
+def test_task_prompt_snapshot_overrides_global_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", "旧的全局任务")
+    prompt = load_realtime_instructions(
+        root=ROOT.parent,
+        session_id="hermes-room",
+        scene_id=None,
+        prompt_override="给 {{customer_name}} 执行续费提醒，任务 {{session_id}}。",
+        customer_name="林经理",
+    )
+
+    assert prompt == "给 林经理 执行续费提醒，任务 hermes-room。"
+    assert "旧的全局任务" not in prompt
+
+
 def test_blind_ab_prompt_is_loadable(monkeypatch: pytest.MonkeyPatch) -> None:
     prompt_file = ROOT / "docs" / "qwen-audio-realtime-ab-test-prompt.md"
     monkeypatch.delenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", raising=False)

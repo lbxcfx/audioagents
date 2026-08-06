@@ -1,0 +1,15 @@
+name: audioagent
+version: 0.1.0
+description: "Submit confirmed outbound calling tasks to AudioAgent and return structured call results."
+author: audioagents
+kind: standalone
+requires_env:
+  - name: AUDIOAGENT_PROJECT_ID
+    description: "AudioAgent Cloud-Parity project ID"
+provides_tools:
+  - audioagent_submit_outbound_task
+  - audioagent_get_outbound_task
+  - audioagent_wait_outbound_task
+  - audioagent_cancel_outbound_task
+hooks:
+  - pre_tool_call

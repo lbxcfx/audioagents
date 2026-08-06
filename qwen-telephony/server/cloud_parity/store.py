@@ -53,7 +53,10 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "viewer": frozenset(
         {"project.read", "session.read", "agent.read", "analytics.read", "telephony.read"}
     ),
-    "worker": frozenset({"session.write", "telephony.work"}),
+    # Workers create and append to managed sessions, then read the same session
+    # while claiming console commands.  Without session.read the console claim
+    # path authenticates the worker and immediately rejects its session lookup.
+    "worker": frozenset({"session.read", "session.write", "telephony.work"}),
 }
 
 

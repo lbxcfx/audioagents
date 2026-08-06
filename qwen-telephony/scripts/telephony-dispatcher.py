@@ -327,6 +327,68 @@ async def start_health_server(
     )
     return runner
 
+
+def task_dispatch_fields(call: dict[str, Any]) -> dict[str, Any]:
+    """Extract the allow-listed task snapshot passed to the phone agent.
+
+    Call metadata is operator-controlled and may also contain delivery routing
+    details for Hermes.  Only the fields needed by the phone agent cross the
+    LiveKit dispatch boundary.
+    """
+
+    metadata = call.get("metadata")
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise ValueError("call metadata must be an object")
+    task = metadata.get("task") or {}
+    customer = metadata.get("customer") or {}
+    if not isinstance(task, dict) or not isinstance(customer, dict):
+        raise ValueError("task and customer metadata must be objects")
+
+    def text_field(value: Any, name: str, limit: int) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        result = str(value).strip()
+        if len(result) > limit:
+            raise ValueError(f"{name} exceeds {limit} characters")
+        return result
+
+    fields: dict[str, Any] = {}
+    task_id = text_field(task.get("id") or metadata.get("task_id"), "task id", 200)
+    prompt = text_field(
+        task.get("prompt_snapshot") or task.get("prompt") or metadata.get("prompt"),
+        "task prompt",
+        24_000,
+    )
+    if task_id:
+        fields["task_id"] = task_id
+    if prompt:
+        fields["realtime_prompt"] = prompt
+
+    raw_scene_id = task.get("scene_id", metadata.get("scene_id"))
+    if raw_scene_id not in {None, ""}:
+        try:
+            scene_id = int(raw_scene_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scene id must be an integer") from exc
+        if scene_id <= 0:
+            raise ValueError("scene id must be positive")
+        fields["scene_id"] = scene_id
+
+    for source_name, target_name, limit in (
+        ("name", "customer_name", 200),
+        ("company", "customer_company", 200),
+        ("profile", "customer_profile", 4_000),
+    ):
+        value = text_field(customer.get(source_name), target_name, limit)
+        if value:
+            fields[target_name] = value
+    return fields
+
+
 async def dispatch_call(
     settings: DispatcherSettings,
     control: ControlPlaneClient,
@@ -342,6 +404,18 @@ async def dispatch_call(
             "failed",
             failure_code="outbound_trunk_missing",
             failure_detail="call has no active LiveKit outbound trunk",
+            retryable=False,
+        )
+        return
+    try:
+        task_fields = task_dispatch_fields(call)
+    except ValueError as exc:
+        await control.transition(
+            project_id,
+            call,
+            "failed",
+            failure_code="task_metadata_invalid",
+            failure_detail=str(exc)[:500],
             retryable=False,
         )
         return
@@ -374,6 +448,7 @@ async def dispatch_call(
             "lease_seconds": lease_seconds,
             "recording_mode": call.get("recording_mode") or "off",
             "recording_disclosure_text": call.get("recording_disclosure_text") or "",
+            **task_fields,
         },
         separators=(",", ":"),
     )

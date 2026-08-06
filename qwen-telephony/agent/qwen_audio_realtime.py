@@ -300,15 +300,19 @@ def load_realtime_instructions(
     root: Path,
     session_id: str,
     scene_id: int | None,
+    prompt_override: str = "",
     customer_name: str = "",
     customer_company: str = "",
     customer_phone: str = "",
     customer_profile: str = "",
     scene: dict[str, Any] | None = None,
 ) -> str:
-    override = os.getenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", "").strip()
-    if override:
-        prompt = override
+    task_prompt = prompt_override.strip()
+    environment_override = os.getenv("QWEN_AUDIO_REALTIME_INSTRUCTIONS", "").strip()
+    if task_prompt:
+        prompt = task_prompt
+    elif environment_override:
+        prompt = environment_override
     else:
         configured = os.getenv("QWEN_AUDIO_REALTIME_PROMPT_FILE", "").strip()
         path = (

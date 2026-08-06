@@ -131,8 +131,8 @@ def test_close_session_is_idempotent_for_end_time(services) -> None:
     assert first["ended_at"] == second["ended_at"]
 
 
-def test_worker_can_write_session_lifecycle_without_read_permission(services) -> None:
-    store, insights, project, _ = services
+def test_worker_can_read_session_lifecycle_only_in_own_project(services) -> None:
+    store, insights, project, other_project = services
     store.add_membership(
         project_id=project["id"], actor_id="owner-1", user_id="worker", role="worker"
     )
@@ -153,7 +153,13 @@ def test_worker_can_write_session_lifecycle_without_read_permission(services) ->
 
     assert event["session_id"] == session["id"]
     assert closed["status"] == "completed"
+    fetched = insights.get_session(
+        project_id=project["id"], user_id="worker", session_id=session["id"]
+    )
+    assert fetched["id"] == session["id"]
     with pytest.raises(AccessDeniedError):
         insights.get_session(
-            project_id=project["id"], user_id="worker", session_id=session["id"]
+            project_id=other_project["id"],
+            user_id="worker",
+            session_id=session["id"],
         )

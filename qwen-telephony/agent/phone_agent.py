@@ -1868,11 +1868,17 @@ def _telephony_heartbeat_interval(job: dict[str, Any]) -> float:
 
 
 def _outbound_shutdown_transition(
-    *, answered: bool, reason: str
+    *, answered: bool, reason: str, normal_disconnect: bool = False
 ) -> tuple[str, str]:
     normalized = reason.strip().lower()
     if not answered:
         return "reconciling", "agent_shutdown_before_answer"
+    # Deleting the LiveKit room after a remote SIP BYE may surface to the job
+    # finalizer as "parent process shutdown".  Preserve the earlier, explicit
+    # SIP disconnect observation so a successfully answered call is not
+    # rewritten as an agent runtime failure.
+    if normal_disconnect:
+        return "completed", ""
     failure_markers = (
         "failed",
         "error",
@@ -2427,6 +2433,7 @@ async def entrypoint(ctx: JobContext) -> None:
     insights_session_id = ""
     telephony_terminal = False
     outbound_call_answered = False
+    outbound_call_ended_normally = False
     shutdown_finalizers: list[Any] = []
     if outbound_job or inbound_config:
         if _telephony_control_client is None or _telephony_control_client.is_closed:
@@ -2690,6 +2697,7 @@ async def entrypoint(ctx: JobContext) -> None:
             root=ROOT,
             session_id=ctx.room.name,
             scene_id=scene_id,
+            prompt_override=str((managed_job or {}).get("realtime_prompt") or ""),
             customer_name=str((managed_job or {}).get("customer_name") or ""),
             customer_company=str((managed_job or {}).get("customer_company") or ""),
             customer_phone=str(
@@ -3073,6 +3081,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     shutdown_status, _ = _outbound_shutdown_transition(
                         answered=outbound_call_answered,
                         reason=reason,
+                        normal_disconnect=outbound_call_ended_normally,
                     )
                     insights_status = (
                         "completed" if shutdown_status == "completed" else "failed"
@@ -3113,6 +3122,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     final_status, failure_code = _outbound_shutdown_transition(
                         answered=outbound_call_answered,
                         reason=reason,
+                        normal_disconnect=outbound_call_ended_normally,
                     )
                 await _telephony_transition(
                     managed_job,
@@ -3253,6 +3263,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 root=ROOT,
                 session_id=ctx.room.name,
                 scene_id=scene_id,
+                prompt_override=str((managed_job or {}).get("realtime_prompt") or ""),
                 customer_name=str((managed_job or {}).get("customer_name") or ""),
                 customer_company=str((managed_job or {}).get("customer_company") or ""),
                 customer_phone=str(
@@ -3313,7 +3324,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
-        nonlocal sip_disconnect_task
+        nonlocal sip_disconnect_task, outbound_call_ended_normally
         if participant.identity != managed_sip_identity or telephony_terminal:
             return
         if sip_disconnect_task is not None and not sip_disconnect_task.done():
@@ -3324,6 +3335,7 @@ async def entrypoint(ctx: JobContext) -> None:
             str((managed_job or {}).get("call_id") or ""),
             participant.identity,
         )
+        outbound_call_ended_normally = True
         sip_disconnect_task = asyncio.create_task(handle_sip_disconnect())
 
     async def ensure_required_recording() -> bool:
