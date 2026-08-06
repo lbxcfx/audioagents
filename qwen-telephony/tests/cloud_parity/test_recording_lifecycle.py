@@ -97,6 +97,19 @@ def test_recording_disclosure_waits_for_playout() -> None:
     assert events == ["say", "played"]
 
 
+def test_empty_recording_disclosure_is_silent() -> None:
+    class Session:
+        def say(self, *_args, **_kwargs):
+            raise AssertionError("empty recording disclosure must not be played")
+
+    asyncio.run(
+        phone_agent._play_recording_disclosure(
+            Session(),
+            {"recording_mode": "always", "recording_disclosure_text": ""},
+        )
+    )
+
+
 def test_managed_recording_uses_chrome_room_composite(monkeypatch) -> None:
     monkeypatch.setenv("QWEN_RECORDING_S3_BUCKET", "recordings")
     monkeypatch.setenv("QWEN_RECORDING_S3_REGION", "us-east-1")
@@ -115,7 +128,7 @@ def test_managed_recording_uses_chrome_room_composite(monkeypatch) -> None:
                 ctx,
                 {
                     "recording_mode": "always",
-                    "recording_disclosure_text": "本次通话将被录音",
+                    "recording_disclosure_text": "",
                     "project_id": "project-1",
                     "call_id": "call-1",
                 },

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
+
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -245,3 +248,54 @@ def test_result_forwarder_formats_hangup_without_saved_summary() -> None:
     assert "通话时长：42秒" in message
     assert "客户主动挂断" in message
     assert "可以；我再看看" in message
+
+
+def test_result_card_renders_clear_customer_summary(monkeypatch, tmp_path) -> None:
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    bold_font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    monkeypatch.setenv("AUDIOAGENT_CARD_FONT", font)
+    monkeypatch.setenv("AUDIOAGENT_CARD_FONT_BOLD", bold_font)
+    status = {
+        "campaign_name": "产品介绍",
+        "status": "completed",
+        "results": [
+            {
+                "status": "completed",
+                "phone": "+8613800000000",
+                "customer": {"name": "林经理"},
+                "answered_at": "2026-08-06T04:00:00Z",
+                "ended_at": "2026-08-06T04:00:42Z",
+                "summary": "客户希望下周再次联系。",
+            }
+        ],
+    }
+
+    path = delivery.render_result_card(
+        status,
+        campaign_id="campaign-1",
+        output_path=tmp_path / "result.png",
+    )
+
+    with Image.open(path) as image:
+        assert image.format == "PNG"
+        assert image.width == 1080
+        assert image.height >= 600
+
+
+def test_result_delivery_sends_card_as_weixin_media(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    card = tmp_path / "result.png"
+    card.write_bytes(b"png")
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(delivery.shutil, "which", lambda _name: "/usr/bin/hermes")
+    monkeypatch.setattr(delivery.subprocess, "run", fake_run)
+
+    assert delivery._send_message("任务已结束", card_path=card) is True
+    command = captured["command"]
+    assert command[-1] == f"MEDIA:{card}\n任务已结束"
+    assert command[command.index("--to") + 1] == "weixin"

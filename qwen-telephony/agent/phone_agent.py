@@ -1710,9 +1710,6 @@ async def _start_managed_recording(
 ) -> tuple[list[str], str]:
     if str(job.get("recording_mode") or "off") != "always":
         return [], ""
-    disclosure = str(job.get("recording_disclosure_text") or "").strip()
-    if not disclosure:
-        raise RuntimeError("recording disclosure text is missing")
     bucket = os.getenv("QWEN_RECORDING_S3_BUCKET", "").strip()
     region = os.getenv("QWEN_RECORDING_S3_REGION", "").strip()
     if not bucket or not region:
@@ -1856,7 +1853,8 @@ async def _play_recording_disclosure(session: AgentSession, job: dict[str, Any])
         return
     disclosure = str(job.get("recording_disclosure_text") or "").strip()
     if not disclosure:
-        raise RuntimeError("recording disclosure text is missing")
+        logger.info("Recording disclosure is disabled for room policy")
+        return
     notice = session.say(disclosure, allow_interruptions=False)
     await notice.wait_for_playout()
 

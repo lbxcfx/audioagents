@@ -419,8 +419,6 @@ class TelephonyService:
         disclosure = recording_disclosure_text.strip()
         if len(disclosure) > 1000:
             raise ValueError("recording_disclosure_text must not exceed 1000 characters")
-        if recording_mode == "always" and not disclosure:
-            raise ValueError("recording disclosure text is required when recording is enabled")
         start_text = window_start.strftime("%H:%M")
         end_text = window_end.strftime("%H:%M")
         now = _utc_now()

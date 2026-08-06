@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .client import AudioAgentClient
+from .result_card import render_result_card
 from .tools import _task_status
 
 
@@ -110,12 +111,19 @@ def format_result_message(status: dict[str, Any]) -> str:
     return "\n".join(lines)[:3500]
 
 
-def _send_message(message: str) -> bool:
+def format_card_caption(status: dict[str, Any]) -> str:
+    task = str(status.get("campaign_name") or status.get("task_id") or "未命名任务")
+    state = str(status.get("status") or "未知")
+    return f"外呼任务「{task}」已结束（{state}），详情见结果卡片。"[:500]
+
+
+def _send_message(message: str, *, card_path: Path | None = None) -> bool:
     hermes = shutil.which("hermes") or "/usr/local/bin/hermes"
     target = os.getenv("AUDIOAGENT_RESULT_TARGET", "weixin").strip() or "weixin"
+    payload = f"MEDIA:{card_path}\n{message}" if card_path else message
     try:
         completed = subprocess.run(
-            [hermes, "send", "--quiet", "--to", target, message],
+            [hermes, "send", "--quiet", "--to", target, payload],
             capture_output=True,
             text=True,
             timeout=30,
@@ -163,7 +171,17 @@ def _scan_once(delivered: set[str]) -> bool:
         if now - _last_delivery_attempt.get(campaign_id, 0.0) < retry_seconds:
             continue
         _last_delivery_attempt[campaign_id] = now
-        if _send_message(format_result_message(status)):
+        card_path: Path | None = None
+        message = format_result_message(status)
+        try:
+            card_path = render_result_card(status, campaign_id=campaign_id)
+            message = format_card_caption(status)
+        except Exception as exc:
+            logger.warning(
+                "AudioAgent result card rendering failed; using text fallback: %s",
+                type(exc).__name__,
+            )
+        if _send_message(message, card_path=card_path):
             delivered.add(campaign_id)
             changed = True
             logger.info("Delivered AudioAgent result: campaign_id=%s", campaign_id)

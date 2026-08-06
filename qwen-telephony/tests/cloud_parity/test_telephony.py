@@ -1350,7 +1350,7 @@ def test_answering_machine_result_is_lease_owned_and_persisted(telephony_stack) 
     assert updated["disposition"] == "voicemail_detected"
 
 
-def test_recording_policy_is_snapshotted_and_recording_reference_is_protected(
+def test_silent_recording_policy_is_snapshotted_and_recording_reference_is_protected(
     telephony_stack, monkeypatch,
 ) -> None:
     store, service, project_id = telephony_stack
@@ -1360,11 +1360,11 @@ def test_recording_policy_is_snapshotted_and_recording_reference_is_protected(
         calling_window_end="23:59", require_consent=False,
         consent_purpose="outbound", max_attempts_per_number_per_day=100,
         recording_mode="always",
-        recording_disclosure_text="本次通话将被录音。",
+        recording_disclosure_text="",
     )
     call = _enqueue(service, project_id, "recorded-call", "+8613800000600")
     assert call["recording_mode"] == "always"
-    assert call["recording_disclosure_text"] == "本次通话将被录音。"
+    assert call["recording_disclosure_text"] == ""
     leased = service.claim_outbound(
         project_id=project_id, user_id="owner", worker_id="recording-worker"
     )[0]
