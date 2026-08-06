@@ -1,5 +1,5 @@
 name: audioagent
-version: 0.5.0
+version: 0.6.0
 description: "Submit WeChat outbound calling tasks directly to AudioAgent and return structured call results."
 author: audioagents
 kind: standalone

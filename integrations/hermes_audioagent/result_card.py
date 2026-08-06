@@ -189,7 +189,7 @@ def render_result_card(
 
     results = [item for item in status.get("results") or [] if isinstance(item, dict)]
     visible_results = results[:10]
-    row_height = 250
+    row_height = 292
     extra_height = 62 if len(results) > len(visible_results) else 0
     height = 310 + max(1, len(visible_results)) * row_height + extra_height + 64
     image = Image.new("RGB", (CARD_WIDTH, height), CARD_BACKGROUND)
@@ -296,6 +296,12 @@ def render_result_card(
             font=small_font,
             fill=TEXT_SECONDARY,
         )
+        draw.text(
+            (CARD_MARGIN + 30, y + 122),
+            "通话总结",
+            font=small_font,
+            fill=ACCENT,
+        )
         summary_lines = _wrap_text(
             draw,
             _summary(item),
@@ -305,7 +311,7 @@ def render_result_card(
         )
         for line_index, line in enumerate(summary_lines):
             draw.text(
-                (CARD_MARGIN + 30, y + 128 + line_index * 40),
+                (CARD_MARGIN + 30, y + 158 + line_index * 40),
                 line,
                 font=body_font,
                 fill=TEXT_PRIMARY,
@@ -322,7 +328,7 @@ def render_result_card(
             )
             if recent_lines:
                 draw.text(
-                    (CARD_MARGIN + 30, y + 204),
+                    (CARD_MARGIN + 30, y + 246),
                     recent_lines[0],
                     font=small_font,
                     fill=ACCENT,

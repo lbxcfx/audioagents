@@ -105,6 +105,9 @@ def test_wechat_outbound_request_drops_history_and_injects_direct_execution() ->
     assert "给任总打电话" in messages[1]["content"]
     assert "不得参考或延续任何历史对话" in messages[1]["content"]
     assert "不预览、不要求确认" in messages[1]["content"]
+    assert "请问您是{{customer_name}}吗" in messages[1]["content"]
+    assert "热情、自然、口语化" in messages[1]["content"]
+    assert "不得写沉默计时或系统挂机原因" in messages[1]["content"]
     assert "以后请先给我看" not in str(messages)
     assert request["messages"][3]["content"].endswith("是否吃饭。")
 

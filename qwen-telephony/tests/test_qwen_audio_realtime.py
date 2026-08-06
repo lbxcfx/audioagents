@@ -103,6 +103,10 @@ def test_task_prompt_snapshot_overrides_global_configuration(
     assert "感谢您的时间，再见。" in prompt
     assert "客户沉默时由程序在5秒后挂机" in prompt
     assert "不播报录音、系统测试等说明" in prompt
+    assert "您好，我是李宝祥的智能助理，请问您是林经理吗？" in prompt
+    assert "像热情、亲切的真人助理一样说话" in prompt
+    assert "摘要必须写明客户已同意、未同意或待确认的具体事项" in prompt
+    assert "不要把沉默计时或系统挂机原因写入摘要" in prompt
     assert "旧的全局任务" not in prompt
 
 

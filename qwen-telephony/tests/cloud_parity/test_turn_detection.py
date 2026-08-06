@@ -355,18 +355,67 @@ def test_phone_agent_accepts_preseeded_opening_context() -> None:
     assert opening in str(agent.chat_ctx.items[0].content)
 
 
-def test_task_realtime_context_seeds_ai_first_outbound_event() -> None:
+def test_task_realtime_context_does_not_seed_synthetic_customer_event() -> None:
     chat_ctx = phone_agent._initial_realtime_chat_context(
         selected_pipeline=phone_agent.REALTIME_PIPELINE,
         realtime_opening="",
         task_prompt_override="邀请客户吃饭",
     )
 
-    assert chat_ctx is not None
-    assert len(chat_ctx.items) == 1
-    assert str(chat_ctx.items[0].role) == "user"
-    assert "外呼接通事件" in str(chat_ctx.items[0].content)
-    assert "不要等待客户先说话" in str(chat_ctx.items[0].content)
+    assert chat_ctx is None
+
+
+def test_outbound_identity_opening_uses_customer_name_exactly() -> None:
+    assert phone_agent._outbound_identity_opening(" 任 总 ") == (
+        "您好，我是李宝祥的智能助理，请问您是任总吗？"
+    )
+    assert phone_agent._outbound_identity_opening("") == (
+        "您好，我是李宝祥的智能助理，请问怎么称呼您？"
+    )
+
+
+def test_fallback_summary_reports_agreed_business_outcome_and_reminder() -> None:
+    summary = phone_agent._fallback_business_summary(
+        customer_name="任总",
+        reason="客户连续5秒未回应，系统主动挂机",
+        turns=[
+            ("assistant", "您好，我是李宝祥的智能助理，请问您是任总吗？"),
+            ("user", "是的。"),
+            ("assistant", "李总想约您今晚六点半吃饭。"),
+            ("user", "可以。"),
+            ("assistant", "好的，地点稍后李总会跟您确认。"),
+        ],
+    )
+
+    assert summary == (
+        "任总已同意：李总想约您今晚六点半吃饭；"
+        "提示：地点稍后李总会跟您确认。"
+    )
+    assert "5秒" not in summary
+    assert "系统主动挂机" not in summary
+
+
+def test_fallback_summary_keeps_no_response_runtime_reason() -> None:
+    assert phone_agent._fallback_business_summary(
+        customer_name="任总",
+        reason="客户连续5秒未回应，系统主动挂机",
+        turns=[
+            ("assistant", "您好，我是李宝祥的智能助理，请问您是任总吗？"),
+        ],
+    ) == "客户连续5秒未回应，系统主动挂机"
+
+
+def test_saved_business_summary_strips_runtime_hangup_mechanics() -> None:
+    summary = phone_agent._sanitize_business_summary(
+        "客户连续5秒未回应，系统主动挂机",
+        customer_name="任总",
+        turns=[
+            ("assistant", "李总想约您今晚六点半吃饭。"),
+            ("user", "可以。"),
+        ],
+    )
+
+    assert summary == "任总已同意：李总想约您今晚六点半吃饭。"
 
 
 def test_outbound_agent_hangup_is_default(monkeypatch) -> None:

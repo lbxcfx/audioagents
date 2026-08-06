@@ -301,6 +301,15 @@ def _select_realtime_opening(scene: dict[str, Any] | None) -> str:
     return opening or DEFAULT_REALTIME_OPENINGS[0]
 
 
+def _outbound_identity_opening(customer_name: str) -> str:
+    """Build the deterministic first sentence for a managed outbound task."""
+
+    normalized = re.sub(r"\s+", "", customer_name).strip("，。！？? ")
+    if not normalized or "{{" in normalized or "}}" in normalized:
+        return "您好，我是李宝祥的智能助理，请问怎么称呼您？"
+    return f"您好，我是李宝祥的智能助理，请问您是{normalized}吗？"
+
+
 def _initial_realtime_chat_context(
     *,
     selected_pipeline: str,
@@ -316,20 +325,9 @@ def _initial_realtime_chat_context(
         chat_ctx = llm.ChatContext.empty()
         chat_ctx.add_message(role="assistant", content=realtime_opening)
         return chat_ctx
-    if task_prompt_override:
-        # Qwen Realtime rejects response.create when the conversation has no
-        # user message. This synthetic event unlocks an AI-first business
-        # opening immediately after answer and is never persisted as customer
-        # speech.
-        chat_ctx = llm.ChatContext.empty()
-        chat_ctx.add_message(
-            role="user",
-            content=(
-                "[外呼接通事件]电话已接通，请立即主动说本任务第一句开场，"
-                "不要等待客户先说话。"
-            ),
-        )
-        return chat_ctx
+    # Managed task calls use a deterministic, pre-synthesized identity
+    # question. Do not inject a fake user turn: Qwen can reject or time out
+    # while synchronizing that context before any real customer audio exists.
     return None
 
 
@@ -2075,6 +2073,85 @@ async def _execute_managed_transfer(
     )
 
 
+_POSITIVE_CUSTOMER_REPLY = re.compile(
+    r"(?:可以|好呀|好啊|好的|没问题|行(?:的|啊)?|同意|答应|有时间|能去|能参加)"
+)
+_NEGATIVE_CUSTOMER_REPLY = re.compile(
+    r"(?:不可以|不行|没时间|不方便|不用|不了|拒绝|不同意)"
+)
+_RUNTIME_HANGUP_MECHANICS = re.compile(
+    r"(?:连续\s*\d+(?:\.\d+)?\s*秒.*未回应|系统主动挂机|沉默计时|响应超时)"
+)
+
+
+def _is_identity_turn(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(
+        marker in compact
+        for marker in ("智能助理", "请问您是", "请问是", "怎么称呼您")
+    )
+
+
+def _clean_summary_clause(text: str) -> str:
+    cleaned = re.sub(r"^(?:嗯|好的呀|好的|好呀|明白了|没问题)[，,、\s]*", "", text.strip())
+    return cleaned.rstrip("。！？!?；; ")
+
+
+def _fallback_business_summary(
+    *, customer_name: str, reason: str, turns: list[tuple[str, str]]
+) -> str:
+    """Summarize an answered call without exposing runtime hangup mechanics."""
+
+    customer_label = customer_name.strip() or "客户"
+    user_indexes = [index for index, (role, _text) in enumerate(turns) if role == "user"]
+    if not user_indexes:
+        return reason.strip() or "电话已结束，但未收到客户回应。"
+
+    for user_index in reversed(user_indexes):
+        reply = turns[user_index][1].strip()
+        business = ""
+        for role, text in reversed(turns[:user_index]):
+            if role == "assistant" and not _is_identity_turn(text):
+                business = _clean_summary_clause(text)
+                if business:
+                    break
+        if not business:
+            continue
+
+        reminder = ""
+        for role, text in turns[user_index + 1 :]:
+            if role == "assistant" and not _is_identity_turn(text):
+                reminder = _clean_summary_clause(text)
+                if reminder:
+                    break
+
+        if _NEGATIVE_CUSTOMER_REPLY.search(reply):
+            summary = f"{customer_label}未同意：{business}"
+        elif _POSITIVE_CUSTOMER_REPLY.search(reply):
+            summary = f"{customer_label}已同意：{business}"
+        else:
+            continue
+        if reminder and reminder != business:
+            summary += f"；提示：{reminder}"
+        return summary + "。"
+
+    last_reply = turns[user_indexes[-1]][1].strip().rstrip("。！？!? ")
+    return f"已完成与{customer_label}的电话沟通；对方最后回复：“{last_reply}”。"
+
+
+def _sanitize_business_summary(
+    proposed: str, *, customer_name: str, turns: list[tuple[str, str]]
+) -> str:
+    normalized = proposed.strip()
+    if not _RUNTIME_HANGUP_MECHANICS.search(normalized):
+        return normalized
+    return _fallback_business_summary(
+        customer_name=customer_name,
+        reason="通话已结束，但未收到客户回应。",
+        turns=turns,
+    )
+
+
 class PhoneAgent(Agent):
     def __init__(
         self,
@@ -2095,6 +2172,7 @@ class PhoneAgent(Agent):
         self._business_result_saved = False
         self._business_result_lock = asyncio.Lock()
         self._last_user_messages: list[str] = []
+        self._conversation_turns: list[tuple[str, str]] = []
         super().__init__(
             instructions=(
                 instructions
@@ -2132,6 +2210,18 @@ class PhoneAgent(Agent):
         normalized = text.strip()
         if normalized:
             self._last_user_messages = [*self._last_user_messages[-4:], normalized[:500]]
+            self._conversation_turns = [
+                *self._conversation_turns[-15:],
+                ("user", normalized[:500]),
+            ]
+
+    def note_assistant_transcript(self, text: str) -> None:
+        normalized = text.strip()
+        if normalized:
+            self._conversation_turns = [
+                *self._conversation_turns[-15:],
+                ("assistant", normalized[:500]),
+            ]
 
     async def persist_fallback_call_result(self, reason: str) -> None:
         if not self._managed_job or self._business_result_saved:
@@ -2140,9 +2230,11 @@ class PhoneAgent(Agent):
             if self._business_result_saved:
                 return
             normalized_reason = reason.strip() or "通话结束"
-            summary = normalized_reason
-            if self._last_user_messages:
-                summary += "；客户最后回应：" + "；".join(self._last_user_messages[-3:])
+            summary = _fallback_business_summary(
+                customer_name=str(self._managed_job.get("customer_name") or ""),
+                reason=normalized_reason,
+                turns=self._conversation_turns,
+            )
             saved = await self._record_realtime_business_event(
                 "call.result",
                 {"summary": summary[:4000], "intent_label": ""},
@@ -2333,6 +2425,11 @@ class PhoneAgent(Agent):
     ) -> str:
         if not summary.strip():
             return "通话摘要为空，未保存。"
+        summary = _sanitize_business_summary(
+            summary,
+            customer_name=str((self._managed_job or {}).get("customer_name") or ""),
+            turns=self._conversation_turns,
+        )
         async with self._business_result_lock:
             saved = await self._record_realtime_business_event(
                 "call.result",
@@ -3136,13 +3233,15 @@ async def entrypoint(ctx: JobContext) -> None:
                     finish_at_conversation_limit(),
                     name="conversation-turn-limit",
                 )
-        elif task_prompt_override and text != FINAL_GOODBYE_TEXT:
-            assistant_business_turns += 1
-            if assistant_business_turns >= max_conversation_turns:
-                asyncio.create_task(
-                    finish_at_conversation_limit(),
-                    name="conversation-turn-limit",
-                )
+        else:
+            phone_agent.note_assistant_transcript(text)
+            if task_prompt_override and text != FINAL_GOODBYE_TEXT:
+                assistant_business_turns += 1
+                if assistant_business_turns >= max_conversation_turns:
+                    asyncio.create_task(
+                        finish_at_conversation_limit(),
+                        name="conversation-turn-limit",
+                    )
 
         _append_local_transcript(
             room_name=ctx.room.name,
@@ -3537,6 +3636,23 @@ async def entrypoint(ctx: JobContext) -> None:
             ctx.shutdown(reason="mandatory recording failed")
             return False
 
+    outbound_identity_opening = ""
+    outbound_identity_audio: bytes | None = None
+    if (
+        outbound_job
+        and task_prompt_override
+        and selected_pipeline == REALTIME_PIPELINE
+    ):
+        outbound_identity_opening = _outbound_identity_opening(
+            str(outbound_job.get("customer_name") or "")
+        )
+        # Synthesize before the PSTN side effect so answer-to-audio latency is
+        # only the room playout latency, not a model or TTS network round trip.
+        outbound_identity_audio = await fixed_realtime_audio(
+            outbound_identity_opening,
+            label="Realtime outbound identity opening",
+        )
+
     if outbound_job:
         call_active = False
         amd_category = ""
@@ -3618,9 +3734,20 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
                 call_active = True
 
-            amd_enabled = os.getenv("QWEN_AMD_ENABLED", "true").strip().lower() in {
+            amd_requested = os.getenv("QWEN_AMD_ENABLED", "true").strip().lower() in {
                 "1", "true", "yes", "on"
             }
+            # The current AMD flow must hear the callee before classifying the
+            # answer. Managed task calls instead promise an immediate AI-first
+            # opening, so do not hold their first sentence behind that listener.
+            amd_enabled = amd_requested and not (
+                task_prompt_override and selected_pipeline == REALTIME_PIPELINE
+            )
+            if amd_requested and not amd_enabled:
+                logger.info(
+                    "Skipping AMD to preserve AI-first managed task opening: call_id=%s",
+                    outbound_job["call_id"],
+                )
             if amd_enabled:
                 detector = AMD(
                     session,
@@ -3795,17 +3922,29 @@ async def entrypoint(ctx: JobContext) -> None:
             await play_greeting_audio_direct(ctx.room)
     else:
         if task_prompt_override:
-            # Start with the actual task instead of a recording/test notice or
-            # a global scene greeting. The hard guardrails in the instructions
-            # constrain this generated opening to one short sentence.
-            opening_speech = session.generate_reply(
-                instructions=(
-                    "现在直接说本次任务的第一句业务开场。只说一句，不超过24个汉字；"
-                    "自然包含‘我是李宝祥的智能助理’，不要提录音、系统测试，"
-                    "也不要使用其他场景的人名或身份。"
+            # The assistant must speak first. Use deterministic media instead
+            # of response.create, which requires a real user message on Qwen.
+            if outbound_identity_audio is None:
+                outbound_identity_opening = _outbound_identity_opening(
+                    str((managed_job or {}).get("customer_name") or "")
                 )
+                outbound_identity_audio = await fixed_realtime_audio(
+                    outbound_identity_opening,
+                    label="Realtime outbound identity opening",
+                )
+            await _play_wav_bytes_direct(
+                ctx.room,
+                outbound_identity_audio,
+                label="Realtime outbound identity opening",
+                track_name="realtime-outbound-identity-opening",
+                on_first_frame_queued=lambda: schedule_preseeded_assistant_turn(
+                    outbound_identity_opening,
+                    source="programmatic_outbound_identity_opening",
+                ),
             )
-            await opening_speech.wait_for_playout()
+            phone_agent.note_assistant_transcript(outbound_identity_opening)
+            assistant_business_turns += 1
+            start_customer_silence_timer()
         else:
             # In direct/manual calls the fixed opening may already have played
             # on an independent track while session.start warmed Qwen. Once the
