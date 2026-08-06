@@ -415,6 +415,24 @@ def test_fallback_summary_reports_agreed_business_outcome_and_reminder() -> None
     assert "系统主动挂机" not in summary
 
 
+def test_fallback_summary_removes_spoken_salutation_and_closing_pleasantry() -> None:
+    summary = phone_agent._fallback_business_summary(
+        customer_name="李艳美",
+        reason="parent process shutdown",
+        turns=[
+            ("assistant", "您好，我是李宝祥的智能助理，请问您是李艳美吗？"),
+            ("user", "你有什么事？"),
+            ("assistant", "李姐您好呀！宝祥想邀请您周末带果果来北京玩。"),
+            ("user", "好啊。"),
+            ("assistant", "太好啦！那我跟宝祥说一声，周末等你们来呀！"),
+        ],
+    )
+
+    assert summary == "李艳美已同意：宝祥想邀请您周末带果果来北京玩。"
+    assert "李姐您好" not in summary
+    assert "太好啦" not in summary
+
+
 def test_fallback_summary_keeps_no_response_runtime_reason() -> None:
     assert phone_agent._fallback_business_summary(
         customer_name="任总",

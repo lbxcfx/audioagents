@@ -25,13 +25,24 @@ SUBMIT_OUTBOUND_TASK = {
     "name": "audioagent_submit_outbound_task",
     "description": (
         "Immediately submit an outbound calling task requested in WeChat. The original task "
-        "message authorizes execution; do not show a preview or ask for confirmation."
+        "message authorizes execution; do not show a preview or ask for confirmation. "
+        "Only report that dialing started when ok=true and queued_count is greater than zero. "
+        "If ok=false, tell the user that no call was placed and include the returned reason."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "task_name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "invitation_content": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300,
+                "description": (
+                    "Concise business matter shown in the WeChat result, for example "
+                    "'今晚 8:30 莲花河跑步'. Exclude recipient and caller names."
+                ),
+            },
             "prompt": {
                 "type": "string",
                 "minLength": 1,
@@ -39,7 +50,8 @@ SUBMIT_OUTBOUND_TASK = {
                 "description": (
                     "Complete, immutable prompt snapshot for this task. It may use "
                     "{{customer_name}}, {{customer_company}}, {{customer_phone}}, "
-                    "{{customer_profile}}, {{session_id}}, and {{scene_id}} placeholders."
+                    "{{customer_profile}}, {{session_id}}, and {{scene_id}} placeholders. "
+                    "Keep it concise and avoid deeply nested quoted examples."
                 ),
             },
             "customers": {
@@ -51,7 +63,13 @@ SUBMIT_OUTBOUND_TASK = {
             "task_id": {"type": "string", "maxLength": 120},
             "scene_id": {"type": "integer", "minimum": 1},
             "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 100},
-            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10},
+            "max_attempts": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 2,
+                "description": "Maximum attempts; defaults to 2 for transient carrier failover.",
+            },
             "scheduled_at": {
                 "type": "string",
                 "description": "Optional ISO-8601 scheduled time.",

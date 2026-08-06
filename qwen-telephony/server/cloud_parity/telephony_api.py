@@ -38,7 +38,12 @@ class TelephonyPolicyUpdate(BaseModel):
     calling_window_end: str = Field(default="18:00", pattern=r"^[0-2][0-9]:[0-5][0-9]$")
     require_consent: bool = True
     consent_purpose: str = Field(default="outbound", min_length=1, max_length=200)
-    max_attempts_per_number_per_day: int = Field(default=3, ge=1, le=100)
+    max_attempts_per_number_per_day: int = Field(
+        default=3,
+        ge=0,
+        le=100,
+        description="Maximum daily attempts per number; 0 disables the limit.",
+    )
     inbound_overflow_mode: Literal["reject", "transfer"] = "reject"
     inbound_overflow_destination_name: str = Field(default="", max_length=200)
     recording_mode: Literal["off", "always"] = "off"
@@ -436,6 +441,25 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
             return {"items": service.list_campaigns(
                 project_id=project_id, user_id=user_id, limit=limit
             )}
+        except Exception as exc:
+            raise _telephony_error(exc) from exc
+
+    @router.get("/projects/{project_id}/telephony/campaigns/{campaign_id}/contacts")
+    def list_campaign_contacts(
+        project_id: str,
+        campaign_id: str,
+        limit: int = Query(default=5000, ge=1, le=5000),
+        user_id: str = Depends(require_user_id),
+    ) -> dict:
+        try:
+            return {
+                "items": service.list_campaign_contacts(
+                    project_id=project_id,
+                    user_id=user_id,
+                    campaign_id=campaign_id,
+                    limit=limit,
+                )
+            }
         except Exception as exc:
             raise _telephony_error(exc) from exc
 

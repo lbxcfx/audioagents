@@ -324,6 +324,85 @@ def test_expired_pre_dial_lease_retries_but_dialing_call_requires_reconciliation
     )["status"] == "reconciling"
 
 
+def test_transient_sip_5xx_retry_switches_to_active_backup_trunk(
+    telephony_stack,
+) -> None:
+    _, service, project_id = telephony_stack
+    primary = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="primary-carrier",
+        direction="outbound",
+        provider="primary",
+        livekit_trunk_id="ST_primary",
+        secret_name="primary-secret",
+        numbers=["*"],
+    )
+    backup = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="backup-carrier",
+        direction="outbound",
+        provider="backup",
+        livekit_trunk_id="ST_backup",
+        secret_name="backup-secret",
+        numbers=["*"],
+    )
+    queued = service.enqueue_outbound(
+        project_id=project_id,
+        user_id="owner",
+        idempotency_key="carrier-failover",
+        destination_number="+8613800000099",
+        source_number="",
+        agent_name="commercial-agent",
+        trunk_id=primary["id"],
+        max_attempts=2,
+    )
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    leased = service.claim_outbound(
+        project_id=project_id,
+        user_id="owner",
+        worker_id="primary-worker",
+        now=now,
+    )[0]
+    for status in ("dispatching", "dialing"):
+        leased = service.transition_call(
+            project_id=project_id,
+            user_id="owner",
+            call_id=queued["id"],
+            worker_id="primary-worker",
+            lease_token=leased["lease_token"],
+            status=status,
+            now=now,
+        )
+    retry = service.transition_call(
+        project_id=project_id,
+        user_id="owner",
+        call_id=queued["id"],
+        worker_id="primary-worker",
+        lease_token=leased["lease_token"],
+        status="failed",
+        failure_code="sip_500",
+        failure_detail="Server Internal Error",
+        retryable=True,
+        retry_delay_seconds=5,
+        now=now,
+    )
+
+    assert retry["status"] == "queued"
+    assert retry["trunk_id"] == backup["id"]
+    retried = service.claim_outbound(
+        project_id=project_id,
+        user_id="owner",
+        worker_id="backup-worker",
+        now=now + timedelta(seconds=5),
+    )[0]
+    assert retried["attempt_count"] == 2
+    assert retried["trunk_id"] == backup["id"]
+    assert retried["livekit_trunk_id"] == "ST_backup"
+    assert retried["trunk_provider"] == "backup"
+
+
 def test_inbound_admission_is_idempotent_and_capacity_safe(telephony_stack) -> None:
     _, service, project_id = telephony_stack
     _limits(service, project_id, total=1, outbound=1, inbound=1, rate=100)
@@ -446,6 +525,73 @@ def test_consent_and_do_not_call_are_rechecked_before_dispatch(telephony_stack) 
     assert number not in raw_audits
 
 
+def test_campaign_exposes_pre_dial_compliance_block_reason(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+    service.update_policy(
+        project_id=project_id,
+        user_id="owner",
+        timezone_name="UTC",
+        allowed_weekdays=range(7),
+        calling_window_start="00:00",
+        calling_window_end="23:59",
+        require_consent=True,
+        consent_purpose="outbound",
+        max_attempts_per_number_per_day=100,
+    )
+    trunk = service.upsert_trunk(
+        project_id=project_id,
+        user_id="owner",
+        name="blocked-campaign-trunk",
+        direction="outbound",
+        provider="telco",
+        livekit_trunk_id="ST_blocked",
+        numbers=["+8610000000000"],
+    )
+    contact = service.upsert_contact(
+        project_id=project_id,
+        user_id="owner",
+        external_id="blocked-contact",
+        name="Blocked Contact",
+        phone_number="+8618001350929",
+    )
+    campaign = service.create_campaign(
+        project_id=project_id,
+        user_id="owner",
+        name="Blocked campaign",
+        agent_name="commercial-agent",
+        trunk_id=trunk["id"],
+        source_number="+8610000000000",
+    )
+    service.add_campaign_contacts(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        contact_ids=[contact["id"]],
+    )
+
+    started = service.set_campaign_status(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+        status="running",
+    )
+
+    assert started["status"] == "completed"
+    assert started["enqueue_result"] == {
+        "queued": 0,
+        "blocked": 1,
+        "blocked_reasons": {"consent_missing_or_inactive": 1},
+    }
+    contacts = service.list_campaign_contacts(
+        project_id=project_id,
+        user_id="owner",
+        campaign_id=campaign["id"],
+    )
+    assert contacts[0]["status"] == "blocked"
+    assert contacts[0]["failure_reason"] == "consent_missing_or_inactive"
+    assert contacts[0]["phone_number"] == "+8618001350929"
+
+
 def test_calling_window_schedules_and_daily_number_limit_blocks(telephony_stack) -> None:
     _, service, project_id = telephony_stack
     future = (datetime.now(timezone.utc) + timedelta(days=8)).replace(
@@ -500,6 +646,32 @@ def test_calling_window_schedules_and_daily_number_limit_blocks(telephony_stack)
     )
     with pytest.raises(ComplianceBlockedError, match="daily_number_attempt_limit"):
         _enqueue(service, project_id, "daily-limit-b", "+8613800000052")
+
+    service.update_policy(
+        project_id=project_id,
+        user_id="owner",
+        timezone_name="UTC",
+        allowed_weekdays=[(datetime.now(timezone.utc).weekday() + 1) % 7],
+        calling_window_start="00:00",
+        calling_window_end="00:00",
+        require_consent=False,
+        consent_purpose="outbound",
+        max_attempts_per_number_per_day=0,
+    )
+    unrestricted = _enqueue(
+        service,
+        project_id,
+        "daily-limit-disabled",
+        "+8613800000052",
+    )
+    assert unrestricted["status"] == "queued"
+    policy = service.get_policy(
+        project_id=project_id,
+        user_id="owner",
+    )
+    assert policy["calling_window_start"] == "00:00"
+    assert policy["calling_window_end"] == "00:00"
+    assert policy["max_attempts_per_number_per_day"] == 0
 
 
 def test_reconciliation_and_livekit_webhook_converge_without_redial(
@@ -1430,6 +1602,67 @@ def test_silent_recording_policy_is_snapshotted_and_recording_reference_is_prote
         )
 
 
+def test_recording_final_status_accepts_latest_attempt_after_lease_release(
+    telephony_stack,
+) -> None:
+    _, service, project_id = telephony_stack
+    call = _enqueue(service, project_id, "recording-after-reconcile", "+8613800000601")
+    leased = service.claim_outbound(
+        project_id=project_id, user_id="owner", worker_id="recording-worker"
+    )[0]
+    for status in ("dispatching", "dialing"):
+        service.transition_call(
+            project_id=project_id,
+            user_id="owner",
+            call_id=call["id"],
+            status=status,
+            worker_id="recording-worker",
+            lease_token=leased["lease_token"],
+        )
+    storage_uri = f"s3://recordings/{call['id']}.ogg"
+    service.record_call_recording(
+        project_id=project_id,
+        user_id="owner",
+        call_id=call["id"],
+        worker_id="recording-worker",
+        lease_token=leased["lease_token"],
+        egress_id="EG_reconcile_recording",
+        status="active",
+        storage_uri=storage_uri,
+    )
+    service.transition_call(
+        project_id=project_id,
+        user_id="owner",
+        call_id=call["id"],
+        status="reconciling",
+        worker_id="recording-worker",
+        lease_token=leased["lease_token"],
+        failure_code="sip_setup_result_uncertain",
+    )
+
+    completed = service.record_call_recording(
+        project_id=project_id,
+        user_id="owner",
+        call_id=call["id"],
+        worker_id="recording-worker",
+        lease_token=leased["lease_token"],
+        egress_id="EG_reconcile_recording",
+        status="completed",
+        storage_uri=storage_uri,
+    )
+
+    assert completed["recording_status"] == "completed"
+    with pytest.raises(LeaseConflictError, match="egress ownership mismatch"):
+        service.record_call_recording(
+            project_id=project_id,
+            user_id="owner",
+            call_id=call["id"],
+            worker_id="recording-worker",
+            lease_token=leased["lease_token"],
+            egress_id="EG_wrong_recording",
+            status="failed",
+            storage_uri=storage_uri,
+        )
 def test_contact_erasure_removes_terminal_campaign_calls(telephony_stack) -> None:
     _, service, project_id = telephony_stack
     contact = service.upsert_contact(

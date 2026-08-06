@@ -188,6 +188,41 @@ def test_phone_agent_shutdown_does_not_complete_unanswered_call() -> None:
     ) == ("failed", "agent_runtime_terminated")
 
 
+def test_livekit_generic_ringing_timeout_is_definitive_no_answer() -> None:
+    error = phone_agent.api.TwirpError(
+        "canceled",
+        "twirp error unknown: sip request timed out",
+        status=408,
+    )
+
+    assert phone_agent._livekit_ringing_timeout_failure(error) == (
+        "no_answer",
+        "sip_408",
+        True,
+    )
+
+
+def test_unrelated_livekit_server_error_remains_uncertain() -> None:
+    error = phone_agent.api.TwirpError(
+        "internal",
+        "upstream unavailable",
+        status=500,
+    )
+
+    assert phone_agent._livekit_ringing_timeout_failure(error) is None
+
+
+def test_sip_no_answer_is_not_automatically_retried() -> None:
+    error = phone_agent.api.SipCallError(
+        "unavailable",
+        "no answer",
+        status=500,
+        metadata={"sip_status_code": "408", "sip_status": "Request Timeout"},
+    )
+
+    assert phone_agent._sip_failure(error) == ("no_answer", "sip_408", False)
+
+
 def test_phone_agent_executes_console_dtmf_and_say_commands() -> None:
     sent: list[tuple[int, str]] = []
     spoken: list[str] = []

@@ -1972,8 +1972,30 @@ def _sip_failure(exc: Exception) -> tuple[str, str, bool]:
     if code in {486, 600, 603}:
         return "busy", f"sip_{code}", False
     if code in {408, 480}:
-        return "no_answer", f"sip_{code}", True
+        return "no_answer", f"sip_{code}", False
     return "failed", f"sip_{code}" if code else "sip_error", code >= 500 or code == 0
+
+
+def _livekit_ringing_timeout_failure(
+    exc: Exception,
+) -> tuple[str, str, bool] | None:
+    """Classify LiveKit's ring timeout when no SIP response metadata is present.
+
+    LiveKit SIP returns a generic Twirp ServerError for its local
+    ``ringing_timeout`` instead of SipCallError.  This is a definitive
+    no-answer result, not an uncertain provider side effect.
+    """
+
+    if not isinstance(exc, api.TwirpError) or isinstance(exc, api.SipCallError):
+        return None
+    try:
+        status = int(getattr(exc, "status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    message = str(getattr(exc, "message", "") or exc).strip().lower()
+    if status == 408 and "sip request timed out" in message:
+        return "no_answer", "sip_408", True
+    return None
 
 
 async def _admit_inbound_call(
@@ -2091,6 +2113,9 @@ _NEGATIVE_CUSTOMER_REPLY = re.compile(
 _RUNTIME_HANGUP_MECHANICS = re.compile(
     r"(?:连续\s*\d+(?:\.\d+)?\s*秒.*未回应|系统主动挂机|沉默计时|响应超时)"
 )
+_ACTIONABLE_REMINDER = re.compile(
+    r"(?:地点|地址|时间|稍后|联系|确认|回复|提醒|记得|需要|请|改到|改为|安排)"
+)
 
 
 def _is_identity_turn(text: str) -> bool:
@@ -2102,7 +2127,19 @@ def _is_identity_turn(text: str) -> bool:
 
 
 def _clean_summary_clause(text: str) -> str:
-    cleaned = re.sub(r"^(?:嗯|好的呀|好的|好呀|明白了|没问题)[，,、\s]*", "", text.strip())
+    cleaned = text.strip()
+    # Spoken business turns often begin with a recipient salutation. It is
+    # useful in the call but never belongs in the persisted business summary.
+    cleaned = re.sub(
+        r"^[^，,。。！？!?;；:：]{0,16}(?:您好|你好)(?:呀|啊|哈)?[！!,，、\s]*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"^(?:嗯|好的呀|好的|好呀|明白了|没问题|是这样(?:的)?)[！!,，、\s]*",
+        "",
+        cleaned,
+    )
     return cleaned.rstrip("。！？!?；; ")
 
 
@@ -2133,6 +2170,11 @@ def _fallback_business_summary(
                 reminder = _clean_summary_clause(text)
                 if reminder:
                     break
+
+        # Friendly acknowledgements such as "太好啦，我转告他" are dialogue
+        # closings, not useful follow-up reminders for the operator.
+        if reminder and not _ACTIONABLE_REMINDER.search(reminder):
+            reminder = ""
 
         if _NEGATIVE_CUSTOMER_REPLY.search(reply):
             summary = f"{customer_label}未同意：{business}"
@@ -3681,6 +3723,12 @@ async def entrypoint(ctx: JobContext) -> None:
     if outbound_job:
         call_active = False
         amd_category = ""
+        ringing_timeout = _bounded_duration(
+            "CLOUD_PARITY_TELEPHONY_RINGING_TIMEOUT_SECONDS",
+            45,
+            minimum=10,
+            maximum=120,
+        )
         try:
             # Persist dialing before causing the external PSTN side effect.
             await _telephony_transition(
@@ -3728,12 +3776,7 @@ async def entrypoint(ctx: JobContext) -> None:
                             {"call_id": outbound_job["call_id"]}, separators=(",", ":")
                         ),
                         wait_until_answered=True,
-                        ringing_timeout=_bounded_duration(
-                            "CLOUD_PARITY_TELEPHONY_RINGING_TIMEOUT_SECONDS",
-                            45,
-                            minimum=10,
-                            maximum=120,
-                        ),
+                        ringing_timeout=ringing_timeout,
                         max_call_duration=_bounded_duration(
                             "CLOUD_PARITY_TELEPHONY_MAX_CALL_DURATION_SECONDS",
                             1800,
@@ -3876,12 +3919,31 @@ async def entrypoint(ctx: JobContext) -> None:
                 failure_code=code,
                 failure_detail=str(getattr(exc, "sip_status", ""))[:500],
                 retryable=retryable,
+                retry_delay_seconds=(
+                    5 if retryable and re.fullmatch(r"sip_5[0-9]{2}", code) else 30
+                ),
             )
             telephony_terminal = True
             await _cancel_task(heartbeat_task)
             ctx.shutdown(reason=f"outbound dial failed: {code}")
             return
         except Exception as exc:
+            ringing_timeout_failure = _livekit_ringing_timeout_failure(exc)
+            if ringing_timeout_failure is not None:
+                status, code, retryable = ringing_timeout_failure
+                await _telephony_transition(
+                    outbound_job,
+                    status,
+                    failure_code=code,
+                    failure_detail=(
+                        f"no answer before {ringing_timeout.seconds}-second ringing timeout"
+                    ),
+                    retryable=retryable,
+                )
+                telephony_terminal = True
+                await _cancel_task(heartbeat_task)
+                ctx.shutdown(reason=f"outbound dial failed: {code}")
+                return
             if call_active:
                 logger.exception(
                     "Post-answer setup failed; continuing without AMD: call_id=%s",

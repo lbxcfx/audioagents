@@ -24,6 +24,13 @@ TERMINAL_CALL_STATUSES = {
 }
 TERMINAL_CAMPAIGN_STATUSES = {"completed", "canceled"}
 
+_BLOCKED_REASON_SUMMARIES = {
+    "consent_missing_or_inactive": "目标号码缺少有效或未过期的外呼授权，电话未拨出。",
+    "do_not_call": "目标号码在禁止呼叫名单中，电话未拨出。",
+    "daily_number_attempt_limit": "目标号码已达到当日呼叫次数上限，电话未拨出。",
+    "outbound_paused": "外呼功能当前已暂停，电话未拨出。",
+}
+
 
 def is_configured() -> bool:
     return bool(os.getenv("AUDIOAGENT_PROJECT_ID", "").strip())
@@ -106,6 +113,12 @@ def _task_id(value: Any) -> str:
     return candidate[:120]
 
 
+def _campaign_resource_name(task_name: str, identifier: str) -> str:
+    """Keep the database key unique while preserving a human display name."""
+    suffix = f" [{identifier[-12:]}]"
+    return task_name[: 200 - len(suffix)].rstrip() + suffix
+
+
 def _setting(args: dict[str, Any], key: str, environment: str) -> str:
     return str(args.get(key) or os.getenv(environment, "")).strip()
 
@@ -131,6 +144,44 @@ def _campaign_calls(
         for item in result.get("items") or []
         if isinstance(item, dict) and str(item.get("campaign_id") or "") == campaign_id
     ]
+
+
+def _campaign_contacts(
+    client: AudioAgentClient, campaign_id: str
+) -> list[dict[str, Any]]:
+    result = client.request(
+        "GET",
+        client.project_path(
+            f"/telephony/campaigns/{quote(campaign_id, safe='')}/contacts?limit=5000"
+        ),
+    )
+    return [item for item in result.get("items") or [] if isinstance(item, dict)]
+
+
+def _campaign_contact_result(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    customer: dict[str, Any] = {}
+    for field in ("name", "company", "profile"):
+        value = item.get(field) if field == "name" else metadata.get(field)
+        if value is not None and value != "":
+            customer[field] = value
+    status = str(item.get("status") or "blocked")
+    reason = str(item.get("failure_reason") or "").strip()
+    summary = _BLOCKED_REASON_SUMMARIES.get(
+        reason,
+        f"电话未拨出：{reason}。" if reason else "电话未进入拨号流程。",
+    )
+    return {
+        "call_id": item.get("call_id") or "",
+        "status": status,
+        "phone": item.get("phone_number") or "",
+        "customer": customer,
+        "failure_code": reason,
+        "failure_detail": reason,
+        "summary": summary,
+        "summary_missing": False,
+        "result_pending": False,
+    }
 
 
 def _timeline_result(
@@ -213,10 +264,15 @@ def _task_status(
 ) -> dict[str, Any]:
     campaign = _campaign(client, campaign_id)
     calls = _campaign_calls(client, campaign_id)
+    campaign_contacts = _campaign_contacts(client, campaign_id)
     counts: dict[str, int] = {}
     for call in calls:
         status = str(call.get("status") or "unknown")
         counts[status] = counts.get(status, 0) + 1
+    contact_counts: dict[str, int] = {}
+    for contact in campaign_contacts:
+        status = str(contact.get("status") or "unknown")
+        contact_counts[status] = contact_counts.get(status, 0) + 1
     total = int(campaign.get("contact_count") or 0)
     terminal = sum(
         count for status, count in counts.items() if status in TERMINAL_CALL_STATUSES
@@ -224,31 +280,50 @@ def _task_status(
     finished = str(campaign.get("status") or "") in TERMINAL_CAMPAIGN_STATUSES
     if total > 0 and terminal >= total:
         finished = True
-    response: dict[str, Any] = {
-        "ok": True,
-        "task_id": (campaign.get("metadata") or {}).get("task", {}).get("id")
+    task_metadata = (
+        (campaign.get("metadata") or {}).get("task", {})
         if isinstance(campaign.get("metadata"), dict)
         and isinstance((campaign.get("metadata") or {}).get("task"), dict)
-        else "",
+        else {}
+    )
+    response: dict[str, Any] = {
+        "ok": True,
+        "task_id": task_metadata.get("id") or "",
         "campaign_id": campaign_id,
-        "campaign_name": campaign.get("name"),
+        "campaign_name": task_metadata.get("display_name") or campaign.get("name"),
+        "invitation_content": (
+            task_metadata.get("invitation_content")
+            or task_metadata.get("display_name")
+            or campaign.get("name")
+        ),
         "status": campaign.get("status"),
         "finished": finished,
         "contact_count": total,
         "blocked_count": int(campaign.get("blocked_count") or 0),
         "call_status_counts": counts,
+        "contact_status_counts": contact_counts,
     }
     if include_results:
-        response["results"] = [
+        results = [
             _timeline_result(client, call, include_transcript=include_transcript)
             for call in sorted(calls, key=lambda item: str(item.get("created_at") or ""))
         ]
+        known_call_ids = {str(call.get("id") or "") for call in calls}
+        results.extend(
+            _campaign_contact_result(contact)
+            for contact in campaign_contacts
+            if str(contact.get("status") or "") in TERMINAL_CALL_STATUSES
+            and str(contact.get("call_id") or "") not in known_call_ids
+        )
+        response["results"] = results
     return response
 
 
 @_handler
 def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     task_name = _required_text(args, "task_name", 200)
+    invitation_content = str(args.get("invitation_content") or task_name).strip()
+    invitation_content = re.sub(r"\s+", " ", invitation_content)[:300]
     prompt = _prepare_prompt_snapshot(_required_text(args, "prompt", 24_000))
     if len(prompt.encode("utf-8")) > 24_000:
         raise ValueError("prompt exceeds 24000 UTF-8 bytes")
@@ -267,7 +342,7 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     if source_number:
         source_number = _normalize_phone(source_number)
     max_concurrency = int(args.get("max_concurrency") or 1)
-    max_attempts = int(args.get("max_attempts") or 1)
+    max_attempts = int(args.get("max_attempts") or 2)
     if not 1 <= max_concurrency <= 100:
         raise ValueError("max_concurrency must be between 1 and 100")
     if not 1 <= max_attempts <= 10:
@@ -299,17 +374,10 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
             }
         )
 
-    imported = client.request(
-        "POST",
-        client.project_path("/telephony/contacts/import"),
-        {"contacts": contact_payloads},
-    )
-    contacts = imported.get("items") or []
-    if len(contacts) != len(contact_payloads):
-        raise AudioAgentError("AudioAgent did not import every task contact")
-
     task_snapshot: dict[str, Any] = {
         "id": identifier,
+        "display_name": task_name,
+        "invitation_content": invitation_content,
         "prompt_snapshot": prompt,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
             "+00:00", "Z"
@@ -319,7 +387,7 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         task_snapshot["scene_id"] = int(args["scene_id"])
     hermes_session_id = str(kwargs.get("task_id") or "")[:200]
     campaign_payload: dict[str, Any] = {
-        "name": task_name,
+        "name": _campaign_resource_name(task_name, identifier),
         "agent_name": agent_name,
         "trunk_id": trunk_id,
         "source_number": source_number,
@@ -341,6 +409,14 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     if not campaign_id:
         raise AudioAgentError("AudioAgent did not return a campaign ID")
     try:
+        imported = client.request(
+            "POST",
+            client.project_path("/telephony/contacts/import"),
+            {"contacts": contact_payloads},
+        )
+        contacts = imported.get("items") or []
+        if len(contacts) != len(contact_payloads):
+            raise AudioAgentError("AudioAgent did not import every task contact")
         client.request(
             "POST",
             client.project_path(
@@ -367,15 +443,44 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         except Exception:
             pass
         raise
-    return {
-        "ok": True,
+    enqueue_result = (
+        running.get("enqueue_result")
+        if isinstance(running.get("enqueue_result"), dict)
+        else {}
+    )
+    queued_count = int(enqueue_result.get("queued") or 0)
+    blocked_count = int(enqueue_result.get("blocked") or 0)
+    blocked_reasons = dict(enqueue_result.get("blocked_reasons") or {})
+    all_blocked = blocked_count > 0 and queued_count == 0
+    response: dict[str, Any] = {
+        "ok": not all_blocked,
         "task_id": identifier,
         "campaign_id": campaign_id,
+        "campaign_name": task_name,
+        "invitation_content": invitation_content,
         "status": running.get("status"),
         "customer_count": len(contact_payloads),
+        "queued_count": queued_count,
+        "blocked_count": blocked_count,
         "max_concurrency": max_concurrency,
-        "message": "outbound task accepted",
+        "message": (
+            "outbound task was not dialed"
+            if all_blocked
+            else "outbound task accepted"
+        ),
     }
+    if blocked_reasons:
+        response["blocked_reasons"] = blocked_reasons
+    if all_blocked:
+        primary_reason = next(iter(blocked_reasons), "")
+        response["error_code"] = primary_reason or "all_contacts_blocked"
+        response["error"] = _BLOCKED_REASON_SUMMARIES.get(
+            primary_reason,
+            "所有客户均在拨号前被策略拦截，电话未拨出。",
+        )
+    elif blocked_count:
+        response["partial"] = True
+    return response
 
 
 @_handler

@@ -400,11 +400,17 @@ class TelephonyService:
             raise ValueError("calling window must use HH:MM format") from exc
         if window_start.second or window_start.microsecond or window_end.second or window_end.microsecond:
             raise ValueError("calling window must use minute precision")
-        if window_start >= window_end:
-            raise ValueError("calling_window_start must be earlier than calling_window_end")
+        if window_start > window_end:
+            raise ValueError(
+                "calling_window_start must not be later than calling_window_end; "
+                "use equal values for unrestricted calling"
+            )
         purpose = _validate_identifier(consent_purpose, "consent_purpose")
-        if not 1 <= max_attempts_per_number_per_day <= 100:
-            raise ValueError("max_attempts_per_number_per_day must be between 1 and 100")
+        if not 0 <= max_attempts_per_number_per_day <= 100:
+            raise ValueError(
+                "max_attempts_per_number_per_day must be between 0 and 100; "
+                "use 0 for unlimited attempts"
+            )
         if inbound_overflow_mode not in {"reject", "transfer"}:
             raise ValueError("inbound_overflow_mode must be reject or transfer")
         overflow_destination = inbound_overflow_destination_name.strip()
@@ -1068,6 +1074,52 @@ class TelephonyService:
             )
         return {"campaign_id": campaign_id, "requested": len(unique_ids), "added": added}
 
+    def list_campaign_contacts(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        campaign_id: str,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        role = self.store.require_permission(project_id, user_id, "telephony.read")
+        safe_limit = max(1, min(int(limit), 5000))
+        with self.store.connect() as conn:
+            campaign = conn.execute(
+                "SELECT id FROM telephony_campaigns WHERE id = ? AND project_id = ?",
+                (campaign_id, project_id),
+            ).fetchone()
+            if campaign is None:
+                raise ResourceNotFoundError("telephony campaign not found")
+            rows = conn.execute(
+                """
+                SELECT cc.campaign_id, cc.contact_id, cc.status, cc.call_id,
+                       cc.failure_reason, cc.created_at, cc.updated_at,
+                       c.external_id, c.name, c.phone_number,
+                       c.metadata_json AS contact_metadata_json
+                FROM telephony_campaign_contacts cc
+                JOIN telephony_contacts c ON c.id = cc.contact_id
+                WHERE cc.project_id = ? AND cc.campaign_id = ?
+                ORDER BY cc.created_at, cc.contact_id
+                LIMIT ?
+                """,
+                (project_id, campaign_id, safe_limit),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = _row(row) or {}
+            item["metadata"] = self._reveal_json(
+                item.pop("contact_metadata_json", "{}")
+            )
+            item["phone_number"] = self._reveal_phone(item.get("phone_number"))
+            if role == "viewer":
+                phone = str(item.get("phone_number") or "")
+                if phone:
+                    item["phone_number"] = "+" + "*" * max(0, len(phone) - 5) + phone[-4:]
+                item["metadata"] = {}
+            items.append(item)
+        return items
+
     def list_campaigns(
         self, *, project_id: str, user_id: str, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -1190,10 +1242,14 @@ class TelephonyService:
                         (campaign_id, project_id),
                     ).fetchone()
                 )
-        campaign["enqueue_result"] = {
+        enqueue_summary: dict[str, Any] = {
             "queued": enqueue_result["queued"],
             "blocked": enqueue_result["blocked"],
         }
+        blocked_reasons = dict(enqueue_result.get("blocked_reasons") or {})
+        if blocked_reasons:
+            enqueue_summary["blocked_reasons"] = blocked_reasons
+        campaign["enqueue_result"] = enqueue_summary
         return campaign
 
     def materialize_campaigns(
@@ -1203,7 +1259,7 @@ class TelephonyService:
         user_id: str,
         limit: int = 100,
         campaign_id: str | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """Turn a bounded number of campaign contacts into durable call jobs."""
         self.store.require_any_permission(
             project_id, user_id, {"telephony.operate", "telephony.work"}
@@ -1262,7 +1318,13 @@ class TelephonyService:
                     ),
                 )
 
-        result = {"scanned": len(contacts), "queued": 0, "blocked": 0, "pending": 0}
+        result: dict[str, Any] = {
+            "scanned": len(contacts),
+            "queued": 0,
+            "blocked": 0,
+            "pending": 0,
+        }
+        blocked_reasons: dict[str, int] = {}
         touched_campaigns: set[str] = set()
         for contact in contacts:
             current_campaign_id = str(contact["campaign_id"])
@@ -1372,7 +1434,12 @@ class TelephonyService:
                             project_id,
                         ),
                     )
-                    result["blocked"] += max(0, int(updated.rowcount or 0))
+                    blocked_count = max(0, int(updated.rowcount or 0))
+                    result["blocked"] += blocked_count
+                    if blocked_count:
+                        blocked_reasons[reason] = (
+                            int(blocked_reasons.get(reason) or 0) + blocked_count
+                        )
 
         if campaign_id:
             touched_campaigns.add(campaign_id)
@@ -1405,6 +1472,8 @@ class TelephonyService:
                 tuple(parameters[:-1]),
             ).fetchone()
         result["pending"] = int(pending["count"] or 0)
+        if blocked_reasons:
+            result["blocked_reasons"] = blocked_reasons
         return result
 
     def upsert_trunk(
@@ -1823,6 +1892,8 @@ class TelephonyService:
         local = _now(candidate).astimezone(zone)
         start = clock_time.fromisoformat(str(policy["calling_window_start"]))
         end = clock_time.fromisoformat(str(policy["calling_window_end"]))
+        if start == end:
+            return _now(candidate), "allowed"
         weekdays = {int(day) for day in policy["allowed_weekdays"]}
         for offset in range(8):
             day = local.date() + timedelta(days=offset)
@@ -1879,23 +1950,25 @@ class TelephonyService:
         local = current.astimezone(zone)
         local_start = datetime.combine(local.date(), clock_time.min, tzinfo=zone)
         local_end = local_start + timedelta(days=1)
-        attempts = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM call_attempts a
-            JOIN call_jobs c ON c.id = a.call_id AND c.project_id = a.project_id
-            WHERE a.project_id = ? AND c.destination_hash = ?
-              AND a.started_at >= ? AND a.started_at < ?
-            """,
-            (
-                project_id,
-                phone_hash,
-                _timestamp(local_start.astimezone(timezone.utc)),
-                _timestamp(local_end.astimezone(timezone.utc)),
-            ),
-        ).fetchone()
-        if int(attempts["count"] or 0) >= int(policy["max_attempts_per_number_per_day"]):
-            raise ComplianceBlockedError("daily_number_attempt_limit")
+        max_daily_attempts = int(policy["max_attempts_per_number_per_day"])
+        if max_daily_attempts > 0:
+            attempts = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM call_attempts a
+                JOIN call_jobs c ON c.id = a.call_id AND c.project_id = a.project_id
+                WHERE a.project_id = ? AND c.destination_hash = ?
+                  AND a.started_at >= ? AND a.started_at < ?
+                """,
+                (
+                    project_id,
+                    phone_hash,
+                    _timestamp(local_start.astimezone(timezone.utc)),
+                    _timestamp(local_end.astimezone(timezone.utc)),
+                ),
+            ).fetchone()
+            if int(attempts["count"] or 0) >= max_daily_attempts:
+                raise ComplianceBlockedError("daily_number_attempt_limit")
 
         candidate = max(_now(requested_at), current)
         ready_at, reason = self._next_calling_window(policy, candidate)
@@ -3155,7 +3228,15 @@ class TelephonyService:
         uri = validate_recording_storage_uri(storage_uri)
         timestamp = _utc_now()
         with self.store.transaction() as conn:
-            owned = self._owned_call(conn, project_id, call_id, worker_id, lease_token)
+            owned = self._recording_owned_call(
+                conn,
+                project_id,
+                call_id,
+                worker_id,
+                lease_token,
+                egress_id=normalized_egress_id,
+                status=status,
+            )
             if str(owned["recording_status"] or "") in {"completed", "failed"} and status in {
                 "starting",
                 "active",
@@ -3260,6 +3341,34 @@ class TelephonyService:
             if retryable and status in RETRYABLE_STATUSES and int(row["attempt_count"]) < int(row["max_attempts"]):
                 final_status = "queued"
                 available_at = _timestamp(current + timedelta(seconds=retry_delay_seconds))
+            retry_trunk_id = ""
+            if (
+                final_status == "queued"
+                and re.fullmatch(r"sip_5[0-9]{2}", failure_code.strip())
+                and row["trunk_id"]
+            ):
+                alternate = conn.execute(
+                    """
+                    SELECT candidate.id
+                    FROM sip_trunks candidate
+                    JOIN sip_trunks current
+                      ON current.id = ? AND current.project_id = candidate.project_id
+                    WHERE candidate.project_id = ?
+                      AND candidate.id <> current.id
+                      AND candidate.direction IN ('outbound', 'bidirectional')
+                      AND candidate.status = 'active'
+                      AND candidate.livekit_trunk_id <> ''
+                      AND candidate.livekit_trunk_id <> current.livekit_trunk_id
+                    ORDER BY
+                      CASE WHEN candidate.provider <> current.provider THEN 0 ELSE 1 END,
+                      candidate.created_at,
+                      candidate.id
+                    LIMIT 1
+                    """,
+                    (row["trunk_id"], project_id),
+                ).fetchone()
+                if alternate is not None:
+                    retry_trunk_id = str(alternate["id"])
             answered_at = timestamp if status == "active" and not row["answered_at"] else row["answered_at"]
             ended_at = timestamp if final_status in TERMINAL_STATUSES else None
             # An uncertain provider result is handed to a separate reconciler.
@@ -3273,6 +3382,7 @@ class TelephonyService:
                 """
                 UPDATE call_jobs SET
                     status = ?, available_at = ?,
+                    trunk_id = CASE WHEN ? <> '' THEN ? ELSE trunk_id END,
                     provider_call_id = CASE WHEN ? <> '' THEN ? ELSE provider_call_id END,
                     room_name = CASE WHEN ? <> '' THEN ? ELSE room_name END,
                     failure_code = ?, failure_detail = ?, answered_at = ?, ended_at = ?,
@@ -3287,6 +3397,8 @@ class TelephonyService:
                 (
                     final_status,
                     available_at,
+                    retry_trunk_id,
+                    retry_trunk_id,
                     (provider_call_id or "").strip(),
                     (provider_call_id or "").strip(),
                     (room_name or "").strip(),
@@ -3334,6 +3446,7 @@ class TelephonyService:
                     "requested_status": status,
                     "retryable": retryable,
                     "failure_code": failure_code.strip(),
+                    "retry_trunk_id": retry_trunk_id,
                 },
             )
             self._sync_campaign_call(
@@ -3514,6 +3627,65 @@ class TelephonyService:
             or not hmac.compare_digest(lease_token, expected_token)
         ):
             raise LeaseConflictError("call lease ownership mismatch")
+        return row
+
+    def _recording_owned_call(
+        self,
+        conn: Any,
+        project_id: str,
+        call_id: str,
+        worker_id: str,
+        lease_token: str,
+        *,
+        egress_id: str,
+        status: str,
+    ) -> Any:
+        """Authorize recording updates without weakening call lease ownership.
+
+        A call releases its active lease when it enters reconciliation or a
+        terminal state, but StopEgress completes asynchronously afterwards.
+        Final recording updates may therefore use the latest call attempt's
+        historical lease, provided the egress ID is unchanged.  Non-final
+        updates still require the current active lease.
+        """
+
+        lock_suffix = " FOR UPDATE" if self.store.backend == "postgresql" else ""
+        row = conn.execute(
+            f"SELECT * FROM call_jobs WHERE id = ? AND project_id = ?{lock_suffix}",
+            (call_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise ResourceNotFoundError("call not found")
+        current_owner = str(row["lease_owner"] or "")
+        current_token = str(row["lease_token"] or "")
+        if (
+            worker_id
+            and lease_token
+            and hmac.compare_digest(worker_id, current_owner)
+            and hmac.compare_digest(lease_token, current_token)
+        ):
+            return row
+        if status not in {"completed", "failed"}:
+            raise LeaseConflictError("call lease ownership mismatch")
+        current_egress_id = str(row["recording_egress_id"] or "")
+        if not current_egress_id or not hmac.compare_digest(egress_id, current_egress_id):
+            raise LeaseConflictError("recording egress ownership mismatch")
+        attempt = conn.execute(
+            """
+            SELECT attempt_number, worker_id, lease_token
+            FROM call_attempts
+            WHERE project_id = ? AND call_id = ? AND attempt_number = ?
+            """,
+            (project_id, call_id, int(row["attempt_count"])),
+        ).fetchone()
+        if (
+            attempt is None
+            or not worker_id
+            or not lease_token
+            or not hmac.compare_digest(worker_id, str(attempt["worker_id"] or ""))
+            or not hmac.compare_digest(lease_token, str(attempt["lease_token"] or ""))
+        ):
+            raise LeaseConflictError("recording attempt ownership mismatch")
         return row
 
     def _expire_leases(self, conn: Any, project_id: str, current: datetime) -> None:

@@ -118,6 +118,8 @@ def _status_label(value: str) -> str:
         "completed": "已完成",
         "partially_completed": "部分完成",
         "failed": "失败",
+        "no_answer": "未接听",
+        "busy": "占线",
         "cancelled": "已取消",
         "canceled": "已取消",
         "blocked": "已拦截",
@@ -142,7 +144,14 @@ def result_outcome(status: dict[str, Any]) -> str:
 
     results = [item for item in status.get("results") or [] if isinstance(item, dict)]
     if not results:
+        if int(status.get("blocked_count") or 0) > 0:
+            return "blocked"
         return str(status.get("status") or "unknown")
+    blocked = sum(
+        str(item.get("status") or "").lower() == "blocked" for item in results
+    )
+    if blocked == len(results):
+        return "blocked"
     completed = sum(
         str(item.get("status") or "").lower() == "completed" for item in results
     )
@@ -160,11 +169,21 @@ def _summary(item: dict[str, Any]) -> str:
         return summary
     detail = str(item.get("failure_detail") or "")
     failure_code = str(item.get("failure_code") or "").strip()
+    if str(item.get("status") or "").lower() == "blocked":
+        return {
+            "consent_missing_or_inactive": "目标号码缺少有效或未过期的外呼授权，电话未拨出。",
+            "do_not_call": "目标号码在禁止呼叫名单中，电话未拨出。",
+            "daily_number_attempt_limit": "目标号码已达到当日呼叫次数上限，电话未拨出。",
+        }.get(failure_code or detail, "外呼策略拦截了本次任务，电话未拨出。")
     if str(item.get("status") or "").lower() == "failed":
         if failure_code == "sip_500":
             return "运营商线路返回500，电话未接通。"
         reason = "；".join(value for value in (failure_code, detail) if value)
         return f"呼叫失败{f'：{reason}' if reason else ''}。"
+    if str(item.get("status") or "").lower() == "no_answer":
+        return "客户在响铃时限内未接听，电话未接通。"
+    if str(item.get("status") or "").lower() == "busy":
+        return "客户电话占线，本次未接通。"
     if "room disconnected" in detail.lower():
         return "客户主动挂断，未形成完整业务摘要。"
     return "本次通话未形成业务摘要。"
@@ -225,9 +244,9 @@ def render_result_card(
         fill=ACCENT,
     )
 
-    total = len(results)
+    total = max(int(status.get("contact_count") or 0), len(results))
     completed = sum(str(item.get("status") or "").lower() == "completed" for item in results)
-    failed = total - completed
+    failed = max(0, total - completed)
     stats_y = 244
     draw.rounded_rectangle(
         (CARD_MARGIN, stats_y, CARD_WIDTH - CARD_MARGIN, stats_y + 90),
@@ -255,7 +274,17 @@ def render_result_card(
 
     y = 360
     if not visible_results:
-        visible_results = [{"status": campaign_status or "未知"}]
+        fallback_status = "blocked" if int(status.get("blocked_count") or 0) else campaign_status
+        visible_results = [
+            {
+                "status": fallback_status or "未知",
+                "summary": (
+                    "外呼策略拦截了本次任务，电话未拨出。"
+                    if fallback_status == "blocked"
+                    else "本次通话未形成业务摘要。"
+                ),
+            }
+        ]
     for index, item in enumerate(visible_results, start=1):
         panel_bottom = y + row_height - 18
         draw.rounded_rectangle(

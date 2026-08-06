@@ -23,8 +23,9 @@ from integrations.hermes_audioagent import (
 
 
 class SubmitClient:
-    def __init__(self) -> None:
+    def __init__(self, *, blocked: bool = False) -> None:
         self.requests: list[tuple[str, str, dict | None]] = []
+        self.blocked = blocked
 
     def project_path(self, suffix: str) -> str:
         return suffix
@@ -38,7 +39,21 @@ class SubmitClient:
         if path.endswith("/contacts"):
             return {"campaign_id": "campaign-1", "added": 1}
         if path.endswith("/status"):
-            return {"id": "campaign-1", "status": payload["status"]}
+            if self.blocked:
+                return {
+                    "id": "campaign-1",
+                    "status": "completed",
+                    "enqueue_result": {
+                        "queued": 0,
+                        "blocked": 1,
+                        "blocked_reasons": {"consent_missing_or_inactive": 1},
+                    },
+                }
+            return {
+                "id": "campaign-1",
+                "status": payload["status"],
+                "enqueue_result": {"queued": 1, "blocked": 0},
+            }
         raise AssertionError((method, path, payload))
 
 
@@ -108,8 +123,13 @@ def test_wechat_outbound_request_drops_history_and_injects_direct_execution() ->
     assert "请问您是{{customer_name}}吗" in messages[1]["content"]
     assert "customers 中每位客户的 name" in messages[1]["content"]
     assert "不得固定写某个人名" in messages[1]["content"]
+    assert "必须填写 invitation_content" in messages[1]["content"]
     assert "热情、自然、口语化" in messages[1]["content"]
     assert "不得写沉默计时或系统挂机原因" in messages[1]["content"]
+    assert "Prompt 控制在 1500 个汉字以内" in messages[1]["content"]
+    assert "只有 ok=true 且 queued_count>0" in messages[1]["content"]
+    assert "[Sent image attachment]" in messages[1]["content"]
+    assert "通话结果由 AudioAgent 结果转发器" in messages[1]["content"]
     assert "以后请先给我看" not in str(messages)
     assert request["messages"][3]["content"].endswith("是否吃饭。")
 
@@ -199,6 +219,7 @@ def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
             {
                 "task_id": "wx-task-1",
                 "task_name": "续费提醒",
+                "invitation_content": "下周企业套餐续费确认",
                 "prompt": "请向 {{customer_name}} 确认续费。",
                 "customers": [
                     {
@@ -219,26 +240,62 @@ def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
         "ok": True,
         "task_id": "wx-task-1",
         "campaign_id": "campaign-1",
+        "campaign_name": "续费提醒",
+        "invitation_content": "下周企业套餐续费确认",
         "status": "running",
         "customer_count": 1,
+        "queued_count": 1,
+        "blocked_count": 0,
         "max_concurrency": 2,
         "message": "outbound task accepted",
     }
-    contact_payload = client.requests[0][2]["contacts"][0]
+    campaign_payload = client.requests[0][2]
+    assert campaign_payload["name"] == "续费提醒 [wx-task-1]"
+    assert campaign_payload["max_attempts"] == 2
+    contact_payload = client.requests[1][2]["contacts"][0]
     assert contact_payload["phone_number"] == "+8613800000000"
     assert contact_payload["metadata"] == {
         "company": "示例科技",
         "profile": {"plan": "enterprise"},
     }
-    campaign_payload = client.requests[1][2]
     prompt_snapshot = campaign_payload["metadata"]["task"]["prompt_snapshot"]
     assert prompt_snapshot.startswith("# 固定身份与信息规则（最高优先级）")
     assert "我是李宝祥的智能助理" in prompt_snapshot
     assert prompt_snapshot.endswith("请向 {{customer_name}} 确认续费。")
     assert campaign_payload["metadata"]["task"]["scene_id"] == 42
+    assert campaign_payload["metadata"]["task"]["display_name"] == "续费提醒"
+    assert (
+        campaign_payload["metadata"]["task"]["invitation_content"]
+        == "下周企业套餐续费确认"
+    )
     assert campaign_payload["metadata"]["delivery"] == {
         "hermes_session_id": "hermes-session-1"
     }
+
+
+def test_submit_reports_all_contacts_blocked_before_dialing(monkeypatch) -> None:
+    client = SubmitClient(blocked=True)
+    monkeypatch.setattr(tools, "AudioAgentClient", lambda: client)
+    monkeypatch.setenv("AUDIOAGENT_AGENT_NAME", "qwen-phone-agent")
+    monkeypatch.setenv("AUDIOAGENT_TRUNK_ID", "trunk-1")
+
+    result = json.loads(
+        tools.submit_outbound_task(
+            {
+                "task_id": "wx-task-blocked",
+                "task_name": "跑步邀约",
+                "prompt": "确认对方是否方便跑步。",
+                "customers": [{"phone": "18001350929", "name": "常凤香"}],
+            }
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "completed"
+    assert result["queued_count"] == 0
+    assert result["blocked_count"] == 1
+    assert result["error_code"] == "consent_missing_or_inactive"
+    assert "电话未拨出" in result["error"]
 
 
 class StatusClient:
@@ -269,6 +326,21 @@ class StatusClient:
                         "destination_number": "+8613800000000",
                         "metadata": {"customer": {"name": "林经理"}},
                         "disposition": "human_answered",
+                    }
+                ]
+            }
+        if path == "/telephony/campaigns/campaign-1/contacts?limit=5000":
+            return {
+                "items": [
+                    {
+                        "campaign_id": "campaign-1",
+                        "contact_id": "contact-1",
+                        "call_id": "call-1",
+                        "status": "completed",
+                        "failure_reason": "",
+                        "phone_number": "+8613800000000",
+                        "name": "林经理",
+                        "metadata": {},
                     }
                 ]
             }
@@ -328,10 +400,71 @@ def test_get_task_can_include_transcript(monkeypatch) -> None:
     ]
 
 
+class BlockedStatusClient:
+    def project_path(self, suffix: str) -> str:
+        return suffix
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        if path == "/telephony/campaigns?limit=500":
+            return {
+                "items": [
+                    {
+                        "id": "campaign-blocked",
+                        "name": "跑步邀约 [task-blocked]",
+                        "status": "completed",
+                        "contact_count": 1,
+                        "blocked_count": 1,
+                        "metadata": {
+                            "task": {
+                                "id": "task-blocked",
+                                "display_name": "跑步邀约",
+                            }
+                        },
+                    }
+                ]
+            }
+        if path == "/telephony/calls?direction=outbound&limit=500":
+            return {"items": []}
+        if path == "/telephony/campaigns/campaign-blocked/contacts?limit=5000":
+            return {
+                "items": [
+                    {
+                        "campaign_id": "campaign-blocked",
+                        "contact_id": "contact-blocked",
+                        "call_id": "",
+                        "status": "blocked",
+                        "failure_reason": "consent_missing_or_inactive",
+                        "phone_number": "+8618001350929",
+                        "name": "常凤香",
+                        "metadata": {},
+                    }
+                ]
+            }
+        raise AssertionError((method, path, payload))
+
+
+def test_get_task_returns_blocked_contact_without_call_record(monkeypatch) -> None:
+    monkeypatch.setattr(tools, "AudioAgentClient", BlockedStatusClient)
+
+    result = json.loads(
+        tools.get_outbound_task(
+            {"campaign_id": "campaign-blocked", "include_results": True}
+        )
+    )
+
+    assert result["campaign_name"] == "跑步邀约"
+    assert result["finished"] is True
+    assert result["contact_status_counts"] == {"blocked": 1}
+    assert result["results"][0]["status"] == "blocked"
+    assert result["results"][0]["customer"]["name"] == "常凤香"
+    assert "电话未拨出" in result["results"][0]["summary"]
+
+
 def test_result_forwarder_formats_hangup_without_saved_summary() -> None:
     message = delivery.format_result_message(
         {
             "campaign_name": "产品介绍",
+            "invitation_content": "下周产品续费沟通",
             "status": "completed",
             "results": [
                 {
@@ -347,12 +480,13 @@ def test_result_forwarder_formats_hangup_without_saved_summary() -> None:
         }
     )
 
-    assert "外呼任务结果" in message
-    assert "产品介绍" in message
-    assert "0000" in message
-    assert "通话时长：42秒" in message
-    assert "客户主动挂断" in message
-    assert "可以；我再看看" in message
+    assert "**收信人：** 林经理" in message
+    assert "**电话：** 13800000000" in message
+    assert "**邀请内容：** 下周产品续费沟通" in message
+    assert "**发起人：** 李宝祥（智能助理代拨）" in message
+    assert "**通话状态：** 已接通" in message
+    assert "**通话摘要：** 电话已接通，但未形成明确业务结论。" in message
+    assert "MEDIA:" not in message
 
 
 def test_result_card_renders_clear_customer_summary(monkeypatch, tmp_path) -> None:
@@ -375,7 +509,7 @@ def test_result_card_renders_clear_customer_summary(monkeypatch, tmp_path) -> No
         ],
     }
 
-    path = delivery.render_result_card(
+    path = result_card.render_result_card(
         status,
         campaign_id="campaign-1",
         output_path=tmp_path / "result.png",
@@ -396,10 +530,137 @@ def test_result_card_uses_failed_business_outcome_for_terminal_campaign() -> Non
     ) == "failed"
 
 
-def test_result_delivery_sends_card_as_weixin_media(monkeypatch, tmp_path) -> None:
+def test_no_answer_result_has_clear_customer_facing_reason() -> None:
+    item = {
+        "status": "no_answer",
+        "failure_code": "sip_408",
+        "failure_detail": "no answer before 45-second ringing timeout",
+    }
+
+    assert result_card._status_label("no_answer") == "未接听"
+    assert result_card._summary(item) == "客户在响铃时限内未接听，电话未接通。"
+    message = delivery.format_result_message(
+        {"campaign_name": "跑步邀约", "status": "completed", "results": [item]}
+    )
+    assert "**通话状态：** 未接通" in message
+    assert "客户未接听，电话未接通。" in message
+    assert "未形成业务摘要" not in message
+
+
+def test_result_markdown_matches_requested_business_format() -> None:
+    message = delivery.format_result_message(
+        {
+            "invitation_content": "今晚 8:30 莲花河跑步",
+            "results": [
+                {
+                    "status": "completed",
+                    "phone": "+8618001350929",
+                    "customer": {"name": "常凤香"},
+                    "answered_at": "2026-08-06T09:00:00Z",
+                    "summary": "常姐已经同意今晚 8:30 去莲花河跑步。请准时到达。",
+                }
+            ],
+        }
+    )
+
+    assert message == (
+        "**收信人：** 常凤香\n"
+        "**电话：** 18001350929\n"
+        "**邀请内容：** 今晚 8:30 莲花河跑步\n"
+        "**发起人：** 李宝祥（智能助理代拨）\n"
+        "**通话状态：** 已接通\n"
+        "**通话摘要：** 常姐已经同意今晚 8:30 去莲花河跑步。"
+    )
+
+
+def test_result_markdown_removes_spoken_greeting_from_summary() -> None:
+    message = delivery.format_result_message(
+        {
+            "invitation_content": "周末带果果来北京玩",
+            "results": [
+                {
+                    "status": "completed",
+                    "phone": "+8618036691828",
+                    "customer": {"name": "李艳美"},
+                    "answered_at": "2026-08-06T10:34:06Z",
+                    "summary": (
+                        "李艳美已同意：李姐您好呀！"
+                        "宝祥想邀请您周末带果果来北京玩；"
+                        "提示：太好啦！那我跟宝祥说一声。"
+                    ),
+                }
+            ],
+        }
+    )
+
+    assert (
+        "**通话摘要：** "
+        "李艳美已同意：宝祥想邀请您周末带果果来北京玩。"
+    ) in message
+    assert "李姐您好" not in message
+    assert "太好啦" not in message
+
+
+def test_sip_decline_is_displayed_as_rejected() -> None:
+    message = delivery.format_result_message(
+        {
+            "invitation_content": "今晚聚餐",
+            "results": [
+                {
+                    "status": "busy",
+                    "failure_code": "sip_603",
+                    "phone": "+8613800000000",
+                    "customer": {"name": "任总"},
+                }
+            ],
+        }
+    )
+
+    assert "**通话状态：** 拒接" in message
+    assert "**通话摘要：** 客户拒接，本次未能沟通。" in message
+
+
+def test_sip_500_has_specific_carrier_summary() -> None:
+    message = delivery.format_result_message(
+        {
+            "invitation_content": "今晚吃饭",
+            "results": [
+                {
+                    "status": "failed",
+                    "failure_code": "sip_500",
+                    "phone": "+8618701538360",
+                    "customer": {"name": "晓旭老师"},
+                }
+            ],
+        }
+    )
+
+    assert "**通话状态：** 未接通" in message
+    assert "**通话摘要：** 运营商线路暂时异常，电话未接通。" in message
+
+
+def test_result_card_uses_blocked_outcome_when_no_call_was_created() -> None:
+    status = {
+        "status": "completed",
+        "contact_count": 1,
+        "blocked_count": 1,
+        "results": [
+            {
+                "status": "blocked",
+                "failure_code": "consent_missing_or_inactive",
+            }
+        ],
+    }
+
+    assert result_card.result_outcome(status) == "blocked"
+    assert "电话未拨出" in result_card._summary(status["results"][0])
+    message = delivery.format_result_message(status)
+    assert "**通话状态：** 未接通" in message
+    assert "电话未拨出" in message
+
+
+def test_result_delivery_sends_markdown_text_without_media(monkeypatch) -> None:
     captured: dict[str, object] = {}
-    card = tmp_path / "result.png"
-    card.write_bytes(b"png")
 
     def fake_run(command, **kwargs):
         captured["command"] = command
@@ -409,9 +670,11 @@ def test_result_delivery_sends_card_as_weixin_media(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(delivery.shutil, "which", lambda _name: "/usr/bin/hermes")
     monkeypatch.setattr(delivery.subprocess, "run", fake_run)
 
-    assert delivery._send_message("任务已结束", card_path=card) is True
+    markdown = "**收信人：** 常凤香"
+    assert delivery._send_message(markdown) is True
     command = captured["command"]
-    assert command[-1] == f"MEDIA:{card}"
+    assert command[-1] == markdown
+    assert not command[-1].startswith("MEDIA:")
     assert command[command.index("--to") + 1] == "weixin"
     assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDING"] == "false"
     assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDER_CHILD"] == "1"

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import fcntl
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -15,7 +15,6 @@ import time
 from typing import Any
 
 from .client import AudioAgentClient
-from .result_card import render_result_card, result_outcome
 from .tools import _task_status
 
 
@@ -128,68 +127,136 @@ def _mark_delivered(campaign_id: str) -> None:
         _write_delivery_state(delivered, attempted)
 
 
-def _duration_seconds(item: dict[str, Any]) -> int | None:
-    try:
-        answered = datetime.fromisoformat(
-            str(item.get("answered_at") or "").replace("Z", "+00:00")
-        )
-        ended = datetime.fromisoformat(
-            str(item.get("ended_at") or "").replace("Z", "+00:00")
-        )
-    except ValueError:
-        return None
-    return max(0, int((ended - answered).total_seconds()))
+def _single_line(value: Any, *, limit: int = 300) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _display_phone(value: Any) -> str:
+    phone = re.sub(r"[^0-9+]", "", str(value or ""))
+    if phone.startswith("+86") and len(phone) == 14:
+        return phone[3:]
+    return phone or "未提供"
+
+
+def _display_call_status(item: dict[str, Any]) -> str:
+    status = str(item.get("status") or "").strip().lower()
+    failure_code = str(item.get("failure_code") or "").strip().lower()
+    disposition = str(item.get("disposition") or "").strip().lower()
+    if failure_code in {"sip_600", "sip_603"} or disposition in {
+        "declined",
+        "rejected",
+    }:
+        return "拒接"
+    if status == "completed" or item.get("answered_at"):
+        return "已接通"
+    return "未接通"
+
+
+def _one_sentence(value: Any) -> str:
+    text = _single_line(value, limit=500)
+    if not text:
+        return ""
+    # Remove spoken salutations accidentally captured by fallback summaries,
+    # for example "已同意：李姐您好呀！宝祥想邀请您……".
+    text = re.sub(
+        r"([:：])[^:：；;，,。！？!?]{0,16}(?:您好|你好)(?:呀|啊|哈)?[！!,，、\s]*",
+        r"\1",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"^[^:：；;，,。！？!?]{0,16}(?:您好|你好)(?:呀|啊|哈)?[！!,，、\s]*",
+        "",
+        text,
+        count=1,
+    )
+    # A closing pleasantry is not an operator reminder. Drop only the trailing
+    # hint clause when it begins with a clear acknowledgement.
+    text = re.sub(
+        r"[；;]\s*提示[:：]\s*(?:太好啦|好的呀|好的|好呀|明白了|没问题)[！!,，、\s]*.*$",
+        "",
+        text,
+    ).rstrip("；;，, ")
+    match = re.search(r"[。！？!?]", text)
+    if match:
+        text = text[: match.end()]
+    elif len(text) > 120:
+        text = text[:119].rstrip("，,；;：: ") + "。"
+    elif text[-1] not in "。！？!?":
+        text += "。"
+    return text
+
+
+def _result_summary(item: dict[str, Any], call_status: str) -> str:
+    summary = _one_sentence(item.get("summary"))
+    if summary:
+        return summary
+    status = str(item.get("status") or "").strip().lower()
+    failure_code = str(item.get("failure_code") or "").strip().lower()
+    if status == "blocked":
+        return {
+            "do_not_call": "目标号码在禁止呼叫名单中，电话未拨出。",
+            "source_number_not_allowlisted": "外呼线路配置不允许该主叫号码，电话未拨出。",
+            "outbound_trunk_unavailable": "外呼线路不可用，电话未拨出。",
+        }.get(failure_code, "任务在拨号前被策略拦截，电话未拨出。")
+    if call_status == "拒接":
+        return "客户拒接，本次未能沟通。"
+    if status == "no_answer":
+        return "客户未接听，电话未接通。"
+    if status == "busy" or failure_code == "sip_486":
+        return "客户电话占线，本次未能沟通。"
+    if failure_code == "sip_500":
+        return "运营商线路暂时异常，电话未接通。"
+    if call_status == "未接通":
+        return "线路或呼叫异常，电话未接通。"
+    return "电话已接通，但未形成明确业务结论。"
 
 
 def format_result_message(status: dict[str, Any]) -> str:
-    outcome = result_outcome(status)
-    outcome_label = {
-        "completed": "已完成",
-        "partially_completed": "部分完成",
-        "failed": "失败",
-    }.get(outcome, outcome or "未知")
-    lines = [
-        "☎️ 外呼任务结果",
-        f"任务：{status.get('campaign_name') or status.get('task_id') or '未命名任务'}",
-        f"状态：{outcome_label}",
-    ]
+    invitation_content = _single_line(
+        status.get("invitation_content")
+        or status.get("campaign_name")
+        or status.get("task_id")
+        or "未提供"
+    )
+    blocks: list[str] = []
     for index, item in enumerate(status.get("results") or [], start=1):
         if not isinstance(item, dict):
             continue
         customer = item.get("customer") if isinstance(item.get("customer"), dict) else {}
-        name = str(customer.get("name") or f"客户{index}")
-        phone = str(item.get("phone") or "")
-        masked_phone = ("*" * max(0, len(phone) - 4) + phone[-4:]) if phone else ""
-        lines.append(f"{name}（{masked_phone}）：{item.get('status') or '未知'}")
-        duration = _duration_seconds(item)
-        if duration is not None:
-            lines.append(f"通话时长：{duration}秒")
-        summary = str(item.get("summary") or "").strip()
-        if summary:
-            lines.append(f"摘要：{summary}")
-        else:
-            detail = str(item.get("failure_detail") or "")
-            failure_code = str(item.get("failure_code") or "").strip()
-            if str(item.get("status") or "").lower() == "failed":
-                reason = "；".join(value for value in (failure_code, detail) if value)
-                lines.append(f"摘要：呼叫失败{f'（{reason}）' if reason else ''}。")
-            elif "room disconnected" in detail.lower():
-                lines.append("摘要：客户主动挂断，未形成完整业务摘要。")
-            else:
-                lines.append("摘要：本次通话未形成业务摘要。")
-        recent = [str(value).strip() for value in item.get("last_user_messages") or []]
-        if recent:
-            lines.append("客户最后回应：" + "；".join(recent[-3:]))
-    return "\n".join(lines)[:3500]
+        name = _single_line(customer.get("name") or f"客户{index}", limit=100)
+        call_status = _display_call_status(item)
+        blocks.append(
+            "\n".join(
+                [
+                    f"**收信人：** {name}",
+                    f"**电话：** {_display_phone(item.get('phone'))}",
+                    f"**邀请内容：** {invitation_content}",
+                    "**发起人：** 李宝祥（智能助理代拨）",
+                    f"**通话状态：** {call_status}",
+                    f"**通话摘要：** {_result_summary(item, call_status)}",
+                ]
+            )
+        )
+    if not blocks:
+        blocks.append(
+            "\n".join(
+                [
+                    "**收信人：** 未提供",
+                    "**电话：** 未提供",
+                    f"**邀请内容：** {invitation_content}",
+                    "**发起人：** 李宝祥（智能助理代拨）",
+                    "**通话状态：** 未接通",
+                    "**通话摘要：** 任务未形成有效呼叫结果。",
+                ]
+            )
+        )
+    return "\n\n---\n\n".join(blocks)[:3500]
 
 
-def _send_message(message: str, *, card_path: Path | None = None) -> bool:
+def _send_message(message: str) -> bool:
     hermes = shutil.which("hermes") or "/usr/local/bin/hermes"
     target = os.getenv("AUDIOAGENT_RESULT_TARGET", "weixin").strip() or "weixin"
-    # Weixin media and text are separate API operations. Sending only the
-    # self-contained card prevents a successful image followed by a failed
-    # caption from causing the whole delivery to be retried with a duplicate.
-    payload = f"MEDIA:{card_path}" if card_path else message
     child_environment = os.environ.copy()
     # `hermes send` loads enabled plugins. Without this override its child
     # process starts another result forwarder and recursively sends the same
@@ -198,7 +265,7 @@ def _send_message(message: str, *, card_path: Path | None = None) -> bool:
     child_environment["AUDIOAGENT_RESULT_FORWARDER_CHILD"] = "1"
     try:
         completed = subprocess.run(
-            [hermes, "send", "--quiet", "--to", target, payload],
+            [hermes, "send", "--quiet", "--to", target, message],
             capture_output=True,
             text=True,
             timeout=30,
@@ -250,16 +317,8 @@ def _scan_once(delivered: set[str]) -> bool:
         if not _claim_delivery(campaign_id):
             delivered.add(campaign_id)
             continue
-        card_path: Path | None = None
         message = format_result_message(status)
-        try:
-            card_path = render_result_card(status, campaign_id=campaign_id)
-        except Exception as exc:
-            logger.warning(
-                "AudioAgent result card rendering failed; using text fallback: %s",
-                type(exc).__name__,
-            )
-        if _send_message(message, card_path=card_path):
+        if _send_message(message):
             _mark_delivered(campaign_id)
             delivered.add(campaign_id)
             changed = True
