@@ -152,64 +152,22 @@ def _display_call_status(item: dict[str, Any]) -> str:
     return "未接通"
 
 
-def _one_sentence(value: Any) -> str:
-    text = _single_line(value, limit=500)
-    if not text:
-        return ""
-    # Remove spoken salutations accidentally captured by fallback summaries,
-    # for example "已同意：李姐您好呀！宝祥想邀请您……".
-    text = re.sub(
-        r"([:：])[^:：；;，,。！？!?]{0,16}(?:您好|你好)(?:呀|啊|哈)?[！!,，、\s]*",
-        r"\1",
-        text,
-        count=1,
-    )
-    text = re.sub(
-        r"^[^:：；;，,。！？!?]{0,16}(?:您好|你好)(?:呀|啊|哈)?[！!,，、\s]*",
-        "",
-        text,
-        count=1,
-    )
-    # A closing pleasantry is not an operator reminder. Drop only the trailing
-    # hint clause when it begins with a clear acknowledgement.
-    text = re.sub(
-        r"[；;]\s*提示[:：]\s*(?:太好啦|好的呀|好的|好呀|明白了|没问题)[！!,，、\s]*.*$",
-        "",
-        text,
-    ).rstrip("；;，, ")
-    match = re.search(r"[。！？!?]", text)
-    if match:
-        text = text[: match.end()]
-    elif len(text) > 120:
-        text = text[:119].rstrip("，,；;：: ") + "。"
-    elif text[-1] not in "。！？!?":
-        text += "。"
-    return text
-
-
-def _result_summary(item: dict[str, Any], call_status: str) -> str:
-    summary = _one_sentence(item.get("summary"))
-    if summary:
-        return summary
-    status = str(item.get("status") or "").strip().lower()
-    failure_code = str(item.get("failure_code") or "").strip().lower()
-    if status == "blocked":
-        return {
-            "do_not_call": "目标号码在禁止呼叫名单中，电话未拨出。",
-            "source_number_not_allowlisted": "外呼线路配置不允许该主叫号码，电话未拨出。",
-            "outbound_trunk_unavailable": "外呼线路不可用，电话未拨出。",
-        }.get(failure_code, "任务在拨号前被策略拦截，电话未拨出。")
-    if call_status == "拒接":
-        return "客户拒接，本次未能沟通。"
-    if status == "no_answer":
-        return "客户未接听，电话未接通。"
-    if status == "busy" or failure_code == "sip_486":
-        return "客户电话占线，本次未能沟通。"
-    if failure_code == "sip_500":
-        return "运营商线路暂时异常，电话未接通。"
-    if call_status == "未接通":
-        return "线路或呼叫异常，电话未接通。"
-    return "电话已接通，但未形成明确业务结论。"
+def _transcript_lines(item: dict[str, Any]) -> list[str]:
+    lines = ["**通话记录：**"]
+    for turn in item.get("transcript") or []:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "").strip().lower()
+        if role not in {"assistant", "user"}:
+            continue
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        label = "AI" if role == "assistant" else "客户"
+        lines.append(f"{label}：{text}")
+    if len(lines) == 1:
+        lines.append("无（数据库中没有 AI 或客户的文字通话记录）。")
+    return lines
 
 
 def format_result_message(status: dict[str, Any]) -> str:
@@ -234,7 +192,7 @@ def format_result_message(status: dict[str, Any]) -> str:
                     f"**邀请内容：** {invitation_content}",
                     "**发起人：** 李宝祥（智能助理代拨）",
                     f"**通话状态：** {call_status}",
-                    f"**通话摘要：** {_result_summary(item, call_status)}",
+                    *_transcript_lines(item),
                 ]
             )
         )
@@ -247,11 +205,12 @@ def format_result_message(status: dict[str, Any]) -> str:
                     f"**邀请内容：** {invitation_content}",
                     "**发起人：** 李宝祥（智能助理代拨）",
                     "**通话状态：** 未接通",
-                    "**通话摘要：** 任务未形成有效呼叫结果。",
+                    "**通话记录：**",
+                    "无（数据库中没有 AI 或客户的文字通话记录）。",
                 ]
             )
         )
-    return "\n\n---\n\n".join(blocks)[:3500]
+    return "\n\n---\n\n".join(blocks)
 
 
 def _send_message(message: str) -> bool:
@@ -302,7 +261,7 @@ def _scan_once(delivered: set[str]) -> bool:
             client,
             campaign_id,
             include_results=True,
-            include_transcript=False,
+            include_transcript=True,
         )
         if not status.get("finished"):
             continue

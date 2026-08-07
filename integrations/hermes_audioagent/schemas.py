@@ -82,6 +82,73 @@ SUBMIT_OUTBOUND_TASK = {
     },
 }
 
+
+RESOLVE_OUTBOUND_CONTACT = {
+    "name": "audioagent_resolve_outbound_contact",
+    "description": (
+        "Resolve a Weixin outbound-call recipient from AudioAgent's address book when the "
+        "message has no phone number. A unique exact text match (full name, short name, "
+        "full pinyin, or short pinyin) is dialed immediately. Fuzzy matches and every "
+        "voice-input match are returned for explicit confirmation. Never invent a phone."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Contact name or pinyin exactly as written by the user.",
+            },
+            "input_mode": {
+                "type": "string",
+                "enum": ["text", "voice"],
+                "default": "text",
+                "description": "The Hermes middleware supplies the authoritative mode.",
+            },
+            "task_name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "invitation_content": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300,
+            },
+            "prompt": {"type": "string", "minLength": 1, "maxLength": 24000},
+            "task_id": {"type": "string", "maxLength": 120},
+            "scene_id": {"type": "integer", "minimum": 1},
+            "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 100},
+            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10},
+            "scheduled_at": {"type": "string"},
+            "agent_name": {"type": "string", "maxLength": 200},
+            "trunk_id": {"type": "string", "maxLength": 200},
+            "source_number": {"type": "string", "maxLength": 16},
+        },
+        "required": ["query", "task_name", "prompt"],
+    },
+}
+
+
+CONFIRM_ADDRESS_BOOK_CONTACT = {
+    "name": "audioagent_confirm_address_book_contact",
+    "description": (
+        "Dial one candidate from the pending AudioAgent address-book result only after the "
+        "Weixin user explicitly replies with confirmation. Task and phone data are loaded "
+        "from Hermes process state; never reconstruct or guess them."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "choice": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 1,
+            }
+        },
+    },
+}
+
 GET_OUTBOUND_TASK = {
     "name": "audioagent_get_outbound_task",
     "description": "Get campaign progress and structured call results for an AudioAgent task.",

@@ -26,4 +26,5 @@ PyJWT[crypto]==2.13.0
 # Explicit security floor for the image codec pulled in by LiveKit local inference.
 pillow==12.3.0
 pypdf==6.1.1
+pypinyin==0.55.0
 minio==7.2.18

@@ -386,13 +386,17 @@ def _function_call_requests_wechat_notice(function_call: Any) -> bool:
     return str(getattr(function_call, "name", "")) == "complete_wechat_followup"
 
 
-def _cancel_tool_reply_for_programmatic_audio(event: Any) -> set[str]:
-    names = {
+def _programmatic_audio_tool_names(event: Any) -> set[str]:
+    return {
         str(getattr(call, "name", ""))
         for call in getattr(event, "function_calls", [])
         if str(getattr(call, "name", ""))
         in {"complete_wechat_followup", "end_call"}
     }
+
+
+def _cancel_tool_reply_for_programmatic_audio(event: Any) -> set[str]:
+    names = _programmatic_audio_tool_names(event)
     if not names:
         return set()
     event.cancel_tool_reply()
@@ -2116,6 +2120,9 @@ _RUNTIME_HANGUP_MECHANICS = re.compile(
 _ACTIONABLE_REMINDER = re.compile(
     r"(?:地点|地址|时间|稍后|联系|确认|回复|提醒|记得|需要|请|改到|改为|安排)"
 )
+_IDENTITY_REJECTION = re.compile(
+    r"(?:不是|打错|找错|不认识|没有这个人|换人了|空号)"
+)
 
 
 def _is_identity_turn(text: str) -> bool:
@@ -2153,6 +2160,7 @@ def _fallback_business_summary(
     if not user_indexes:
         return reason.strip() or "电话已结束，但未收到客户回应。"
 
+    last_business_reply = ""
     for user_index in reversed(user_indexes):
         reply = turns[user_index][1].strip()
         business = ""
@@ -2163,6 +2171,8 @@ def _fallback_business_summary(
                     break
         if not business:
             continue
+        if not last_business_reply:
+            last_business_reply = reply
 
         reminder = ""
         for role, text in turns[user_index + 1 :]:
@@ -2186,8 +2196,45 @@ def _fallback_business_summary(
             summary += f"；提示：{reminder}"
         return summary + "。"
 
-    last_reply = turns[user_indexes[-1]][1].strip().rstrip("。！？!? ")
-    return f"已完成与{customer_label}的电话沟通；对方最后回复：“{last_reply}”。"
+    if last_business_reply:
+        reply = last_business_reply.rstrip("。！？!? ")
+        return f"已完成与{customer_label}的电话沟通；对方最后回复：“{reply}”。"
+    return reason.strip() or "电话已结束，但没有可验证的业务对话。"
+
+
+def _evidence_based_call_result(
+    *, customer_name: str, turns: list[tuple[str, str]]
+) -> str | None:
+    """Derive a result only from a customer reply to a spoken call turn."""
+
+    for user_index in range(len(turns) - 1, -1, -1):
+        role, raw_reply = turns[user_index]
+        if role != "user" or not raw_reply.strip():
+            continue
+        reply = raw_reply.strip()
+        preceding_assistant = next(
+            (
+                text.strip()
+                for prior_role, text in reversed(turns[:user_index])
+                if prior_role == "assistant" and text.strip()
+            ),
+            "",
+        )
+        if not preceding_assistant:
+            continue
+        if _is_identity_turn(preceding_assistant):
+            if _IDENTITY_REJECTION.search(reply):
+                customer_label = customer_name.strip() or "客户"
+                return f"{customer_label}身份未确认；对方回复：“{reply}”。"
+            # “是” only confirms identity. It is never evidence that the
+            # customer accepted an invitation or any other business request.
+            continue
+        return _fallback_business_summary(
+            customer_name=customer_name,
+            reason="",
+            turns=turns[: user_index + 1],
+        )
+    return None
 
 
 def _sanitize_business_summary(
@@ -2468,7 +2515,12 @@ class PhoneAgent(Agent):
         )
         return "意向标签已保存。" if saved else "意向标签暂时无法保存。"
 
-    @function_tool(description="Save a faithful summary before normally completing the call.")
+    @function_tool(
+        description=(
+            "Save a result only after the customer answered a spoken business request. "
+            "The runtime derives the stored result from the transcript and ignores unsupported claims."
+        )
+    )
     async def save_call_result(
         self,
         summary: str,
@@ -2476,17 +2528,24 @@ class PhoneAgent(Agent):
     ) -> str:
         if not summary.strip():
             return "通话摘要为空，未保存。"
-        summary = _sanitize_business_summary(
-            summary,
+        summary = _evidence_based_call_result(
             customer_name=str((self._managed_job or {}).get("customer_name") or ""),
             turns=self._conversation_turns,
         )
+        if not summary:
+            logger.warning(
+                "Rejected unsupported call result: call_id=%s",
+                (self._managed_job or {}).get("call_id"),
+            )
+            return "尚无可验证的业务答复，未保存；请先说明具体事项并取得客户答复。"
         async with self._business_result_lock:
             saved = await self._record_realtime_business_event(
                 "call.result",
                 {
                     "summary": summary.strip()[:4000],
-                    "intent_label": intent_label.strip().upper()[:10],
+                    # A model-supplied label is not evidence. Dedicated intent
+                    # labeling has its own explicit evidence-bearing tool.
+                    "intent_label": "",
                 },
             )
             if saved:
@@ -2544,6 +2603,13 @@ class PhoneAgent(Agent):
         )
     )
     async def end_call(self, ctx: RunContext, reason: str) -> str:
+        if (
+            self._managed_job
+            and str(self._managed_job.get("direction") or "") == "outbound"
+            and str(self._managed_job.get("realtime_prompt") or "").strip()
+            and not self._business_result_saved
+        ):
+            return "尚无已验证的客户业务答复，不能结束通话；请继续说明事项并等待客户答复。"
         if voice_pipeline() == REALTIME_PIPELINE:
             return "结束请求已接收，程序将播放统一结束语。"
         if not self._job_ctx:
@@ -3216,6 +3282,21 @@ async def entrypoint(ctx: JobContext) -> None:
         nonlocal wechat_notice_task
         if selected_pipeline != REALTIME_PIPELINE:
             return
+        requested_tools = _programmatic_audio_tool_names(ev)
+        if (
+            requested_tools == {"end_call"}
+            and task_prompt_override
+            and outbound_job
+            and not phone_agent._business_result_saved
+        ):
+            # Preserve the rejected end_call tool result so Qwen can continue
+            # with the actual business request. Canceling it here would leave
+            # the model unaware that identity confirmation was insufficient.
+            logger.warning(
+                "Leaving unsupported end_call result visible to model: call_id=%s",
+                outbound_job.get("call_id"),
+            )
+            return
         programmatic_tools = _cancel_tool_reply_for_programmatic_audio(ev)
         if not programmatic_tools:
             return
@@ -3234,6 +3315,12 @@ async def entrypoint(ctx: JobContext) -> None:
             return
 
         if action == "final_goodbye":
+            if task_prompt_override and outbound_job and not phone_agent._business_result_saved:
+                logger.warning(
+                    "Ignoring unsupported end_call before evidence-backed result: call_id=%s",
+                    outbound_job.get("call_id"),
+                )
+                return
             reason = "normal flow completed"
             for call in getattr(ev, "function_calls", []):
                 if str(getattr(call, "name", "")) != "end_call":
@@ -3358,7 +3445,15 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception:
                 logger.exception("Unable to persist conversation item")
 
-        asyncio.create_task(persist_conversation_item())
+        task = asyncio.create_task(
+            persist_conversation_item(),
+            name=f"persist-conversation-{item_id or role}",
+        )
+        # Terminal call state is written only after this set is drained by the
+        # shutdown finalizer. The result forwarder can therefore read the full
+        # database transcript as soon as it observes a completed call.
+        phone_agent._pending_business_event_tasks.add(task)
+        task.add_done_callback(phone_agent._pending_business_event_tasks.discard)
 
     async def cancel_wechat_timer_on_shutdown(_reason: str = "") -> None:
         cancel_wechat_close_timer("session shutdown", clear_waiting=True)

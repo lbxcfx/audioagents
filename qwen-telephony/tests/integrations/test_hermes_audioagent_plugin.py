@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -14,8 +15,11 @@ if str(ROOT) not in sys.path:
 
 from integrations import hermes_audioagent
 from integrations.hermes_audioagent import (
+    address_book,
     delivery,
     middleware,
+    qwen_asr,
+    response_policy,
     result_card,
     schemas,
     tools,
@@ -32,6 +36,8 @@ class SubmitClient:
 
     def request(self, method: str, path: str, payload: dict | None = None) -> dict:
         self.requests.append((method, path, payload))
+        if path == "/telephony/address-book":
+            return {"stored": False, "reason": "name_is_not_a_full_person_name"}
         if path == "/telephony/contacts/import":
             return {"items": [{"id": "contact-1"}], "count": 1}
         if path == "/telephony/campaigns" and method == "POST":
@@ -57,13 +63,17 @@ class SubmitClient:
         raise AssertionError((method, path, payload))
 
 
-def test_plugin_registers_tools_and_bundled_skill() -> None:
+def test_plugin_registers_tools_and_bundled_skill(monkeypatch) -> None:
+    provider = object()
+    monkeypatch.setattr(qwen_asr, "create_provider", lambda: provider)
+
     class Context:
         def __init__(self) -> None:
             self.tools = []
             self.skills = []
             self.hooks = []
             self.middleware = []
+            self.transcription_providers = []
 
         def register_tool(self, **options) -> None:
             self.tools.append(options)
@@ -77,10 +87,15 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
         def register_middleware(self, name, handler) -> None:
             self.middleware.append((name, handler))
 
+        def register_transcription_provider(self, item) -> None:
+            self.transcription_providers.append(item)
+
     context = Context()
     hermes_audioagent.register(context)
 
     assert {item["name"] for item in context.tools} == {
+        "audioagent_resolve_outbound_contact",
+        "audioagent_confirm_address_book_contact",
         "audioagent_submit_outbound_task",
         "audioagent_get_outbound_task",
         "audioagent_wait_outbound_task",
@@ -94,11 +109,67 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
         "latest-call-recording",
     ]
     assert all(item[1].is_file() for item in context.skills)
-    assert context.hooks == []
+    assert context.hooks == [
+        ("transform_llm_output", response_policy.transform_submission_response),
+        ("pre_gateway_dispatch", address_book.mark_weixin_voice_input),
+    ]
+    assert context.transcription_providers == [provider]
     assert context.middleware == [
+        ("llm_request", middleware.guide_wechat_address_book_request),
         ("llm_request", middleware.isolate_wechat_outbound_request),
         ("llm_request", middleware.guide_wechat_call_artifact_request),
     ]
+
+
+def test_qwen_asr_client_posts_base64_wav(monkeypatch, tmp_path) -> None:
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"RIFFtest")
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": "给任总打电话。"}}]}
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(qwen_asr, "urlopen", fake_urlopen)
+    client = qwen_asr.QwenASRClient(api_key="secret", timeout_seconds=12)
+
+    result = client.transcribe(str(audio_path), language="zh")
+
+    assert result["transcript"] == "给任总打电话。"
+    assert captured["timeout"] == 12
+    request = captured["request"]
+    assert request.full_url.endswith("/compatible-mode/v1/chat/completions")
+    assert request.get_header("Authorization") == "Bearer secret"
+    payload = json.loads(request.data)
+    assert payload["model"] == "qwen3-asr-flash"
+    assert payload["asr_options"] == {"enable_itn": True, "language": "zh"}
+    data_uri = payload["messages"][0]["content"][0]["input_audio"]["data"]
+    assert data_uri == "data:audio/wav;base64,UklGRnRlc3Q="
+
+
+def test_qwen_asr_rejects_non_aliyuncs_endpoint() -> None:
+    try:
+        qwen_asr.QwenASRClient(
+            api_key="secret",
+            base_url="https://example.com/compatible-mode/v1",
+        )
+    except ValueError as exc:
+        assert "aliyuncs.com" in str(exc)
+    else:
+        raise AssertionError("unsafe Qwen endpoint was accepted")
 
 
 def test_wechat_outbound_request_drops_history_and_injects_direct_execution() -> None:
@@ -134,7 +205,7 @@ def test_wechat_outbound_request_drops_history_and_injects_direct_execution() ->
     assert "热情、自然、口语化" in messages[1]["content"]
     assert "不得写沉默计时或系统挂机原因" in messages[1]["content"]
     assert "Prompt 控制在 1500 个汉字以内" in messages[1]["content"]
-    assert "只有 ok=true 且 queued_count>0" in messages[1]["content"]
+    assert "成功时只能显示“拨号中...”" in messages[1]["content"]
     assert "[Sent image attachment]" in messages[1]["content"]
     assert "通话结果由 AudioAgent 结果转发器" in messages[1]["content"]
     assert "以后请先给我看" not in str(messages)
@@ -169,6 +240,67 @@ def test_wechat_outbound_request_preserves_current_tool_loop() -> None:
     assert messages[-1]["content"] == "schema loaded"
 
 
+def test_text_pinyin_without_phone_routes_to_hermes_address_book() -> None:
+    address_book.clear_state()
+    result = middleware.guide_wechat_address_book_request(
+        request={
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "给 lijiakui 打电话，邀请他明天开会"},
+            ]
+        },
+        platform="weixin",
+        session_id="wx-address-pinyin",
+    )
+
+    assert result is not None
+    content = result["request"]["messages"][-1]["content"]
+    assert "audioagent_resolve_outbound_contact" in content
+    assert "全拼或简拼" in content
+    assert "严禁猜测" in content
+    assert address_book.resolution_context("wx-address-pinyin") == {
+        "query": "lijiakui",
+        "input_mode": "text",
+    }
+
+
+def test_voice_no_phone_always_marks_address_book_confirmation_mode() -> None:
+    address_book.clear_state()
+    result = middleware.guide_wechat_address_book_request(
+        request={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f'"给李家魁打电话"\n{address_book.VOICE_MARKER}',
+                }
+            ]
+        },
+        platform="weixin",
+        session_id="wx-address-voice",
+    )
+
+    assert result is not None
+    content = result["request"]["messages"][0]["content"]
+    assert address_book.VOICE_MARKER not in content
+    assert "微信语音" in content
+    assert address_book.resolution_context("wx-address-voice") == {
+        "query": "李家魁",
+        "input_mode": "voice",
+    }
+
+
+def test_weixin_voice_transport_is_tagged_before_central_stt() -> None:
+    event = SimpleNamespace(
+        source=SimpleNamespace(platform="weixin"),
+        message_type="voice",
+        text="",
+    )
+
+    result = address_book.mark_weixin_voice_input(event=event)
+
+    assert result == {"action": "rewrite", "text": address_book.VOICE_MARKER}
+
+
 def test_non_outbound_or_non_weixin_request_is_unchanged() -> None:
     request = {"messages": [{"role": "user", "content": "查询13800000000"}]}
 
@@ -190,6 +322,20 @@ def test_non_outbound_or_non_weixin_request_is_unchanged() -> None:
         )
         is None
     )
+
+
+def test_quoted_result_or_dialing_ack_never_launches_another_call() -> None:
+    quoted_result = (
+        "正在拨打李家魁 13070183606\n"
+        "**通话状态：** 已接通\n"
+        "**通话摘要：** 李家魁已确认参加。\n"
+        "[OutOfBand answer]\n为什么会这样？"
+    )
+
+    assert middleware.is_wechat_outbound_request(quoted_result) is False
+    assert middleware.is_wechat_outbound_request(
+        "拨号中... 13070183606，为什么没响应？"
+    ) is False
 
 
 def test_wechat_latest_call_transcript_request_loads_hermes_skill_and_tool() -> None:
@@ -327,6 +473,14 @@ def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
         "hermes_session_id": "hermes-session-1"
     }
 
+    # Even if the LLM fabricates a detailed answer, the Hermes hook replaces
+    # the whole response with the only tool-backed dialing state.
+    assert response_policy.transform_submission_response(
+        response_text="已接通，客户已经同意。 [OutOfBand answer]",
+        session_id="hermes-session-1",
+        platform="weixin",
+    ) == "拨号中..."
+
 
 def test_submit_reports_all_contacts_blocked_before_dialing(monkeypatch) -> None:
     client = SubmitClient(blocked=True)
@@ -341,7 +495,8 @@ def test_submit_reports_all_contacts_blocked_before_dialing(monkeypatch) -> None
                 "task_name": "跑步邀约",
                 "prompt": "确认对方是否方便跑步。",
                 "customers": [{"phone": "18001350929", "name": "常凤香"}],
-            }
+            },
+            task_id="hermes-session-blocked",
         )
     )
 
@@ -351,6 +506,161 @@ def test_submit_reports_all_contacts_blocked_before_dialing(monkeypatch) -> None
     assert result["blocked_count"] == 1
     assert result["error_code"] == "consent_missing_or_inactive"
     assert "电话未拨出" in result["error"]
+    failure = response_policy.transform_submission_response(
+        response_text="正在拨打，稍后同步结果",
+        session_id="hermes-session-blocked",
+        platform="weixin",
+    )
+    assert failure is not None
+    assert failure.startswith("电话未拨出：")
+    assert result["error"] in failure
+
+
+class AddressBookClient(SubmitClient):
+    def __init__(self, lookup: dict) -> None:
+        super().__init__()
+        self.lookup = lookup
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        if path == "/telephony/address-book/sync":
+            self.requests.append((method, path, payload))
+            return {"stored": 1, "skipped": 0}
+        if path.startswith("/telephony/address-book/lookup?"):
+            self.requests.append((method, path, payload))
+            return self.lookup
+        return super().request(method, path, payload)
+
+
+def _address_task_args(query: str) -> dict:
+    return {
+        "query": query,
+        "task_name": "会议邀请",
+        "invitation_content": "明天下午三点动捕会议",
+        "prompt": "邀请 {{customer_name}} 参加明天下午三点动捕会议。",
+    }
+
+
+def test_unique_exact_pinyin_text_match_dials_immediately(monkeypatch) -> None:
+    address_book.clear_state()
+    response_policy.clear_submission_responses()
+    client = AddressBookClient(
+        {
+            "match_type": "exact",
+            "candidates": [
+                {"full_name": "李家魁", "phone_number": "+8613070183606"}
+            ],
+        }
+    )
+    monkeypatch.setattr(tools, "AudioAgentClient", lambda: client)
+    monkeypatch.setenv("AUDIOAGENT_AGENT_NAME", "qwen-phone-agent")
+    monkeypatch.setenv("AUDIOAGENT_TRUNK_ID", "trunk-1")
+    address_book.mark_resolution_context(
+        "wx-exact-pinyin", query="lijiakui", input_mode="text"
+    )
+
+    result = json.loads(
+        tools.resolve_outbound_contact(
+            _address_task_args("模型不应改写这个值"),
+            task_id="turn-task-differs-from-session",
+            session_id="wx-exact-pinyin",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["queued_count"] == 1
+    lookup_path = next(path for _method, path, _payload in client.requests if "lookup" in path)
+    assert "query=lijiakui" in lookup_path
+    imported = next(
+        payload
+        for method, path, payload in client.requests
+        if method == "POST" and path == "/telephony/contacts/import"
+    )
+    assert imported["contacts"][0]["name"] == "李家魁"
+    assert imported["contacts"][0]["phone_number"] == "+8613070183606"
+    assert response_policy.transform_submission_response(
+        response_text="已经接通并同意了",
+        session_id="wx-exact-pinyin",
+        platform="weixin",
+    ) == "拨号中..."
+
+
+def test_fuzzy_text_match_requires_confirmation_before_dialing(monkeypatch) -> None:
+    address_book.clear_state()
+    response_policy.clear_submission_responses()
+    client = AddressBookClient(
+        {
+            "match_type": "fuzzy",
+            "candidates": [
+                {
+                    "full_name": "李家魁",
+                    "phone_number": "+8613070183606",
+                    "score": 0.875,
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(tools, "AudioAgentClient", lambda: client)
+    monkeypatch.setenv("AUDIOAGENT_AGENT_NAME", "qwen-phone-agent")
+    monkeypatch.setenv("AUDIOAGENT_TRUNK_ID", "trunk-1")
+    address_book.mark_resolution_context(
+        "wx-fuzzy-contact", query="李家奎", input_mode="text"
+    )
+
+    resolved = json.loads(
+        tools.resolve_outbound_contact(
+            _address_task_args("李家奎"), task_id="wx-fuzzy-contact"
+        )
+    )
+
+    assert resolved["requires_confirmation"] is True
+    assert not any(path == "/telephony/campaigns" for _method, path, _ in client.requests)
+    confirmation = response_policy.transform_submission_response(
+        response_text="我已经替你拨出了",
+        session_id="wx-fuzzy-contact",
+        platform="weixin",
+    )
+    assert confirmation is not None
+    assert confirmation.startswith("通讯录中找到相似联系人，请确认：")
+    assert "李家魁 13070183606" in confirmation
+
+    assert address_book.note_confirmation("wx-fuzzy-contact", "确认1") is True
+    confirmed = json.loads(
+        tools.confirm_address_book_contact({}, task_id="wx-fuzzy-contact")
+    )
+    assert confirmed["ok"] is True
+    assert confirmed["queued_count"] == 1
+    assert response_policy.transform_submission_response(
+        response_text="客户答应了",
+        session_id="wx-fuzzy-contact",
+        platform="weixin",
+    ) == "拨号中..."
+
+
+def test_exact_voice_match_still_requires_confirmation(monkeypatch) -> None:
+    address_book.clear_state()
+    response_policy.clear_submission_responses()
+    client = AddressBookClient(
+        {
+            "match_type": "exact",
+            "candidates": [
+                {"full_name": "李家魁", "phone_number": "+8613070183606"}
+            ],
+        }
+    )
+    monkeypatch.setattr(tools, "AudioAgentClient", lambda: client)
+    address_book.mark_resolution_context(
+        "wx-voice-exact", query="李家魁", input_mode="voice"
+    )
+
+    resolved = json.loads(
+        tools.resolve_outbound_contact(
+            _address_task_args("李家魁"), task_id="wx-voice-exact"
+        )
+    )
+
+    assert resolved["requires_confirmation"] is True
+    assert resolved["user_response"].startswith("语音识别结果可能有误，请确认联系人：")
+    assert not any(path == "/telephony/campaigns" for _method, path, _ in client.requests)
 
 
 class StatusClient:
@@ -532,7 +842,7 @@ def test_get_latest_call_transcript_returns_exact_weixin_text(monkeypatch) -> No
         {"role": "assistant", "text": "您好，我是李宝祥的智能助理。"},
         {"role": "user", "text": "你好，请讲。"},
     ]
-    assert "智能助理：您好，我是李宝祥的智能助理。" in result["formatted_text"]
+    assert "AI：您好，我是李宝祥的智能助理。" in result["formatted_text"]
     assert "客户：你好，请讲。" in result["formatted_text"]
     assert "missed-call" not in result["formatted_text"]
 
@@ -679,7 +989,9 @@ def test_result_forwarder_formats_hangup_without_saved_summary() -> None:
     assert "**邀请内容：** 下周产品续费沟通" in message
     assert "**发起人：** 李宝祥（智能助理代拨）" in message
     assert "**通话状态：** 已接通" in message
-    assert "**通话摘要：** 电话已接通，但未形成明确业务结论。" in message
+    assert "**通话记录：**" in message
+    assert "无（数据库中没有 AI 或客户的文字通话记录）。" in message
+    assert "通话摘要" not in message
     assert "MEDIA:" not in message
 
 
@@ -737,7 +1049,8 @@ def test_no_answer_result_has_clear_customer_facing_reason() -> None:
         {"campaign_name": "跑步邀约", "status": "completed", "results": [item]}
     )
     assert "**通话状态：** 未接通" in message
-    assert "客户未接听，电话未接通。" in message
+    assert "**通话记录：**" in message
+    assert "无（数据库中没有 AI 或客户的文字通话记录）。" in message
     assert "未形成业务摘要" not in message
 
 
@@ -752,6 +1065,10 @@ def test_result_markdown_matches_requested_business_format() -> None:
                     "customer": {"name": "常凤香"},
                     "answered_at": "2026-08-06T09:00:00Z",
                     "summary": "常姐已经同意今晚 8:30 去莲花河跑步。请准时到达。",
+                    "transcript": [
+                        {"role": "assistant", "text": "今晚八点半一起跑步，您方便吗？"},
+                        {"role": "user", "text": "可以。"},
+                    ],
                 }
             ],
         }
@@ -763,11 +1080,13 @@ def test_result_markdown_matches_requested_business_format() -> None:
         "**邀请内容：** 今晚 8:30 莲花河跑步\n"
         "**发起人：** 李宝祥（智能助理代拨）\n"
         "**通话状态：** 已接通\n"
-        "**通话摘要：** 常姐已经同意今晚 8:30 去莲花河跑步。"
+        "**通话记录：**\n"
+        "AI：今晚八点半一起跑步，您方便吗？\n"
+        "客户：可以。"
     )
 
 
-def test_result_markdown_removes_spoken_greeting_from_summary() -> None:
+def test_result_markdown_ignores_model_summary_and_preserves_exact_transcript() -> None:
     message = delivery.format_result_message(
         {
             "invitation_content": "周末带果果来北京玩",
@@ -782,17 +1101,21 @@ def test_result_markdown_removes_spoken_greeting_from_summary() -> None:
                         "宝祥想邀请您周末带果果来北京玩；"
                         "提示：太好啦！那我跟宝祥说一声。"
                     ),
+                    "transcript": [
+                        {"role": "assistant", "text": "李姐您好呀！宝祥想邀请您周末带果果来北京玩。"},
+                        {"role": "user", "text": "好啊。"},
+                        {"role": "assistant", "text": "太好啦！那我跟宝祥说一声。"},
+                    ],
                 }
             ],
         }
     )
 
-    assert (
-        "**通话摘要：** "
-        "李艳美已同意：宝祥想邀请您周末带果果来北京玩。"
-    ) in message
-    assert "李姐您好" not in message
-    assert "太好啦" not in message
+    assert "通话摘要" not in message
+    assert "李艳美已同意" not in message
+    assert "AI：李姐您好呀！宝祥想邀请您周末带果果来北京玩。" in message
+    assert "客户：好啊。" in message
+    assert "AI：太好啦！那我跟宝祥说一声。" in message
 
 
 def test_sip_decline_is_displayed_as_rejected() -> None:
@@ -811,7 +1134,8 @@ def test_sip_decline_is_displayed_as_rejected() -> None:
     )
 
     assert "**通话状态：** 拒接" in message
-    assert "**通话摘要：** 客户拒接，本次未能沟通。" in message
+    assert "**通话记录：**" in message
+    assert "通话摘要" not in message
 
 
 def test_sip_500_has_specific_carrier_summary() -> None:
@@ -830,7 +1154,8 @@ def test_sip_500_has_specific_carrier_summary() -> None:
     )
 
     assert "**通话状态：** 未接通" in message
-    assert "**通话摘要：** 运营商线路暂时异常，电话未接通。" in message
+    assert "**通话记录：**" in message
+    assert "通话摘要" not in message
 
 
 def test_result_card_uses_blocked_outcome_when_no_call_was_created() -> None:
@@ -850,7 +1175,30 @@ def test_result_card_uses_blocked_outcome_when_no_call_was_created() -> None:
     assert "电话未拨出" in result_card._summary(status["results"][0])
     message = delivery.format_result_message(status)
     assert "**通话状态：** 未接通" in message
-    assert "电话未拨出" in message
+    assert "**通话记录：**" in message
+    assert "通话摘要" not in message
+
+
+def test_result_transcript_is_not_truncated() -> None:
+    long_text = "完整原话" * 1000
+    message = delivery.format_result_message(
+        {
+            "invitation_content": "测试完整记录",
+            "results": [
+                {
+                    "status": "completed",
+                    "answered_at": "2026-08-07T04:00:00Z",
+                    "transcript": [
+                        {"role": "assistant", "text": long_text},
+                        {"role": "user", "text": "收到。"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert long_text in message
+    assert message.endswith("客户：收到。")
 
 
 def test_result_delivery_sends_markdown_text_without_media(monkeypatch) -> None:

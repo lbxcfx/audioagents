@@ -78,6 +78,12 @@ class TelephonyContactImport(BaseModel):
     contacts: list[TelephonyContactUpsert] = Field(min_length=1, max_length=1000)
 
 
+class TelephonyAddressBookUpsert(BaseModel):
+    full_name: str = Field(min_length=1, max_length=200)
+    phone_number: str = Field(min_length=8, max_length=16)
+    source: str = Field(default="automatic", max_length=80)
+
+
 class TelephonyCampaignCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     agent_name: str = Field(min_length=1, max_length=200)
@@ -399,6 +405,51 @@ def create_telephony_router(service: TelephonyService) -> APIRouter:
                 search=search,
                 status=status,
                 cursor=cursor,
+            )
+        except Exception as exc:
+            raise _telephony_error(exc) from exc
+
+    @router.post("/projects/{project_id}/telephony/address-book/sync")
+    def sync_address_book(
+        project_id: str,
+        user_id: str = Depends(require_user_id),
+    ) -> dict:
+        try:
+            return service.sync_address_book_from_contacts(
+                project_id=project_id,
+                user_id=user_id,
+            )
+        except Exception as exc:
+            raise _telephony_error(exc) from exc
+
+    @router.post("/projects/{project_id}/telephony/address-book")
+    def upsert_address_book(
+        project_id: str,
+        payload: TelephonyAddressBookUpsert,
+        user_id: str = Depends(require_user_id),
+    ) -> dict:
+        try:
+            return service.upsert_address_book(
+                project_id=project_id,
+                user_id=user_id,
+                **payload.model_dump(),
+            )
+        except Exception as exc:
+            raise _telephony_error(exc) from exc
+
+    @router.get("/projects/{project_id}/telephony/address-book/lookup")
+    def resolve_address_book(
+        project_id: str,
+        query: str = Query(min_length=1, max_length=200),
+        limit: int = Query(default=3, ge=1, le=10),
+        user_id: str = Depends(require_user_id),
+    ) -> dict:
+        try:
+            return service.resolve_address_book(
+                project_id=project_id,
+                user_id=user_id,
+                query=query,
+                limit=limit,
             )
         except Exception as exc:
             raise _telephony_error(exc) from exc

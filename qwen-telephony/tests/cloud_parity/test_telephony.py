@@ -1729,3 +1729,123 @@ def test_contact_listing_uses_stable_cursor_and_server_search(telephony_stack) -
     assert second["next_cursor"] is None
     assert not ({item["id"] for item in first["items"]} & {item["id"] for item in second["items"]})
     assert [item["external_id"] for item in found["items"]] == ["crm-2"]
+
+
+def test_address_book_generates_full_short_and_pinyin_keys(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+
+    stored = service.upsert_address_book(
+        project_id=project_id,
+        user_id="owner",
+        full_name="李家魁",
+        phone_number="+8613070183606",
+        source="wechat_text",
+    )
+
+    assert stored["stored"] is True
+    assert stored["entry"] == {
+        **stored["entry"],
+        "full_name": "李家魁",
+        "short_name": "家魁",
+        "full_pinyin": "lijiakui",
+        "short_pinyin": "jiakui",
+        "phone_number": "+8613070183606",
+    }
+    for query in ("李家魁", "家魁", "lijiakui", "JIAKUI"):
+        resolved = service.resolve_address_book(
+            project_id=project_id,
+            user_id="owner",
+            query=query,
+        )
+        assert resolved["match_type"] == "exact"
+        assert resolved["candidates"][0]["phone_number"] == "+8613070183606"
+
+
+def test_address_book_rejects_titles_and_returns_fuzzy_candidates(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+    for title in ("李总", "任总", "张先生", "晓旭老师"):
+        result = service.upsert_address_book(
+            project_id=project_id,
+            user_id="owner",
+            full_name=title,
+            phone_number="+8613800000000",
+        )
+        assert result == {"stored": False, "reason": "name_is_not_a_full_person_name"}
+
+    service.upsert_address_book(
+        project_id=project_id,
+        user_id="owner",
+        full_name="李家魁",
+        phone_number="+8613070183606",
+    )
+    fuzzy = service.resolve_address_book(
+        project_id=project_id,
+        user_id="owner",
+        query="李佳凯",
+    )
+    assert fuzzy["match_type"] == "fuzzy"
+    assert fuzzy["candidates"][0]["full_name"] == "李家魁"
+
+
+def test_address_book_exact_key_must_be_unique(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+    service.upsert_address_book(
+        project_id=project_id,
+        user_id="owner",
+        full_name="李家魁",
+        phone_number="+8613070183606",
+    )
+    service.upsert_address_book(
+        project_id=project_id,
+        user_id="owner",
+        full_name="王家魁",
+        phone_number="+8613800000001",
+    )
+
+    resolved = service.resolve_address_book(
+        project_id=project_id,
+        user_id="owner",
+        query="家魁",
+    )
+
+    assert resolved["match_type"] == "ambiguous"
+    assert {item["phone_number"] for item in resolved["candidates"]} == {
+        "+8613070183606",
+        "+8613800000001",
+    }
+
+
+def test_address_book_sync_uses_only_real_hermes_full_names(telephony_stack) -> None:
+    _, service, project_id = telephony_stack
+    for external_id, name, phone in (
+        ("hermes-old-1", "李魁", "+8613070183606"),
+        ("hermes-title-1", "李总", "+8618911129833"),
+        ("manual-test-1", "真实电话测试", "+8618332362029"),
+        ("hermes-new-1", "李家魁", "+8613070183606"),
+    ):
+        service.upsert_contact(
+            project_id=project_id,
+            user_id="owner",
+            external_id=external_id,
+            phone_number=phone,
+            name=name,
+        )
+
+    synced = service.sync_address_book_from_contacts(
+        project_id=project_id,
+        user_id="owner",
+    )
+
+    assert synced == {"stored": 2, "skipped": 1}
+    resolved = service.resolve_address_book(
+        project_id=project_id,
+        user_id="owner",
+        query="lijiakui",
+    )
+    assert resolved["match_type"] == "exact"
+    assert resolved["candidates"][0]["full_name"] == "李家魁"
+    assert service.resolve_address_book(
+        project_id=project_id,
+        user_id="owner",
+        query="李总",
+    )["match_type"] == "none"

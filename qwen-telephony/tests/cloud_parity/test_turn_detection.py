@@ -456,6 +456,116 @@ def test_saved_business_summary_strips_runtime_hangup_mechanics() -> None:
     assert summary == "任总已同意：李总想约您今晚六点半吃饭。"
 
 
+def test_identity_confirmation_is_not_a_business_result() -> None:
+    turns = [
+        ("assistant", "您好，我是李宝祥的智能助理，请问您是李家魁吗？"),
+        ("user", "是。"),
+    ]
+
+    assert phone_agent._evidence_based_call_result(
+        customer_name="李家魁",
+        turns=turns,
+    ) is None
+    assert phone_agent._fallback_business_summary(
+        customer_name="李家魁",
+        reason="通话结束",
+        turns=turns,
+    ) == "通话结束"
+
+
+def test_business_result_is_derived_from_transcript_not_model_claim() -> None:
+    result = phone_agent._evidence_based_call_result(
+        customer_name="李家魁",
+        turns=[
+            ("assistant", "您好，我是李宝祥的智能助理，请问您是李家魁吗？"),
+            ("user", "是。"),
+            ("assistant", "明天下午三点参加3D动捕会议，您方便吗？"),
+            ("user", "明天上午三点。"),
+        ],
+    )
+
+    assert result == "已完成与李家魁的电话沟通；对方最后回复：“明天上午三点”。"
+
+
+def test_save_call_result_rejects_unsupported_model_conclusion() -> None:
+    async def run() -> None:
+        agent = phone_agent.PhoneAgent(
+            managed_job={
+                "call_id": "call-1",
+                "customer_name": "李家魁",
+                "direction": "outbound",
+                "realtime_prompt": "邀请参加会议",
+            }
+        )
+        agent._conversation_turns = [
+            ("assistant", "您好，我是李宝祥的智能助理，请问您是李家魁吗？"),
+            ("user", "是。"),
+        ]
+        persisted: list[tuple[str, dict]] = []
+
+        async def persist(event_type: str, payload: dict) -> bool:
+            persisted.append((event_type, payload))
+            return True
+
+        agent._record_realtime_business_event = persist
+        result = await phone_agent.PhoneAgent.save_call_result.__wrapped__(
+            agent,
+            summary="李家魁已确认参加明天下午三点会议。",
+            intent_label="confirmed",
+        )
+
+        assert "尚无可验证的业务答复" in result
+        assert persisted == []
+        assert agent._business_result_saved is False
+
+        end_result = await phone_agent.PhoneAgent.end_call.__wrapped__(
+            agent,
+            SimpleNamespace(),
+            reason="客户已同意",
+        )
+        assert "不能结束通话" in end_result
+
+    asyncio.run(run())
+
+
+def test_save_call_result_persists_only_transcript_derived_text() -> None:
+    async def run() -> None:
+        agent = phone_agent.PhoneAgent(
+            managed_job={"call_id": "call-2", "customer_name": "李家魁"}
+        )
+        agent._conversation_turns = [
+            ("assistant", "请问您是李家魁吗？"),
+            ("user", "是。"),
+            ("assistant", "明天下午三点参加会议，您方便吗？"),
+            ("user", "不方便。"),
+        ]
+        persisted: list[tuple[str, dict]] = []
+
+        async def persist(event_type: str, payload: dict) -> bool:
+            persisted.append((event_type, payload))
+            return True
+
+        agent._record_realtime_business_event = persist
+        result = await phone_agent.PhoneAgent.save_call_result.__wrapped__(
+            agent,
+            summary="李家魁已确认参加。",
+            intent_label="confirmed",
+        )
+
+        assert result == "通话结果已保存。"
+        assert persisted == [
+            (
+                "call.result",
+                {
+                    "summary": "李家魁未同意：明天下午三点参加会议，您方便吗。",
+                    "intent_label": "",
+                },
+            )
+        ]
+
+    asyncio.run(run())
+
+
 def test_outbound_agent_hangup_is_default(monkeypatch) -> None:
     monkeypatch.delenv("QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY", raising=False)
     assert not phone_agent._customer_hangup_only({"direction": "outbound"})

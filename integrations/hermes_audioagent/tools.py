@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import wraps
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +17,7 @@ from urllib.parse import quote, urlsplit
 import uuid
 
 from .client import AudioAgentClient, AudioAgentError
+from . import address_book
 
 
 TERMINAL_CALL_STATUSES = {
@@ -33,6 +36,7 @@ _BLOCKED_REASON_SUMMARIES = {
     "daily_number_attempt_limit": "目标号码已达到当日呼叫次数上限，电话未拨出。",
     "outbound_paused": "外呼功能当前已暂停，电话未拨出。",
 }
+logger = logging.getLogger("hermes.plugins.audioagent.tools")
 
 
 def is_configured() -> bool:
@@ -44,18 +48,37 @@ def _json_result(payload: dict[str, Any]) -> str:
 
 
 def _handler(function):
+    @wraps(function)
     def wrapped(args: dict[str, Any], **kwargs: Any) -> str:
         try:
-            return _json_result(function(args or {}, **kwargs))
+            payload = function(args or {}, **kwargs)
         except (AudioAgentError, ValueError) as exc:
-            return _json_result({"ok": False, "error": str(exc)})
+            payload = {"ok": False, "error": str(exc)}
         except Exception as exc:  # Hermes handlers must never raise.
-            return _json_result(
-                {
-                    "ok": False,
-                    "error": f"unexpected {type(exc).__name__}: {exc}",
-                }
+            payload = {
+                "ok": False,
+                "error": f"unexpected {type(exc).__name__}: {exc}",
+            }
+        if function.__name__ == "submit_outbound_task":
+            # The final Weixin hook consumes this exact tool-derived fact, so
+            # an LLM cannot paraphrase or embellish submission state.
+            from .response_policy import remember_submission_response
+
+            remember_submission_response(
+                kwargs.get("session_id") or kwargs.get("task_id"), payload
             )
+        elif function.__name__ in {
+            "resolve_outbound_contact",
+            "confirm_address_book_contact",
+        }:
+            response = str(payload.get("user_response") or "").strip()
+            if response:
+                from .response_policy import remember_user_response
+
+                remember_user_response(
+                    kwargs.get("session_id") or kwargs.get("task_id"), response
+                )
+        return _json_result(payload)
 
     return wrapped
 
@@ -201,11 +224,11 @@ def _format_latest_transcript(
     lines.append("")
     if transcript:
         for item in transcript:
-            label = "客户" if item["role"] == "user" else "智能助理"
+            label = "客户" if item["role"] == "user" else "AI"
             lines.append(f"{label}：{item['text']}")
     else:
         lines.append("本通电话没有可用的客户或助理文字记录。")
-    return "\n".join(lines)[:12_000]
+    return "\n".join(lines)
 
 
 def _recording_cache_path(call_id: str, recording_url: str) -> Path:
@@ -391,12 +414,12 @@ def _timeline_result(
         elif event_type in {"user.transcript", "agent.response"}:
             text = str(payload.get("text") or "").strip()
             if event_type == "user.transcript" and text:
-                user_messages.append(text[:1000])
-            if include_transcript and text and len(transcript) < 100:
+                user_messages.append(text)
+            if include_transcript and text:
                 transcript.append(
                     {
                         "role": "user" if event_type == "user.transcript" else "assistant",
-                        "text": text[:2000],
+                        "text": text,
                     }
                 )
     if include_transcript:
@@ -541,7 +564,9 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     }
     if args.get("scene_id") not in {None, ""}:
         task_snapshot["scene_id"] = int(args["scene_id"])
-    hermes_session_id = str(kwargs.get("task_id") or "")[:200]
+    hermes_session_id = str(
+        kwargs.get("session_id") or kwargs.get("task_id") or ""
+    )[:200]
     campaign_payload: dict[str, Any] = {
         "name": _campaign_resource_name(task_name, identifier),
         "agent_name": agent_name,
@@ -599,6 +624,23 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         except Exception:
             pass
         raise
+
+    # Persist only valid real names. The server deterministically rejects
+    # honorifics such as “李总”, so address-book ingestion can never block a
+    # successfully submitted call.
+    for contact in contact_payloads:
+        try:
+            client.request(
+                "POST",
+                client.project_path("/telephony/address-book"),
+                {
+                    "full_name": contact["name"],
+                    "phone_number": contact["phone_number"],
+                    "source": "hermes_weixin",
+                },
+            )
+        except Exception as exc:
+            logger.warning("address-book auto-ingest failed: %s", exc)
     enqueue_result = (
         running.get("enqueue_result")
         if isinstance(running.get("enqueue_result"), dict)
@@ -639,6 +681,176 @@ def submit_outbound_task(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     return response
 
 
+def _hermes_session(args: dict[str, Any], kwargs: dict[str, Any]) -> str:
+    candidates = (
+        kwargs.get("session_id"),
+        kwargs.get("task_id"),
+        args.get("hermes_session_id"),
+        args.get("task_id"),
+    )
+    for candidate in candidates:
+        identifier = str(candidate or "").strip()[:200]
+        if identifier:
+            return identifier
+    return ""
+
+
+def _submission_args(args: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "task_name": _required_text(args, "task_name", 200),
+        "prompt": _required_text(args, "prompt", 24_000),
+    }
+    for key in (
+        "invitation_content",
+        "task_id",
+        "scene_id",
+        "max_concurrency",
+        "max_attempts",
+        "scheduled_at",
+        "agent_name",
+        "trunk_id",
+        "source_number",
+    ):
+        if args.get(key) not in {None, ""}:
+            result[key] = args[key]
+    return result
+
+
+def _display_phone(value: Any) -> str:
+    phone = str(value or "").strip()
+    return phone[3:] if phone.startswith("+86") and len(phone) == 14 else phone
+
+
+def _confirmation_text(
+    candidates: list[dict[str, Any]], *, input_mode: str
+) -> str:
+    if input_mode == "voice":
+        heading = "语音识别结果可能有误，请确认联系人："
+    else:
+        heading = "通讯录中找到相似联系人，请确认："
+    lines = [heading]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.append(
+            f"{index}. {candidate.get('full_name') or '未知姓名'} "
+            f"{_display_phone(candidate.get('phone_number'))}"
+        )
+    lines.append("请回复“确认1”后拨号；不正确请提供姓名和电话号码。")
+    return "\n".join(lines)
+
+
+def _submit_address_book_candidate(
+    submission: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    session_id: str,
+) -> dict[str, Any]:
+    phone = str(candidate.get("phone_number") or "").strip()
+    name = str(candidate.get("full_name") or "").strip()
+    if not phone or not name:
+        raise AudioAgentError("通讯录候选缺少姓名或电话号码，电话未拨出")
+    payload = {
+        **submission,
+        "customers": [{"name": name, "phone": phone}],
+    }
+    result = submit_outbound_task.__wrapped__(payload, task_id=session_id)
+    from .response_policy import remember_submission_response
+
+    remember_submission_response(session_id, result)
+    return result
+
+
+@_handler
+def resolve_outbound_contact(
+    args: dict[str, Any], **kwargs: Any
+) -> dict[str, Any]:
+    """Resolve a no-phone Hermes request and dial only deterministic exact text matches."""
+
+    session_id = _hermes_session(args, kwargs)
+    context = address_book.resolution_context(session_id) or {}
+    query = str(context.get("query") or args.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    input_mode = str(context.get("input_mode") or args.get("input_mode") or "text")
+    input_mode = "voice" if input_mode == "voice" else "text"
+    submission = _submission_args(args)
+    client = AudioAgentClient()
+    try:
+        client.request("POST", client.project_path("/telephony/address-book/sync"), {})
+    except Exception as exc:
+        logger.warning("address-book history sync failed: %s", exc)
+    lookup = client.request(
+        "GET",
+        client.project_path(
+            "/telephony/address-book/lookup"
+            f"?query={quote(query, safe='')}&limit=3"
+        ),
+    )
+    candidates = [
+        item for item in lookup.get("candidates") or [] if isinstance(item, dict)
+    ][:3]
+    match_type = str(lookup.get("match_type") or "none")
+
+    if match_type == "exact" and len(candidates) == 1 and input_mode == "text":
+        return _submit_address_book_candidate(
+            submission, candidates[0], session_id=session_id
+        )
+    if candidates:
+        if not session_id:
+            raise AudioAgentError("Hermes 会话标识缺失，无法安全确认联系人")
+        address_book.store_pending(
+            session_id,
+            {
+                "query": query,
+                "input_mode": input_mode,
+                "submission": submission,
+                "candidates": candidates,
+            },
+        )
+        return {
+            "ok": True,
+            "requires_confirmation": True,
+            "match_type": match_type,
+            "candidates": candidates,
+            "user_response": _confirmation_text(candidates, input_mode=input_mode),
+        }
+
+    return {
+        "ok": False,
+        "requires_phone": True,
+        "match_type": "none",
+        "candidates": [],
+        "user_response": f"通讯录中未找到“{query}”，请提供姓名和电话号码。",
+    }
+
+
+@_handler
+def confirm_address_book_contact(
+    args: dict[str, Any], **kwargs: Any
+) -> dict[str, Any]:
+    """Submit a previously resolved candidate after a deterministic user confirmation."""
+
+    session_id = _hermes_session(args, kwargs)
+    stored = address_book.pop_pending(session_id)
+    if stored is None:
+        return {
+            "ok": False,
+            "user_response": "没有等待确认的联系人，请重新发送拨号指令。",
+        }
+    choice = address_book.confirmation_choice(
+        session_id, fallback=int(args.get("choice") or 1)
+    )
+    candidates = stored.get("candidates") or []
+    if not 1 <= choice <= len(candidates):
+        address_book.store_pending(session_id, stored)
+        return {
+            "ok": False,
+            "user_response": f"请选择 1 到 {len(candidates)} 之间的联系人编号。",
+        }
+    return _submit_address_book_candidate(
+        stored["submission"], candidates[choice - 1], session_id=session_id
+    )
+
+
 @_handler
 def get_outbound_task(args: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
     campaign_id = _required_text(args, "campaign_id", 200)
@@ -667,15 +879,11 @@ def get_latest_call_transcript(
         client.project_path(f"/sessions/{quote(call_id, safe='')}"),
     )
     transcript: list[dict[str, str]] = []
-    summary = ""
     for event in timeline.get("events") or []:
         if not isinstance(event, dict):
             continue
         event_type = str(event.get("event_type") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        if event_type == "call.result":
-            summary = str(payload.get("summary") or "").strip()
-            continue
         if event_type not in {"user.transcript", "agent.response"}:
             continue
         text = str(payload.get("text") or "").strip()
@@ -684,11 +892,9 @@ def get_latest_call_transcript(
         transcript.append(
             {
                 "role": "user" if event_type == "user.transcript" else "assistant",
-                "text": text[:2000],
+                "text": text,
             }
         )
-        if len(transcript) >= 100:
-            break
     customer = _call_customer(call)
     return {
         "ok": True,
@@ -697,7 +903,6 @@ def get_latest_call_transcript(
         "customer": customer,
         "answered_at": call.get("answered_at"),
         "ended_at": call.get("ended_at"),
-        "summary": summary,
         "transcript": transcript,
         "formatted_text": _format_latest_transcript(call, transcript),
     }

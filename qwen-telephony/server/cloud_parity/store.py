@@ -860,6 +860,35 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
             ON console_commands(project_id, session_id, status, lease_expires_at, created_at);
         """,
     ),
+    (
+        20,
+        """
+        CREATE TABLE IF NOT EXISTS telephony_address_book (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            short_name TEXT NOT NULL DEFAULT '',
+            full_pinyin TEXT NOT NULL,
+            short_pinyin TEXT NOT NULL DEFAULT '',
+            phone_number TEXT NOT NULL,
+            phone_hash TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'automatic',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            UNIQUE(project_id, phone_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_address_book_full_name
+            ON telephony_address_book(project_id, full_name);
+        CREATE INDEX IF NOT EXISTS idx_address_book_short_name
+            ON telephony_address_book(project_id, short_name);
+        CREATE INDEX IF NOT EXISTS idx_address_book_full_pinyin
+            ON telephony_address_book(project_id, full_pinyin);
+        CREATE INDEX IF NOT EXISTS idx_address_book_short_pinyin
+            ON telephony_address_book(project_id, short_pinyin);
+        """,
+    ),
 )
 
 

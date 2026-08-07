@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, time as clock_time, timedelta, timezone
+from difflib import SequenceMatcher
 import hashlib
 import hmac
 import json
 import re
+import unicodedata
 from typing import Any, Iterable, Protocol
 import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pypinyin import Style, lazy_pinyin
 
 from .store import PlatformStore, ResourceNotFoundError, _row, _utc_now
 from .recording_access import presign_recording_uri, validate_recording_storage_uri
@@ -62,6 +66,22 @@ _E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,200}$")
 _SIP_URI_RE = re.compile(
     r"^sip:[A-Za-z0-9_.!~*'()%+\-]+@[A-Za-z0-9.-]+(?::[0-9]{1,5})?$"
+)
+_CHINESE_NAME_RE = re.compile(r"^[\u3400-\u9fff·]{2,20}$")
+_GENERIC_TITLE_RE = re.compile(
+    r"(?:总|老师|先生|女士|经理|主任|医生|大夫|老板|师傅|哥|姐)$"
+)
+_COMPOUND_SURNAMES = frozenset(
+    {
+        "欧阳", "太史", "端木", "上官", "司马", "东方", "独孤", "南宫",
+        "万俟", "闻人", "夏侯", "诸葛", "尉迟", "公羊", "赫连", "澹台",
+        "皇甫", "宗政", "濮阳", "公冶", "太叔", "申屠", "公孙", "慕容",
+        "仲孙", "钟离", "长孙", "宇文", "司徒", "鲜于", "司空", "闾丘",
+        "子车", "亓官", "司寇", "巫马", "公西", "颛孙", "壤驷", "公良",
+        "漆雕", "乐正", "宰父", "谷梁", "拓跋", "夹谷", "轩辕", "令狐",
+        "段干", "百里", "呼延", "东郭", "南门", "羊舌", "微生", "梁丘",
+        "左丘", "东门", "西门", "第五",
+    }
 )
 
 
@@ -119,6 +139,45 @@ def _validate_identifier(value: str, label: str) -> str:
     return normalized
 
 
+def _normalize_address_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return "".join(
+        character
+        for character in normalized
+        if character.isalnum() or "\u3400" <= character <= "\u9fff"
+    )
+
+
+def _address_book_keys(full_name: str) -> dict[str, str] | None:
+    """Return deterministic exact-lookup keys for a real Chinese name."""
+
+    normalized = _normalize_address_key(full_name)
+    if (
+        not _CHINESE_NAME_RE.fullmatch(normalized)
+        or _GENERIC_TITLE_RE.search(normalized)
+        or "测试" in normalized
+    ):
+        return None
+    surname_length = 2 if normalized[:2] in _COMPOUND_SURNAMES else 1
+    short_name = normalized[surname_length:] if len(normalized) - surname_length >= 2 else ""
+    full_pinyin = "".join(
+        lazy_pinyin(normalized, style=Style.NORMAL, errors="ignore")
+    ).lower()
+    short_pinyin = (
+        "".join(lazy_pinyin(short_name, style=Style.NORMAL, errors="ignore")).lower()
+        if short_name
+        else ""
+    )
+    if not full_pinyin:
+        return None
+    return {
+        "full_name": normalized,
+        "short_name": short_name,
+        "full_pinyin": full_pinyin,
+        "short_pinyin": short_pinyin,
+    }
+
+
 class TelephonyService:
     """Tenant-isolated, transactional call admission and dispatch control plane.
 
@@ -171,13 +230,14 @@ class TelephonyService:
     def protect_legacy_phone_data(self) -> dict[str, int]:
         """Encrypt pre-existing plaintext phone fields after enabling a master key."""
         if self._phone_cipher is None:
-            return {"call_jobs": 0, "contacts": 0, "campaigns": 0}
-        changed = {"call_jobs": 0, "contacts": 0, "campaigns": 0}
+            return {"call_jobs": 0, "contacts": 0, "campaigns": 0, "address_book": 0}
+        changed = {"call_jobs": 0, "contacts": 0, "campaigns": 0, "address_book": 0}
         with self.store.transaction() as conn:
             for table, id_column, fields, json_fields, result_key in (
                 ("call_jobs", "id", ("source_number", "destination_number"), ("metadata_json",), "call_jobs"),
                 ("telephony_contacts", "id", ("phone_number",), ("metadata_json",), "contacts"),
                 ("telephony_campaigns", "id", ("source_number",), ("metadata_json",), "campaigns"),
+                ("telephony_address_book", "id", ("phone_number",), (), "address_book"),
             ):
                 rows = conn.execute(
                     f"SELECT {id_column}, {', '.join((*fields, *json_fields))} FROM {table}"
@@ -704,6 +764,216 @@ class TelephonyService:
                 (project_id, max(1, min(limit, 500))),
             ).fetchall()
         return [self._compliance_record(row) for row in rows]
+
+    def _address_book_entry(self, row: Any) -> dict[str, Any]:
+        record = _row(row) or {}
+        record.pop("phone_hash", None)
+        record["phone_number"] = self._reveal_phone(record.get("phone_number"))
+        return record
+
+    def _upsert_address_book_row(
+        self,
+        conn: Any,
+        *,
+        project_id: str,
+        full_name: str,
+        phone_number: str,
+        source: str,
+        now: str,
+    ) -> dict[str, Any] | None:
+        keys = _address_book_keys(full_name)
+        if keys is None:
+            return None
+        phone = _validate_phone(phone_number)
+        phone_hash = self._phone_hash(phone)
+        existing = conn.execute(
+            """
+            SELECT id, created_at FROM telephony_address_book
+            WHERE project_id = ? AND phone_hash = ?
+            """,
+            (project_id, phone_hash),
+        ).fetchone()
+        entry_id = str(existing["id"]) if existing is not None else str(uuid.uuid4())
+        created_at = str(existing["created_at"]) if existing is not None else now
+        conn.execute(
+            """
+            INSERT INTO telephony_address_book (
+                id, project_id, full_name, short_name, full_pinyin, short_pinyin,
+                phone_number, phone_hash, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, phone_hash) DO UPDATE SET
+                full_name = excluded.full_name,
+                short_name = excluded.short_name,
+                full_pinyin = excluded.full_pinyin,
+                short_pinyin = excluded.short_pinyin,
+                phone_number = excluded.phone_number,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (
+                entry_id,
+                project_id,
+                keys["full_name"],
+                keys["short_name"],
+                keys["full_pinyin"],
+                keys["short_pinyin"],
+                self._protect_phone(phone),
+                phone_hash,
+                source[:80] or "automatic",
+                created_at,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM telephony_address_book WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return self._address_book_entry(row)
+
+    def upsert_address_book(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        full_name: str,
+        phone_number: str,
+        source: str = "automatic",
+    ) -> dict[str, Any]:
+        """Store one real name and its deterministic short/pinyin keys."""
+
+        self.store.require_permission(project_id, user_id, "telephony.operate")
+        now = _utc_now()
+        with self.store.transaction() as conn:
+            entry = self._upsert_address_book_row(
+                conn,
+                project_id=project_id,
+                full_name=full_name,
+                phone_number=phone_number,
+                source=source,
+                now=now,
+            )
+            if entry is None:
+                return {"stored": False, "reason": "name_is_not_a_full_person_name"}
+            self.store._append_audit(
+                conn,
+                project_id=project_id,
+                actor_id=user_id,
+                action="telephony.address_book.upsert",
+                resource_type="telephony_address_book",
+                resource_id=str(entry["id"]),
+                payload={"full_name": entry["full_name"], "phone_last4": phone_number[-4:]},
+            )
+            return {"stored": True, "entry": entry}
+
+    def sync_address_book_from_contacts(
+        self, *, project_id: str, user_id: str
+    ) -> dict[str, int]:
+        """Idempotently fold Hermes call contacts into the one-row-per-phone book."""
+
+        self.store.require_permission(project_id, user_id, "telephony.operate")
+        now = _utc_now()
+        stored = 0
+        skipped = 0
+        with self.store.transaction() as conn:
+            rows = conn.execute(
+                """
+                SELECT name, phone_number FROM telephony_contacts
+                WHERE project_id = ? AND external_id LIKE ?
+                ORDER BY updated_at, id
+                """,
+                (project_id, "hermes-%"),
+            ).fetchall()
+            for row in rows:
+                name = str(row["name"] or "").strip()
+                phone = self._reveal_phone(row["phone_number"])
+                entry = self._upsert_address_book_row(
+                    conn,
+                    project_id=project_id,
+                    full_name=name,
+                    phone_number=phone,
+                    source="call_history",
+                    now=now,
+                )
+                if entry is None:
+                    skipped += 1
+                else:
+                    stored += 1
+            self.store._append_audit(
+                conn,
+                project_id=project_id,
+                actor_id=user_id,
+                action="telephony.address_book.sync",
+                resource_type="telephony_address_book",
+                resource_id=project_id,
+                payload={"stored": stored, "skipped": skipped},
+            )
+        return {"stored": stored, "skipped": skipped}
+
+    def resolve_address_book(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        query: str,
+        limit: int = 3,
+    ) -> dict[str, Any]:
+        """Return unique exact matches or bounded fuzzy candidates."""
+
+        self.store.require_permission(project_id, user_id, "telephony.read")
+        normalized = _normalize_address_key(query)
+        if not normalized or _GENERIC_TITLE_RE.search(normalized):
+            return {"query": normalized, "match_type": "none", "candidates": []}
+        query_forms = {normalized}
+        if _CHINESE_NAME_RE.fullmatch(normalized):
+            query_forms.add(
+                "".join(lazy_pinyin(normalized, style=Style.NORMAL, errors="ignore")).lower()
+            )
+        with self.store.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM telephony_address_book
+                WHERE project_id = ? ORDER BY updated_at DESC, id DESC
+                """,
+                (project_id,),
+            ).fetchall()
+
+        exact: list[dict[str, Any]] = []
+        fuzzy: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            entry = self._address_book_entry(row)
+            keys = {
+                str(entry.get(field) or "").lower()
+                for field in ("full_name", "short_name", "full_pinyin", "short_pinyin")
+                if str(entry.get(field) or "").strip()
+            }
+            if query_forms & keys:
+                exact.append(entry)
+                continue
+            score = max(
+                (
+                    SequenceMatcher(None, form, key).ratio()
+                    for form in query_forms
+                    for key in keys
+                ),
+                default=0.0,
+            )
+            if score >= 0.65:
+                fuzzy.append((score, entry))
+
+        if exact:
+            return {
+                "query": normalized,
+                "match_type": "exact" if len(exact) == 1 else "ambiguous",
+                "candidates": exact[: max(1, min(limit, 10))],
+            }
+        fuzzy.sort(key=lambda item: (-item[0], str(item[1].get("full_name") or "")))
+        return {
+            "query": normalized,
+            "match_type": "fuzzy" if fuzzy else "none",
+            "candidates": [
+                {**entry, "score": round(score, 4)}
+                for score, entry in fuzzy[: max(1, min(limit, 10))]
+            ],
+        }
 
     def _contact(self, row: Any, *, redact_phone: bool = False) -> dict[str, Any]:
         record = _row(row) or {}

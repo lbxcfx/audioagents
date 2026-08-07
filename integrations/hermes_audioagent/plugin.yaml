@@ -1,12 +1,14 @@
 name: audioagent
-version: 0.7.1
-description: "Submit WeChat outbound calls and deliver recent call transcripts or recordings from AudioAgent."
+version: 0.10.0
+description: "Resolve WeChat contacts, submit outbound calls, transcribe voice with Qwen ASR, and deliver recent call artifacts."
 author: audioagents
 kind: standalone
 requires_env:
   - name: AUDIOAGENT_PROJECT_ID
     description: "AudioAgent Cloud-Parity project ID"
 provides_tools:
+  - audioagent_resolve_outbound_contact
+  - audioagent_confirm_address_book_contact
   - audioagent_submit_outbound_task
   - audioagent_get_outbound_task
   - audioagent_wait_outbound_task
