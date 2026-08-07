@@ -1,6 +1,6 @@
 name: audioagent
-version: 0.6.1
-description: "Submit WeChat outbound calling tasks directly to AudioAgent and return structured call results."
+version: 0.7.1
+description: "Submit WeChat outbound calls and deliver recent call transcripts or recordings from AudioAgent."
 author: audioagents
 kind: standalone
 requires_env:
@@ -11,3 +11,5 @@ provides_tools:
   - audioagent_get_outbound_task
   - audioagent_wait_outbound_task
   - audioagent_cancel_outbound_task
+  - audioagent_get_latest_call_transcript
+  - audioagent_get_latest_call_recording

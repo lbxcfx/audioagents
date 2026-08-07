@@ -129,3 +129,44 @@ CANCEL_OUTBOUND_TASK = {
         "required": ["campaign_id", "confirmed"],
     },
 }
+
+
+_LATEST_CALL_DIRECTION = {
+    "type": "string",
+    "enum": ["outbound", "inbound", "any"],
+    "default": "outbound",
+    "description": (
+        "Call direction to search. Default to outbound for WeChat-created calls; "
+        "use any only when the user explicitly asks for the latest call of either direction."
+    ),
+}
+
+
+GET_LATEST_CALL_TRANSCRIPT = {
+    "name": "audioagent_get_latest_call_transcript",
+    "description": (
+        "Fetch the exact assistant and customer text events from the most recent answered "
+        "AudioAgent call. Use when a WeChat user asks to send, show, export, or retrieve "
+        "the latest/last/recent call transcript, chat history, conversation text, or 转写."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"direction": _LATEST_CALL_DIRECTION},
+    },
+}
+
+
+GET_LATEST_CALL_RECORDING = {
+    "name": "audioagent_get_latest_call_recording",
+    "description": (
+        "Fetch the most recent answered AudioAgent call recording into Hermes' media cache "
+        "and return a MEDIA directive for native Weixin upload. Use when a WeChat user asks "
+        "to send, upload, export, or retrieve the latest/last/recent call audio or recording."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"direction": _LATEST_CALL_DIRECTION},
+    },
+}

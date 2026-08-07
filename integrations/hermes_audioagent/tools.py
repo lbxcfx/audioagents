@@ -5,10 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import uuid
 
 from .client import AudioAgentClient, AudioAgentError
@@ -144,6 +147,159 @@ def _campaign_calls(
         for item in result.get("items") or []
         if isinstance(item, dict) and str(item.get("campaign_id") or "") == campaign_id
     ]
+
+
+def _call_query_path(direction: str, *, limit: int = 100) -> str:
+    normalized = str(direction or "outbound").strip().lower()
+    if normalized not in {"outbound", "inbound", "any"}:
+        raise ValueError("direction must be outbound, inbound, or any")
+    suffix = "" if normalized == "any" else f"&direction={normalized}"
+    return f"/telephony/calls?limit={limit}{suffix}"
+
+
+def _latest_answered_call(
+    client: AudioAgentClient,
+    *,
+    direction: str,
+    require_recording: bool = False,
+) -> dict[str, Any]:
+    response = client.request("GET", client.project_path(_call_query_path(direction)))
+    calls = [item for item in response.get("items") or [] if isinstance(item, dict)]
+    for call in calls:
+        if not str(call.get("answered_at") or "").strip():
+            continue
+        if require_recording and (
+            str(call.get("recording_status") or "").strip().lower() != "completed"
+            or not str(call.get("recording_storage_uri") or "").strip()
+        ):
+            continue
+        return call
+    detail = " with a completed recording" if require_recording else ""
+    raise AudioAgentError(f"No recent answered call{detail} was found")
+
+
+def _call_customer(call: dict[str, Any]) -> dict[str, Any]:
+    metadata = call.get("metadata") if isinstance(call.get("metadata"), dict) else {}
+    customer = metadata.get("customer") if isinstance(metadata.get("customer"), dict) else {}
+    return {
+        "name": str(customer.get("name") or "").strip(),
+        "phone": str(call.get("destination_number") or "").strip(),
+    }
+
+
+def _format_latest_transcript(
+    call: dict[str, Any], transcript: list[dict[str, str]]
+) -> str:
+    customer = _call_customer(call)
+    lines = ["最近一通已接通电话的聊天记录"]
+    if customer["name"]:
+        lines.append(f"联系人：{customer['name']}")
+    if customer["phone"]:
+        lines.append(f"电话：{customer['phone']}")
+    if call.get("answered_at"):
+        lines.append(f"接通时间：{call['answered_at']}")
+    lines.append("")
+    if transcript:
+        for item in transcript:
+            label = "客户" if item["role"] == "user" else "智能助理"
+            lines.append(f"{label}：{item['text']}")
+    else:
+        lines.append("本通电话没有可用的客户或助理文字记录。")
+    return "\n".join(lines)[:12_000]
+
+
+def _recording_cache_path(call_id: str, recording_url: str) -> Path:
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    cache_dir = hermes_home / "cache" / "documents"
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", call_id).strip("-.")
+    if not safe_call_id:
+        raise ValueError("call ID is invalid")
+    suffix = Path(urlsplit(recording_url).path).suffix.lower()
+    if suffix not in {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac"}:
+        suffix = ".mp3"
+    return cache_dir / f"audioagent-call-{safe_call_id}{suffix}"
+
+
+def _normalize_mp3_for_delivery(source: Path, target: Path) -> int:
+    """Write a seekable CBR MP3 whose duration is reliable in chat clients."""
+
+    ffmpeg_name = os.getenv("AUDIOAGENT_FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+    ffmpeg = shutil.which(ffmpeg_name)
+    if not ffmpeg:
+        raise AudioAgentError(
+            f"recording delivery requires ffmpeg ({ffmpeg_name!r} was not found)"
+        )
+    timeout_seconds = min(
+        300,
+        max(
+            10,
+            int(
+                os.getenv(
+                    "AUDIOAGENT_RECORDING_NORMALIZE_TIMEOUT_SECONDS",
+                    "120",
+                )
+            ),
+        ),
+    )
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:a:0",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        "-ar",
+        "16000",
+        "-ac",
+        "2",
+        "-write_xing",
+        "1",
+        "-id3v2_version",
+        "3",
+        "-threads",
+        "1",
+        str(target),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AudioAgentError("recording MP3 normalization timed out") from exc
+    except OSError as exc:
+        raise AudioAgentError(
+            f"recording MP3 normalization failed to start: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or "unknown ffmpeg error").strip()[-1000:]
+        raise AudioAgentError(f"recording MP3 normalization failed: {detail}")
+    try:
+        size_bytes = target.stat().st_size
+    except OSError as exc:
+        raise AudioAgentError("recording MP3 normalization produced no file") from exc
+    if size_bytes <= 0:
+        raise AudioAgentError("recording MP3 normalization produced an empty file")
+    target.chmod(0o600)
+    return size_bytes
 
 
 def _campaign_contacts(
@@ -492,6 +648,135 @@ def get_outbound_task(args: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         include_results=args.get("include_results", True) is not False,
         include_transcript=args.get("include_transcript") is True,
     )
+
+
+@_handler
+def get_latest_call_transcript(
+    args: dict[str, Any], **_kwargs: Any
+) -> dict[str, Any]:
+    """Return the exact assistant/customer text from the latest answered call."""
+
+    client = AudioAgentClient()
+    direction = str(args.get("direction") or "outbound")
+    call = _latest_answered_call(client, direction=direction)
+    call_id = str(call.get("id") or "").strip()
+    if not call_id:
+        raise AudioAgentError("AudioAgent returned a call without an ID")
+    timeline = client.request(
+        "GET",
+        client.project_path(f"/sessions/{quote(call_id, safe='')}"),
+    )
+    transcript: list[dict[str, str]] = []
+    summary = ""
+    for event in timeline.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event_type") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event_type == "call.result":
+            summary = str(payload.get("summary") or "").strip()
+            continue
+        if event_type not in {"user.transcript", "agent.response"}:
+            continue
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            continue
+        transcript.append(
+            {
+                "role": "user" if event_type == "user.transcript" else "assistant",
+                "text": text[:2000],
+            }
+        )
+        if len(transcript) >= 100:
+            break
+    customer = _call_customer(call)
+    return {
+        "ok": True,
+        "call_id": call_id,
+        "direction": call.get("direction") or direction,
+        "customer": customer,
+        "answered_at": call.get("answered_at"),
+        "ended_at": call.get("ended_at"),
+        "summary": summary,
+        "transcript": transcript,
+        "formatted_text": _format_latest_transcript(call, transcript),
+    }
+
+
+@_handler
+def get_latest_call_recording(
+    args: dict[str, Any], **_kwargs: Any
+) -> dict[str, Any]:
+    """Cache the latest recording for Hermes MEDIA delivery to Weixin."""
+
+    client = AudioAgentClient()
+    direction = str(args.get("direction") or "outbound")
+    call = _latest_answered_call(
+        client,
+        direction=direction,
+        require_recording=True,
+    )
+    call_id = str(call.get("id") or "").strip()
+    if not call_id:
+        raise AudioAgentError("AudioAgent returned a call without an ID")
+    access = client.request(
+        "GET",
+        client.project_path(
+            f"/telephony/calls/{quote(call_id, safe='')}/recording-access?ttl_seconds=300"
+        ),
+    )
+    recording_url = str(access.get("url") or "").strip()
+    if not recording_url:
+        raise AudioAgentError("AudioAgent did not return a recording download URL")
+
+    target = _recording_cache_path(call_id, recording_url)
+    max_bytes = min(
+        512 * 1024 * 1024,
+        max(
+            1024 * 1024,
+            int(os.getenv("AUDIOAGENT_RECORDING_MAX_BYTES", str(64 * 1024 * 1024))),
+        ),
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    downloaded = target.with_name(
+        f".{target.stem}.{token}.download{target.suffix}"
+    )
+    normalized = target.with_name(f".{target.stem}.{token}.normalized.mp3")
+    try:
+        source_size_bytes = client.download_to_path(
+            recording_url,
+            downloaded,
+            max_bytes=max_bytes,
+        )
+        downloaded.chmod(0o600)
+        if target.suffix.lower() == ".mp3":
+            size_bytes = _normalize_mp3_for_delivery(downloaded, normalized)
+            normalized.replace(target)
+        else:
+            size_bytes = source_size_bytes
+            downloaded.replace(target)
+    finally:
+        for temporary in (downloaded, normalized):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    customer = _call_customer(call)
+    return {
+        "ok": True,
+        "call_id": call_id,
+        "direction": call.get("direction") or direction,
+        "customer": customer,
+        "answered_at": call.get("answered_at"),
+        "ended_at": call.get("ended_at"),
+        "source_size_bytes": source_size_bytes,
+        "size_bytes": size_bytes,
+        "media_path": str(target.resolve()),
+        "media_directive": f"MEDIA:{target.resolve()}",
+        "message": "录音已准备好；请在本轮最终回复中原样输出 media_directive。",
+    }
 
 
 @_handler

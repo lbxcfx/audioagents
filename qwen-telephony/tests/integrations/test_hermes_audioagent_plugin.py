@@ -85,12 +85,19 @@ def test_plugin_registers_tools_and_bundled_skill() -> None:
         "audioagent_get_outbound_task",
         "audioagent_wait_outbound_task",
         "audioagent_cancel_outbound_task",
+        "audioagent_get_latest_call_transcript",
+        "audioagent_get_latest_call_recording",
     }
-    assert context.skills[0][0] == "outbound-calling"
-    assert context.skills[0][1].is_file()
+    assert [item[0] for item in context.skills] == [
+        "outbound-calling",
+        "latest-call-transcript",
+        "latest-call-recording",
+    ]
+    assert all(item[1].is_file() for item in context.skills)
     assert context.hooks == []
     assert context.middleware == [
-        ("llm_request", middleware.isolate_wechat_outbound_request)
+        ("llm_request", middleware.isolate_wechat_outbound_request),
+        ("llm_request", middleware.guide_wechat_call_artifact_request),
     ]
 
 
@@ -183,6 +190,54 @@ def test_non_outbound_or_non_weixin_request_is_unchanged() -> None:
         )
         is None
     )
+
+
+def test_wechat_latest_call_transcript_request_loads_hermes_skill_and_tool() -> None:
+    result = middleware.guide_wechat_call_artifact_request(
+        request={
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "请把刚才的通话聊天记录发给我"},
+            ]
+        },
+        platform="weixin",
+    )
+
+    assert result is not None
+    content = result["request"]["messages"][-1]["content"]
+    assert "audioagent:latest-call-transcript" in content
+    assert "audioagent_get_latest_call_transcript" in content
+    assert "必须由 Hermes 的 audioagent 插件执行" in content
+    assert "audioagent_get_latest_call_recording" not in content
+
+
+def test_wechat_latest_call_recording_request_requires_media_delivery() -> None:
+    result = middleware.guide_wechat_call_artifact_request(
+        request={"messages": [{"role": "user", "content": "把最后一通电话录音发来"}]},
+        platform="weixin",
+    )
+
+    assert result is not None
+    content = result["request"]["messages"][0]["content"]
+    assert "audioagent:latest-call-recording" in content
+    assert "audioagent_get_latest_call_recording" in content
+    assert "media_directive 原样放在独立一行" in content
+
+
+def test_wechat_can_request_transcript_and_recording_together() -> None:
+    result = middleware.guide_wechat_call_artifact_request(
+        request={
+            "messages": [
+                {"role": "user", "content": "发送最近通话的聊天记录和录音"}
+            ]
+        },
+        platform="weixin",
+    )
+
+    assert result is not None
+    content = result["request"]["messages"][0]["content"]
+    assert "audioagent_get_latest_call_transcript" in content
+    assert "audioagent_get_latest_call_recording" in content
 
 
 def test_submit_schema_requires_no_confirmation() -> None:
@@ -398,6 +453,145 @@ def test_get_task_can_include_transcript(monkeypatch) -> None:
     assert result["results"][0]["transcript"] == [
         {"role": "user", "text": "下周续费。"}
     ]
+
+
+class LatestCallClient:
+    downloaded_urls: list[str] = []
+
+    def project_path(self, suffix: str) -> str:
+        return suffix
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        assert method == "GET"
+        if path == "/telephony/calls?limit=100&direction=outbound":
+            return {
+                "items": [
+                    {
+                        "id": "missed-call",
+                        "direction": "outbound",
+                        "status": "no_answer",
+                        "answered_at": None,
+                    },
+                    {
+                        "id": "call-latest",
+                        "direction": "outbound",
+                        "status": "completed",
+                        "destination_number": "+8613800000000",
+                        "answered_at": "2026-08-07T04:04:25Z",
+                        "ended_at": "2026-08-07T04:04:34Z",
+                        "recording_status": "completed",
+                        "recording_storage_uri": "s3://recordings/call-latest.mp3",
+                        "metadata": {"customer": {"name": "林经理"}},
+                    },
+                ]
+            }
+        if path == "/sessions/call-latest":
+            return {
+                "events": [
+                    {
+                        "event_type": "agent.response",
+                        "payload": {"text": "您好，我是李宝祥的智能助理。"},
+                    },
+                    {
+                        "event_type": "user.transcript",
+                        "payload": {"text": "你好，请讲。"},
+                    },
+                    {
+                        "event_type": "call.result",
+                        "payload": {"summary": "客户愿意继续沟通。"},
+                    },
+                ]
+            }
+        if path == (
+            "/telephony/calls/call-latest/recording-access?ttl_seconds=300"
+        ):
+            return {
+                "call_id": "call-latest",
+                "status": "completed",
+                "url": "http://127.0.0.1:9000/recordings/call-latest.mp3?signature=x",
+            }
+        raise AssertionError((method, path, payload))
+
+    def download_to_path(
+        self, url: str, target: Path, *, max_bytes: int
+    ) -> int:
+        assert max_bytes >= 1024 * 1024
+        self.downloaded_urls.append(url)
+        target.write_bytes(b"ID3test-recording")
+        return target.stat().st_size
+
+
+def test_get_latest_call_transcript_returns_exact_weixin_text(monkeypatch) -> None:
+    monkeypatch.setattr(tools, "AudioAgentClient", LatestCallClient)
+
+    result = json.loads(tools.get_latest_call_transcript({}))
+
+    assert result["ok"] is True
+    assert result["call_id"] == "call-latest"
+    assert result["transcript"] == [
+        {"role": "assistant", "text": "您好，我是李宝祥的智能助理。"},
+        {"role": "user", "text": "你好，请讲。"},
+    ]
+    assert "智能助理：您好，我是李宝祥的智能助理。" in result["formatted_text"]
+    assert "客户：你好，请讲。" in result["formatted_text"]
+    assert "missed-call" not in result["formatted_text"]
+
+
+def test_get_latest_call_recording_prepares_hermes_media_attachment(
+    monkeypatch, tmp_path
+) -> None:
+    LatestCallClient.downloaded_urls = []
+    monkeypatch.setattr(tools, "AudioAgentClient", LatestCallClient)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+    def normalize(source: Path, target: Path) -> int:
+        assert source.read_bytes() == b"ID3test-recording"
+        target.write_bytes(b"ID3normalized-recording")
+        return target.stat().st_size
+
+    monkeypatch.setattr(tools, "_normalize_mp3_for_delivery", normalize)
+
+    result = json.loads(tools.get_latest_call_recording({}))
+
+    assert result["ok"] is True
+    assert result["call_id"] == "call-latest"
+    assert result["media_directive"].startswith("MEDIA:")
+    media_path = Path(result["media_path"])
+    assert media_path.is_file()
+    assert media_path.read_bytes() == b"ID3normalized-recording"
+    assert result["source_size_bytes"] == len(b"ID3test-recording")
+    assert result["size_bytes"] == len(b"ID3normalized-recording")
+    assert media_path.parent == tmp_path / "hermes" / "cache" / "documents"
+    assert "signature=x" not in json.dumps(result)
+    assert LatestCallClient.downloaded_urls == [
+        "http://127.0.0.1:9000/recordings/call-latest.mp3?signature=x"
+    ]
+
+
+def test_mp3_normalization_uses_fixed_bitrate_and_xing_header(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "source.mp3"
+    target = tmp_path / "target.mp3"
+    source.write_bytes(b"malformed-short-mp3")
+    observed: list[str] = []
+
+    def run(command, **options):
+        observed.extend(command)
+        assert options["timeout"] == 120
+        target.write_bytes(b"normalized-mp3")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(tools.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(tools.subprocess, "run", run)
+
+    assert tools._normalize_mp3_for_delivery(source, target) == len(
+        b"normalized-mp3"
+    )
+    assert "libmp3lame" in observed
+    assert observed[observed.index("-b:a") + 1] == "64k"
+    assert observed[observed.index("-write_xing") + 1] == "1"
+    assert observed[observed.index("-ar") + 1] == "16000"
 
 
 class BlockedStatusClient:

@@ -4,6 +4,14 @@ This standalone Hermes plugin turns a WeChat task directly into an AudioAgent
 campaign. One immutable prompt snapshot is shared by the task's
 customers; customer variables remain isolated per call.
 
+It also registers two Hermes-only retrieval skills:
+
+- `audioagent:latest-call-transcript` sends the exact assistant/customer text
+  from the latest answered call.
+- `audioagent:latest-call-recording` downloads the latest completed recording
+  through the control plane and lets the Weixin adapter upload it as an audio
+  attachment.
+
 ## Install
 
 Link or copy this directory to `~/.hermes/plugins/audioagent`, then enable the
@@ -21,6 +29,25 @@ AUDIOAGENT_SOURCE_NUMBER=<e164-source-number>
 
 Use `AUDIOAGENT_BEARER_TOKEN` outside development. `AUDIOAGENT_USER_ID` is only
 for the AudioAgent development authentication mode.
+
+Optional recording-delivery limits:
+
+```bash
+AUDIOAGENT_RECORDING_MAX_BYTES=67108864
+AUDIOAGENT_RECORDING_DOWNLOAD_TIMEOUT_SECONDS=60
+AUDIOAGENT_RECORDING_NORMALIZE_TIMEOUT_SECONDS=120
+# Optional explicit executable name/path; defaults to ffmpeg on PATH.
+AUDIOAGENT_FFMPEG_BIN=ffmpeg
+```
+
+Weixin requests such as `发一下最近通话聊天记录`, `把刚才的通话录音发给我`,
+or a request for both are routed to the plugin tools by Hermes middleware. The
+plugin never asks Codex or a shell agent to query the database. AudioAgent's
+authenticated project APIs remain the source of truth, and recording files are
+normalized to a seekable 16 kHz/64 kbps MP3 before being cached under
+`HERMES_HOME/cache/documents` for Hermes `MEDIA:` delivery. This prevents
+Weixin and other chat clients from estimating a short VBR recording as a much
+longer file when the source MP3 has no reliable Xing duration header.
 
 For Weixin, set `WEIXIN_DM_POLICY=allowlist`, populate `WEIXIN_ALLOWED_USERS`,
 and disable unrelated high-privilege tools on the `hermes-weixin` surface.
