@@ -180,7 +180,7 @@ def test_realtime_model_uses_dashscope_beta_compatibility() -> None:
     model = QwenAudioRealtimeModel(api_key="test-key")
     try:
         assert model.provider == "dashscope-qwen-audio-realtime"
-        assert model.model == "qwen-audio-3.0-realtime-flash"
+        assert model.model == "qwen-audio-3.0-realtime-plus"
         assert model._opts.is_azure is True
         assert model._opts.entra_token == "test-key"
         assert model._opts.api_key is None

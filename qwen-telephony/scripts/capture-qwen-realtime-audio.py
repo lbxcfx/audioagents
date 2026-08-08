@@ -29,7 +29,7 @@ async def capture(output: Path, text: str) -> dict[str, object]:
         "QWEN_AUDIO_REALTIME_URL",
         "wss://llm-vfnjvqxp5829jfc6.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
     )
-    model = os.getenv("QWEN_AUDIO_REALTIME_MODEL", "qwen-audio-3.0-realtime-flash")
+    model = os.getenv("QWEN_AUDIO_REALTIME_MODEL", "qwen-audio-3.0-realtime-plus")
     voice = os.getenv("QWEN_AUDIO_REALTIME_VOICE", "longanqian")
     separator = "&" if "?" in endpoint else "?"
     url = f"{endpoint}{separator}model={model}"

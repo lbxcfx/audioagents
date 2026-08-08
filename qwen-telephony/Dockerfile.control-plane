@@ -2,7 +2,9 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    FORWARDED_ALLOW_IPS=127.0.0.1
+    FORWARDED_ALLOW_IPS=127.0.0.1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com
 
 WORKDIR /app/qwen-telephony
 

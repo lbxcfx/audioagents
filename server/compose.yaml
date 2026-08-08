@@ -1,0 +1,362 @@
+name: ${COMPOSE_PROJECT_NAME:-audioagents-server}
+
+x-audioagent-build: &audioagent-build
+  context: ..
+
+x-audioagent-environment: &audioagent-environment
+  LIVEKIT_URL: ws://livekit:7880
+  LIVEKIT_HTTP_URL: http://livekit:7880
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in server/.env}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in server/.env}
+  CLOUD_PARITY_ENV: development
+  CLOUD_PARITY_AUTH_MODE: development
+  CLOUD_PARITY_ENABLE_LEGACY_SQLITE: "false"
+  CLOUD_PARITY_DATABASE_URL: postgresql://${POSTGRES_USER:-audioagents}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in server/.env}@postgres:5432/${POSTGRES_DB:-audioagents}
+  CLOUD_PARITY_MASTER_KEY: ${CLOUD_PARITY_MASTER_KEY:?Set CLOUD_PARITY_MASTER_KEY in server/.env}
+  CLOUD_PARITY_DISPATCH_METADATA_KEY: ${CLOUD_PARITY_DISPATCH_METADATA_KEY:?Set CLOUD_PARITY_DISPATCH_METADATA_KEY in server/.env}
+  CLOUD_PARITY_PHONE_HASH_KEY: ${CLOUD_PARITY_PHONE_HASH_KEY:?Set CLOUD_PARITY_PHONE_HASH_KEY in server/.env}
+  CLOUD_PARITY_METRICS_TOKEN: ${CLOUD_PARITY_METRICS_TOKEN:?Set CLOUD_PARITY_METRICS_TOKEN in server/.env}
+  CLOUD_PARITY_SERVICE_USER_ID: ${AUDIOAGENT_WORKER_USER_ID:-telephony-worker}
+  CLOUD_PARITY_CONTROL_URL: http://control-plane:8091
+
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-audioagents}
+      POSTGRES_USER: ${POSTGRES_USER:-audioagents}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in server/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-audioagents} -d ${POSTGRES_DB:-audioagents}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: *default-logging
+
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    command:
+      - --bind=0.0.0.0
+      - --node-ip=${PUBLIC_IP:?Set PUBLIC_IP in server/.env}
+      - "--keys=${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in server/.env}: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in server/.env}"
+      - --redis-host=redis:6379
+    ports:
+      - "${LIVEKIT_HTTP_BIND_IP:-127.0.0.1}:${LIVEKIT_HTTP_PORT:-7880}:7880"
+      - "${LIVEKIT_TCP_PORT:-7881}:7881/tcp"
+      - "${LIVEKIT_RTC_PORT:-7882}:7882/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+  livekit-sip:
+    image: livekit/sip:v1.8.0
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in server/.env}"
+        api_secret: "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in server/.env}"
+        ws_url: "ws://livekit:7880"
+        redis:
+          address: "redis:6379"
+        sip_port: ${SIP_PORT:-5065}
+        sip_port_listen: ${SIP_PORT:-5065}
+        sip_hostname: "${PUBLIC_IP:?Set PUBLIC_IP in server/.env}"
+        rtp_port: ${SIP_RTP_PORT_RANGE:-10000-10100}
+        use_external_ip: true
+        nat_1_to_1_ip: "${PUBLIC_IP:?Set PUBLIC_IP in server/.env}"
+        media_nat_1_to_1_ip: "${PUBLIC_IP:?Set PUBLIC_IP in server/.env}"
+        symmetric_rtp: true
+        ignore_local_addr_in_sdp: true
+        logging:
+          level: info
+    ports:
+      - "${SIP_PORT:-5065}:${SIP_PORT:-5065}/udp"
+      - "${SIP_PORT:-5065}:${SIP_PORT:-5065}/tcp"
+      - "${SIP_RTP_PORT_RANGE:-10000-10100}:${SIP_RTP_PORT_RANGE:-10000-10100}/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-audioagents}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in server/.env}
+    ports:
+      - "${MINIO_BIND_IP:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_BIND_IP:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: *default-logging
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-audioagents}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in server/.env}
+      RECORDING_BUCKET: ${RECORDING_BUCKET:-audioagents-recordings}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${RECORDING_BUCKET}"
+        mc anonymous set none "local/$${RECORDING_BUCKET}"
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+
+  livekit-egress:
+    image: livekit/egress:v1.12.0
+    environment:
+      LIVEKIT_PREFER_SOFTWARE: "true"
+      EGRESS_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in server/.env}"
+        api_secret: "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in server/.env}"
+        ws_url: "ws://livekit:7880"
+        insecure: true
+        redis:
+          address: "redis:6379"
+        health_port: 8080
+        backup_storage: /out
+        logging:
+          level: info
+    volumes:
+      - egress-backup:/out
+    shm_size: 2gb
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+
+  control-plane:
+    build:
+      <<: *audioagent-build
+      dockerfile: qwen-telephony/Dockerfile.control-plane
+    image: ${AUDIOAGENT_IMAGE_PREFIX:-audioagents}/control-plane:${AUDIOAGENT_IMAGE_TAG:-local}
+    environment:
+      <<: *audioagent-environment
+      CLOUD_PARITY_BUILD_DRIVER: disabled
+      CLOUD_PARITY_RUNTIME_DRIVER: control-plane
+      CLOUD_PARITY_API_REQUESTS_PER_MINUTE: ${CONTROL_API_REQUESTS_PER_MINUTE:-6000}
+      FORWARDED_ALLOW_IPS: 127.0.0.1
+      QWEN_RECORDING_S3_ENDPOINT: http://minio:9000
+      QWEN_RECORDING_S3_PUBLIC_ENDPOINT: ${RECORDING_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      QWEN_RECORDING_S3_BUCKET: ${RECORDING_BUCKET:-audioagents-recordings}
+      QWEN_RECORDING_S3_REGION: ${RECORDING_REGION:-us-east-1}
+      QWEN_RECORDING_S3_FORCE_PATH_STYLE: "true"
+      QWEN_RECORDING_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-audioagents}
+      QWEN_RECORDING_S3_SECRET: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in server/.env}
+    ports:
+      - "${CONTROL_BIND_IP:-127.0.0.1}:${CONTROL_PORT:-8091}:8091"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/api/platform/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    logging: *default-logging
+
+  bootstrap:
+    image: python:3.12-alpine
+    environment:
+      CONTROL_URL: http://control-plane:8091
+      AUDIOAGENT_ADMIN_USER_ID: ${AUDIOAGENT_ADMIN_USER_ID:-audioagent-admin}
+      AUDIOAGENT_WORKER_USER_ID: ${AUDIOAGENT_WORKER_USER_ID:-telephony-worker}
+      AUDIOAGENT_PROJECT_NAME: ${AUDIOAGENT_PROJECT_NAME:-WeChat AudioAgent}
+      AUDIOAGENT_PROJECT_SLUG: ${AUDIOAGENT_PROJECT_SLUG:-wechat-audioagent}
+      AUDIOAGENT_TRUNK_NAME: ${AUDIOAGENT_TRUNK_NAME:-primary-outbound}
+      AUDIOAGENT_TRUNK_PROVIDER: ${AUDIOAGENT_TRUNK_PROVIDER:-external-sip}
+      LIVEKIT_SIP_TRUNK_ID: ${LIVEKIT_SIP_TRUNK_ID:?Set LIVEKIT_SIP_TRUNK_ID in server/.env}
+      AUDIOAGENT_SOURCE_NUMBER: ${AUDIOAGENT_SOURCE_NUMBER:-}
+      AUDIOAGENT_AGENT_NAME: ${AUDIOAGENT_AGENT_NAME:-commercial-agent}
+      AUDIOAGENT_MAX_CONCURRENT_CALLS: ${AUDIOAGENT_MAX_CONCURRENT_CALLS:-8}
+      AUDIOAGENT_MAX_CALLS_PER_SECOND: ${AUDIOAGENT_MAX_CALLS_PER_SECOND:-2}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?Set DEEPSEEK_API_KEY in server/.env}
+      HERMES_MODEL: ${HERMES_MODEL:-deepseek-v4-pro}
+      HERMES_MODEL_BASE_URL: ${HERMES_MODEL_BASE_URL:-https://api.deepseek.com/v1}
+      WEIXIN_DM_POLICY: ${WEIXIN_DM_POLICY:-open}
+      WEIXIN_ALLOWED_USERS: ${WEIXIN_ALLOWED_USERS:-}
+    volumes:
+      - ./scripts/bootstrap.py:/bootstrap/bootstrap.py:ro
+      - runtime-data:/runtime
+      - hermes-data:/hermes
+    command: ["python", "/bootstrap/bootstrap.py"]
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+
+  dispatcher:
+    build:
+      <<: *audioagent-build
+      dockerfile: qwen-telephony/Dockerfile.dispatcher
+    image: ${AUDIOAGENT_IMAGE_PREFIX:-audioagents}/dispatcher:${AUDIOAGENT_IMAGE_TAG:-local}
+    environment:
+      <<: *audioagent-environment
+      CLOUD_PARITY_TELEPHONY_WORKER_ID: ${AUDIOAGENT_DISPATCHER_ID:-dispatcher-1}
+      CLOUD_PARITY_TELEPHONY_CLAIM_BATCH: ${AUDIOAGENT_CLAIM_BATCH:-10}
+      CLOUD_PARITY_TELEPHONY_PROJECT_CONCURRENCY: ${AUDIOAGENT_MAX_CONCURRENT_CALLS:-8}
+      CLOUD_PARITY_TELEPHONY_POLL_SECONDS: ${AUDIOAGENT_POLL_SECONDS:-1}
+      CLOUD_PARITY_TELEPHONY_HEALTH_HOST: 0.0.0.0
+      CLOUD_PARITY_TELEPHONY_HEALTH_PORT: 9091
+      CLOUD_PARITY_TELEPHONY_RECONCILIATION_GRACE_SECONDS: ${AUDIOAGENT_RECONCILIATION_GRACE_SECONDS:-120}
+    volumes:
+      - runtime-data:/runtime:ro
+    command:
+      - /bin/sh
+      - -ec
+      - set -a; . /runtime/audioagent.env; set +a; exec python scripts/telephony-dispatcher.py
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  voice-agent:
+    build:
+      <<: *audioagent-build
+      dockerfile: qwen-telephony/Dockerfile.agent
+      args:
+        DOWNLOAD_LIVEKIT_MODELS: ${DOWNLOAD_LIVEKIT_MODELS:-false}
+        HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    image: ${AUDIOAGENT_IMAGE_PREFIX:-audioagents}/voice-agent:${AUDIOAGENT_IMAGE_TAG:-local}
+    environment:
+      <<: *audioagent-environment
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:?Set DASHSCOPE_API_KEY in server/.env}
+      LIVEKIT_AGENT_NAME: ${AUDIOAGENT_AGENT_NAME:-commercial-agent}
+      QWEN_AGENT_EXPLICIT_NAME: ${AUDIOAGENT_AGENT_NAME:-commercial-agent}
+      QWEN_AGENT_PORT: 18081
+      QWEN_VOICE_PIPELINE: ${QWEN_VOICE_PIPELINE:-realtime}
+      QWEN_LLM_BASE_URL: ${QWEN_LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_LLM_MODEL: ${QWEN_LLM_MODEL:-qwen3.7-flash}
+      QWEN_LLM_WARMUP: "true"
+      QWEN_AUDIO_REALTIME_MODEL: ${QWEN_AUDIO_REALTIME_MODEL:-qwen-audio-3.0-realtime-plus}
+      QWEN_AUDIO_REALTIME_VOICE: ${QWEN_AUDIO_REALTIME_VOICE:-longanqian}
+      QWEN_AUDIO_REALTIME_TURN_DETECTION: server_vad
+      QWEN_AUDIO_REALTIME_VAD_THRESHOLD: ${QWEN_AUDIO_REALTIME_VAD_THRESHOLD:-0.65}
+      QWEN_AUDIO_REALTIME_PREFIX_PADDING_MS: ${QWEN_AUDIO_REALTIME_PREFIX_PADDING_MS:-200}
+      QWEN_AUDIO_REALTIME_SILENCE_DURATION_MS: ${QWEN_AUDIO_REALTIME_SILENCE_DURATION_MS:-650}
+      QWEN_AUDIO_REALTIME_PLAYOUT_TAIL_MS: ${QWEN_AUDIO_REALTIME_PLAYOUT_TAIL_MS:-400}
+      QWEN_CUSTOMER_RESPONSE_TIMEOUT_SECONDS: ${QWEN_CUSTOMER_RESPONSE_TIMEOUT_SECONDS:-5}
+      QWEN_REALTIME_WECHAT_CLOSE_TIMEOUT_SECONDS: ${QWEN_REALTIME_WECHAT_CLOSE_TIMEOUT_SECONDS:-5}
+      QWEN_OUTBOUND_CUSTOMER_HANGUP_ONLY: "false"
+      QWEN_AMD_ENABLED: ${QWEN_AMD_ENABLED:-true}
+      QWEN_AMD_IVR_DETECTION: ${QWEN_AMD_IVR_DETECTION:-true}
+      QWEN_AMD_WAIT_UNTIL_FINISHED: ${QWEN_AMD_WAIT_UNTIL_FINISHED:-true}
+      QWEN_RECORDING_S3_ENDPOINT: http://minio:9000
+      QWEN_RECORDING_S3_BUCKET: ${RECORDING_BUCKET:-audioagents-recordings}
+      QWEN_RECORDING_S3_REGION: ${RECORDING_REGION:-us-east-1}
+      QWEN_RECORDING_S3_PREFIX: telephony-recordings
+      QWEN_RECORDING_S3_FORCE_PATH_STYLE: "true"
+      QWEN_RECORDING_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-audioagents}
+      QWEN_RECORDING_S3_SECRET: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in server/.env}
+      QWEN_SIP_DIAL_PREFIX: ${QWEN_SIP_DIAL_PREFIX:-}
+      QWEN_SIP_STRIP_COUNTRY_CODE: ${QWEN_SIP_STRIP_COUNTRY_CODE:-false}
+      QWEN_SIP_REGISTER_ENABLED: ${QWEN_SIP_REGISTER_ENABLED:-false}
+      QWEN_SIP_REGISTER_HOST: ${QWEN_SIP_REGISTER_HOST:-}
+      QWEN_SIP_REGISTER_PORT: ${QWEN_SIP_REGISTER_PORT:-5060}
+      QWEN_SIP_REGISTER_USERNAME: ${QWEN_SIP_REGISTER_USERNAME:-}
+      QWEN_SIP_REGISTER_AUTH_USERNAME: ${QWEN_SIP_REGISTER_AUTH_USERNAME:-}
+      QWEN_SIP_REGISTER_PASSWORD: ${QWEN_SIP_REGISTER_PASSWORD:-}
+      QWEN_SIP_REGISTER_DOMAIN: ${QWEN_SIP_REGISTER_DOMAIN:-}
+      QWEN_SIP_REGISTER_CONTACT_HOST: ${QWEN_SIP_REGISTER_CONTACT_HOST:-}
+      QWEN_SIP_REGISTER_CONTACT_PORT: ${QWEN_SIP_REGISTER_CONTACT_PORT:-5065}
+      QWEN_SIP_REGISTER_EXPIRES: ${QWEN_SIP_REGISTER_EXPIRES:-300}
+      QWEN_SIP_MEDIA_TIMEOUT_SECONDS: ${QWEN_SIP_MEDIA_TIMEOUT_SECONDS:-5}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      livekit:
+        condition: service_started
+      livekit-egress:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  hermes:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent@sha256:63003835a35b18ba5fc8fa978e1b3f8a0b7fed3625e845da08cf4a3831000c60}
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?Set DEEPSEEK_API_KEY in server/.env}
+      AUDIOAGENT_BASE_URL: http://control-plane:8091
+      AUDIOAGENT_AGENT_NAME: ${AUDIOAGENT_AGENT_NAME:-commercial-agent}
+      AUDIOAGENT_SOURCE_NUMBER: ${AUDIOAGENT_SOURCE_NUMBER:-}
+      AUDIOAGENT_USER_ID: ${AUDIOAGENT_ADMIN_USER_ID:-audioagent-admin}
+      AUDIOAGENT_RESULT_FORWARDING: "true"
+      AUDIOAGENT_RESULT_TARGET: weixin
+      AUDIOAGENT_RESULT_POLL_SECONDS: ${AUDIOAGENT_RESULT_POLL_SECONDS:-2}
+      WEIXIN_DM_POLICY: ${WEIXIN_DM_POLICY:-open}
+      WEIXIN_ALLOWED_USERS: ${WEIXIN_ALLOWED_USERS:-}
+      WEIXIN_GROUP_POLICY: disabled
+    command: ["gateway", "run"]
+    volumes:
+      - hermes-data:/opt/data
+      - ../integrations/hermes_audioagent:/opt/data/plugins/audioagent:ro
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  egress-backup:
+  runtime-data:
+  hermes-data:

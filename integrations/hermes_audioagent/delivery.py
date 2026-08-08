@@ -8,8 +8,6 @@ import logging
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import threading
 import time
 from typing import Any
@@ -213,29 +211,28 @@ def format_result_message(status: dict[str, Any]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+def _send_via_hermes(args: dict[str, str]) -> Any:
+    from tools.send_message_tool import send_message_tool
+
+    return send_message_tool(args)
+
+
 def _send_message(message: str) -> bool:
-    hermes = shutil.which("hermes") or "/usr/local/bin/hermes"
     target = os.getenv("AUDIOAGENT_RESULT_TARGET", "weixin").strip() or "weixin"
-    child_environment = os.environ.copy()
-    # `hermes send` loads enabled plugins. Without this override its child
-    # process starts another result forwarder and recursively sends the same
-    # campaign before the parent can persist success.
-    child_environment["AUDIOAGENT_RESULT_FORWARDING"] = "false"
-    child_environment["AUDIOAGENT_RESULT_FORWARDER_CHILD"] = "1"
     try:
-        completed = subprocess.run(
-            [hermes, "send", "--quiet", "--to", target, message],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=child_environment,
+        # The forwarder already runs inside Hermes Gateway. Calling its
+        # messaging tool in-process reuses the loaded config and Weixin
+        # adapter instead of starting a CLI process that rediscovers every
+        # plugin before each result notification.
+        raw_result = _send_via_hermes(
+            {"action": "send", "target": target, "message": message}
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+    except Exception as exc:
         logger.warning("AudioAgent result delivery failed: %s", type(exc).__name__)
         return False
-    if completed.returncode != 0:
-        logger.warning("AudioAgent result delivery returned exit code %s", completed.returncode)
+    if not isinstance(result, dict) or result.get("error") or result.get("success") is False:
+        logger.warning("AudioAgent result delivery returned an error")
         return False
     return True
 
@@ -296,7 +293,7 @@ def _scan_once(delivered: set[str]) -> bool:
 def _forwarder_loop() -> None:
     interval = min(
         60.0,
-        max(2.0, float(os.getenv("AUDIOAGENT_RESULT_POLL_SECONDS", "3"))),
+        max(2.0, float(os.getenv("AUDIOAGENT_RESULT_POLL_SECONDS", "2"))),
     )
     delivered = _load_delivered()
     while True:

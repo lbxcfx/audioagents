@@ -87,37 +87,54 @@ does not show a preview, ask follow-up questions about missing business facts,
 or require a confirmation boolean. Cancellation remains separately confirmed.
 Every submitted prompt is prefixed with the invariant caller identity
 `我是李宝祥的智能助理。`; unknown facts are omitted rather than invented.
-An LLM request middleware recognizes WeChat messages containing both a phone
-number and an outbound-call intent. It removes prior conversation turns from
-that DeepSeek request and injects the direct-execution rules, while preserving
-the current turn's tool calls and results. Result cards, prior dialing
-acknowledgements, and quoted out-of-band markers are explicitly excluded so a
-question about an earlier call cannot launch a duplicate campaign.
+The same invariant policy forbids repeating or paraphrasing any sentence that
+has already been spoken. Once the customer gives a clear business answer or
+says goodbye, the generated prompt requires an immediate result save and call
+end without another business confirmation turn.
+An LLM request middleware recognizes WeChat outbound-call commands and replaces
+the normal Hermes context with a dedicated short system prompt plus only the
+current user message. It exposes only Hermes' `tool_call` bridge, narrowed to
+exactly one AudioAgent target, and explicitly instructs DeepSeek to call it, so DeepSeek
+generates the immutable call prompt and tool arguments in one request without
+`tool_describe`, prior chat turns, the general Hermes system prompt, or unrelated
+tools. After the tool returns, an execution middleware emits the stored
+tool-backed acknowledgement without making another DeepSeek request. If that
+tool fails before producing a verified acknowledgement, the middleware returns
+a fixed failure message instead of leaking internal tool syntax. Result
+cards, prior dialing acknowledgements, and quoted out-of-band markers are
+explicitly excluded so a question about an earlier call cannot launch a
+duplicate campaign.
 
 When a text command omits the phone number, Hermes calls
 `audioagent_resolve_outbound_contact`. A unique exact match on any of the four
 keys, including full or short pinyin, is submitted immediately. Fuzzy or
-ambiguous results are never dialed until the user confirms a numbered
-candidate. Every match produced from a Weixin voice command also requires
+ambiguous results are never dialed until the user selects a candidate by
+number, ordinal, name, or phone suffix. Candidate selection runs in an isolated
+task context containing only the original dialing command, the address-book
+candidate response, and the current selection; general Weixin history is not
+loaded. Every match produced from a Weixin voice command also requires
 confirmation because ASR can preserve pronunciation while choosing the wrong
 characters. If nothing sufficiently similar exists, the deterministic reply
 asks for a name and phone number. The model never receives authority to invent
 or infer a number; `audioagent_confirm_address_book_contact` loads the stored
 candidate and pending task directly from Hermes plugin state.
 
-The submit tool records a response keyed by the current Hermes session. A
-`transform_llm_output` hook then replaces the model's entire Weixin response
-with `拨号中...` only when the control plane actually queued at least one call.
-Failures are likewise rendered from the submit tool's error. The LLM therefore
-cannot add a recipient, call status, conclusion, attachment, or prompt marker
-to a dialing acknowledgement. Keep Hermes final-only streaming enabled for
-Weixin (`streaming.enabled: false`), as in the supplied runtime configuration.
+The submit tool records a response keyed by the current Hermes session. The
+post-tool LLM call is skipped, and a `transform_llm_output` hook consumes the
+stored fact as a final guard. It returns `拨号中...` only when the control plane
+actually queued at least one call; failures are rendered from the submit tool's
+error. The LLM therefore cannot add a recipient, call status, conclusion,
+attachment, or prompt marker to a dialing acknowledgement. Keep Hermes
+final-only streaming enabled for Weixin (`streaming.enabled: false`), as in the
+supplied runtime configuration.
 
 Set `AUDIOAGENT_RESULT_FORWARDING=true` to run the plugin's terminal-campaign
 watcher inside the Hermes Gateway. It sends each completed Hermes campaign to
 `AUDIOAGENT_RESULT_TARGET` (default `weixin`) and persists successfully delivered
 campaign IDs under `HERMES_HOME` to deduplicate notifications across normal
-gateway restarts. Only after a campaign reaches a terminal state, Weixin
+gateway restarts. Delivery uses Hermes' already-loaded messaging tool in-process
+instead of spawning a new CLI process and rediscovering plugins. Only after a
+campaign reaches a terminal state, Weixin
 receives Markdown with the recipient, phone number, invitation, initiator,
 call status, and every `agent.response` / `user.transcript` event in database
 order under `通话记录`. Model-written `call.result.summary` values are never used

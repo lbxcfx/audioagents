@@ -1,5 +1,5 @@
 name: audioagent
-version: 0.10.0
+version: 0.11.4
 description: "Resolve WeChat contacts, submit outbound calls, transcribe voice with Qwen ASR, and deliver recent call artifacts."
 author: audioagents
 kind: standalone

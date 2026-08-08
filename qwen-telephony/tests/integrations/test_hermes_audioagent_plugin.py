@@ -118,6 +118,7 @@ def test_plugin_registers_tools_and_bundled_skill(monkeypatch) -> None:
         ("llm_request", middleware.guide_wechat_address_book_request),
         ("llm_request", middleware.isolate_wechat_outbound_request),
         ("llm_request", middleware.guide_wechat_call_artifact_request),
+        ("llm_execution", middleware.return_tool_backed_wechat_response),
     ]
 
 
@@ -194,21 +195,23 @@ def test_wechat_outbound_request_drops_history_and_injects_direct_execution() ->
     assert result is not None
     messages = result["request"]["messages"]
     assert len(messages) == 2
-    assert messages[0] == {"role": "system", "content": "Hermes system"}
+    assert messages[0]["role"] == "system"
+    assert "只处理下面这一条用户消息" in messages[0]["content"]
+    assert "Hermes system" not in str(messages)
     assert "给任总打电话" in messages[1]["content"]
-    assert "不得参考或延续任何历史对话" in messages[1]["content"]
-    assert "不预览、不要求确认" in messages[1]["content"]
-    assert "请问您是{{customer_name}}吗" in messages[1]["content"]
-    assert "customers 中每位客户的 name" in messages[1]["content"]
-    assert "不得固定写某个人名" in messages[1]["content"]
-    assert "必须填写 invitation_content" in messages[1]["content"]
-    assert "热情、自然、口语化" in messages[1]["content"]
-    assert "不得写沉默计时或系统挂机原因" in messages[1]["content"]
-    assert "Prompt 控制在 1500 个汉字以内" in messages[1]["content"]
-    assert "成功时只能显示“拨号中...”" in messages[1]["content"]
-    assert "[Sent image attachment]" in messages[1]["content"]
-    assert "通话结果由 AudioAgent 结果转发器" in messages[1]["content"]
     assert "以后请先给我看" not in str(messages)
+    tool = result["request"]["tools"][0]["function"]
+    assert tool["name"] == "tool_call"
+    assert tool["parameters"]["properties"]["name"]["pattern"] == (
+        "^audioagent_submit_outbound_task$"
+    )
+    assert "enum" not in tool["parameters"]["properties"]["name"]
+    assert tool["parameters"]["properties"]["arguments"] == (
+        schemas.SUBMIT_OUTBOUND_TASK["parameters"]
+    )
+    assert "tool_choice" not in result["request"]
+    assert "parallel_tool_calls" not in result["request"]
+    assert result["request"]["max_tokens"] == 1800
     assert request["messages"][3]["content"].endswith("是否吃饭。")
 
 
@@ -238,6 +241,8 @@ def test_wechat_outbound_request_preserves_current_tool_loop() -> None:
         "tool",
     ]
     assert messages[-1]["content"] == "schema loaded"
+    assert result["request"]["tools"] == []
+    assert "tool_choice" not in result["request"]
 
 
 def test_text_pinyin_without_phone_routes_to_hermes_address_book() -> None:
@@ -254,13 +259,20 @@ def test_text_pinyin_without_phone_routes_to_hermes_address_book() -> None:
     )
 
     assert result is not None
-    content = result["request"]["messages"][-1]["content"]
-    assert "audioagent_resolve_outbound_contact" in content
-    assert "全拼或简拼" in content
-    assert "严禁猜测" in content
+    messages = result["request"]["messages"]
+    assert len(messages) == 2
+    assert "通讯录外呼任务生成器" in messages[0]["content"]
+    assert "任何一句最多说一次" in messages[0]["content"]
+    tool = result["request"]["tools"][0]["function"]
+    assert tool["name"] == "tool_call"
+    assert tool["parameters"]["properties"]["name"]["pattern"] == (
+        "^audioagent_resolve_outbound_contact$"
+    )
+    assert "tool_choice" not in result["request"]
     assert address_book.resolution_context("wx-address-pinyin") == {
         "query": "lijiakui",
         "input_mode": "text",
+        "request_text": "给 lijiakui 打电话，邀请他明天开会",
     }
 
 
@@ -280,12 +292,19 @@ def test_voice_no_phone_always_marks_address_book_confirmation_mode() -> None:
     )
 
     assert result is not None
-    content = result["request"]["messages"][0]["content"]
-    assert address_book.VOICE_MARKER not in content
-    assert "微信语音" in content
+    messages = result["request"]["messages"]
+    assert address_book.VOICE_MARKER not in str(messages)
+    assert "通讯录外呼任务生成器" in messages[0]["content"]
+    tool = result["request"]["tools"][0]["function"]
+    assert tool["name"] == "tool_call"
+    assert tool["parameters"]["properties"]["name"]["pattern"] == (
+        "^audioagent_resolve_outbound_contact$"
+    )
+    assert "tool_choice" not in result["request"]
     assert address_book.resolution_context("wx-address-voice") == {
         "query": "李家魁",
         "input_mode": "voice",
+        "request_text": '"给李家魁打电话"',
     }
 
 
@@ -299,6 +318,194 @@ def test_weixin_voice_transport_is_tagged_before_central_stt() -> None:
     result = address_book.mark_weixin_voice_input(event=event)
 
     assert result == {"action": "rewrite", "text": address_book.VOICE_MARKER}
+
+
+def test_address_book_confirmation_uses_isolated_single_tool() -> None:
+    address_book.clear_state()
+    address_book.store_pending("wx-confirm", {"candidates": [{"full_name": "李家魁"}]})
+
+    result = middleware.guide_wechat_address_book_request(
+        request={
+            "messages": [
+                {"role": "system", "content": "large hermes system prompt"},
+                {"role": "user", "content": "旧消息"},
+                {"role": "assistant", "content": "旧回复"},
+                {"role": "user", "content": "确认1"},
+            ]
+        },
+        platform="weixin",
+        session_id="wx-confirm",
+    )
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert len(messages) == 2
+    assert "large hermes system prompt" not in str(messages)
+    assert messages[-1]["content"] == "确认1"
+    tool = result["request"]["tools"][0]["function"]
+    assert tool["name"] == "tool_call"
+    assert tool["parameters"]["properties"]["name"]["pattern"] == (
+        "^audioagent_confirm_address_book_contact$"
+    )
+    assert "tool_choice" not in result["request"]
+
+
+def test_address_book_selection_loads_only_current_dialing_context() -> None:
+    address_book.clear_state()
+    address_book.store_pending(
+        "wx-scoped-confirm",
+        {
+            "request_text": "给常凤香打电话，问一下周末有什么安排？",
+            "user_response": (
+                "通讯录中找到相似联系人，请确认：\n"
+                "1. 常梦香 18001350929\n"
+                "2. 常凤玲 13980045107"
+            ),
+            "candidates": [
+                {"full_name": "常梦香", "phone_number": "+8618001350929"},
+                {"full_name": "常凤玲", "phone_number": "+8613980045107"},
+            ],
+        },
+    )
+    result = middleware.guide_wechat_address_book_request(
+        request={
+            "messages": [
+                {"role": "system", "content": "large hermes system prompt"},
+                {"role": "user", "content": "很早以前的消息"},
+                {"role": "assistant", "content": "很早以前的回复"},
+                {"role": "user", "content": "第二个"},
+            ]
+        },
+        platform="weixin",
+        session_id="wx-scoped-confirm",
+    )
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert messages[1]["content"] == "给常凤香打电话，问一下周末有什么安排？"
+    assert "常梦香" in messages[2]["content"]
+    assert messages[3]["content"] == "第二个"
+    assert "很早以前" not in str(messages)
+    assert "large hermes system prompt" not in str(messages)
+    assert result["request"]["tools"][0]["function"]["name"] == "tool_call"
+    assert address_book.confirmation_choice("wx-scoped-confirm") == 2
+
+
+def test_address_book_selection_accepts_ordinal_name_and_phone() -> None:
+    address_book.clear_state()
+    candidates = [
+        {"full_name": "常梦香", "short_name": "梦香", "phone_number": "+8618001350929"},
+        {"full_name": "常凤玲", "short_name": "凤玲", "phone_number": "+8613980045107"},
+        {"full_name": "张洪强", "short_name": "洪强", "phone_number": "+8613406780567"},
+    ]
+    for text, expected in (
+        ("第一个", 1),
+        ("第二个", 2),
+        ("选3", 3),
+        ("常凤玲", 2),
+        ("尾号0567的", 3),
+    ):
+        address_book.store_pending("wx-selection-forms", {"candidates": candidates})
+        assert address_book.note_confirmation("wx-selection-forms", text) is True
+        assert address_book.confirmation_choice("wx-selection-forms") == expected
+
+
+def test_any_pending_contact_followup_never_loads_general_history() -> None:
+    address_book.clear_state()
+    address_book.store_pending(
+        "wx-natural-selection",
+        {
+            "request_text": "给李家魁打电话",
+            "user_response": "1. 李家魁 13070183606\n2. 李家奎 13800000000",
+            "candidates": [
+                {"full_name": "李家魁", "phone_number": "+8613070183606"},
+                {"full_name": "李家奎", "phone_number": "+8613800000000"},
+            ],
+        },
+    )
+    result = middleware.guide_wechat_address_book_request(
+        request={
+            "messages": [
+                {"role": "system", "content": "general system with 77000 tokens"},
+                {"role": "user", "content": "unrelated old history"},
+                {"role": "assistant", "content": "unrelated old answer"},
+                {"role": "user", "content": "麻烦选择我刚才说的那位"},
+            ]
+        },
+        platform="weixin",
+        session_id="wx-natural-selection",
+    )
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert len(messages) == 4
+    assert messages[-1]["content"] == "麻烦选择我刚才说的那位"
+    assert "77000" not in str(messages)
+    assert "unrelated old" not in str(messages)
+
+
+def test_tool_backed_wechat_response_skips_second_llm_call() -> None:
+    response_policy.clear_submission_responses()
+    response_policy.remember_user_response("wx-fast-path", "拨号中...")
+
+    def unexpected_provider_call(_request):
+        raise AssertionError("the post-tool DeepSeek call must be skipped")
+
+    result = middleware.return_tool_backed_wechat_response(
+        request={
+            "messages": [
+                {"role": "user", "content": "给李总打电话13800000000"},
+                {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "content": '{"ok":true,"queued_count":1}'},
+            ]
+        },
+        next_call=unexpected_provider_call,
+        platform="weixin",
+        session_id="wx-fast-path",
+        model="deepseek-v4-pro",
+    )
+
+    assert result.choices[0].message.content == "拨号中..."
+    assert result.choices[0].finish_reason == "stop"
+    # The normal output hook still owns consumption of the deterministic fact.
+    assert response_policy.transform_submission_response(
+        response_text="ignored",
+        session_id="wx-fast-path",
+        platform="weixin",
+    ) == "拨号中..."
+
+
+def test_failed_fast_path_tool_does_not_leak_internal_tool_syntax() -> None:
+    response_policy.clear_submission_responses()
+
+    def unexpected_provider_call(_request):
+        raise AssertionError("a failed fast-path tool must not reach DeepSeek again")
+
+    result = middleware.return_tool_backed_wechat_response(
+        request={
+            "messages": [
+                {
+                    "role": "system",
+                    "content": middleware._ADDRESS_BOOK_TASK_SYSTEM_PROMPT,
+                },
+                {"role": "user", "content": "给常凤香打电话"},
+                {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "content": "tool execution failed"},
+            ]
+        },
+        next_call=unexpected_provider_call,
+        platform="weixin",
+        session_id="wx-failed-fast-path",
+        model="deepseek-v4-pro",
+    )
+
+    assert result.choices[0].message.content == "电话未拨出：外呼工具执行失败。"
 
 
 def test_non_outbound_or_non_weixin_request_is_unchanged() -> None:
@@ -404,6 +611,8 @@ def test_prompt_preparation_fixes_identity_without_missing_fact_check() -> None:
     assert "XXX" not in task_prompt
     assert task_prompt.startswith("我是李宝祥的智能助理")
     assert "餐厅如知道请补充，根据实际情况沟通" in prompt
+    assert "严禁原样重复、换词复述或循环播放" in prompt
+    assert "客户明确答复或说“再见”后" in prompt
 
 
 def test_submit_creates_campaign_with_immutable_prompt_and_customer_metadata(
@@ -1204,22 +1413,20 @@ def test_result_transcript_is_not_truncated() -> None:
 def test_result_delivery_sends_markdown_text_without_media(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(command, **kwargs):
-        captured["command"] = command
-        captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, "", "")
+    def fake_send(args):
+        captured["args"] = args
+        return json.dumps({"success": True})
 
-    monkeypatch.setattr(delivery.shutil, "which", lambda _name: "/usr/bin/hermes")
-    monkeypatch.setattr(delivery.subprocess, "run", fake_run)
+    monkeypatch.setattr(delivery, "_send_via_hermes", fake_send)
 
     markdown = "**收信人：** 常凤香"
     assert delivery._send_message(markdown) is True
-    command = captured["command"]
-    assert command[-1] == markdown
-    assert not command[-1].startswith("MEDIA:")
-    assert command[command.index("--to") + 1] == "weixin"
-    assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDING"] == "false"
-    assert captured["kwargs"]["env"]["AUDIOAGENT_RESULT_FORWARDER_CHILD"] == "1"
+    assert captured["args"] == {
+        "action": "send",
+        "target": "weixin",
+        "message": markdown,
+    }
+    assert not markdown.startswith("MEDIA:")
 
 
 def test_result_delivery_claim_is_persistent_and_at_most_once(monkeypatch, tmp_path) -> None:

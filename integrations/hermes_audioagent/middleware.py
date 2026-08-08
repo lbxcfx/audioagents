@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 import re
+import time
+from types import SimpleNamespace
 from typing import Any
 
-from . import address_book
+from . import address_book, response_policy, schemas
+
+
+logger = logging.getLogger("hermes.plugins.audioagent.middleware")
 
 
 _PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1\d{10}(?!\d)")
@@ -27,21 +33,21 @@ _RECORDING_ARTIFACT_PATTERN = re.compile(
     r"(?:通话|电话).{0,6}(?:录音|音频)|(?:录音|音频).{0,6}(?:通话|电话)|"
     r"(?:发送|发出|发来|上传|导出|给我).{0,8}(?:录音|音频)"
 )
-_DIRECT_EXECUTION_DIRECTIVE = """[本轮外呼执行规则（最高优先级）]
-这是一个独立的微信外呼任务，不得参考或延续任何历史对话、历史偏好、历史 Prompt 或历史确认流程。
-仅使用本条微信消息中的号码和业务信息生成 Prompt；缺失信息直接省略，不追问、不预览、不要求确认。
-身份固定为“我是李宝祥的智能助理”。
-Prompt 必须规定第一句为“您好，我是李宝祥的智能助理，请问您是{{customer_name}}吗？”，客户回应后再说事情。
-下发工具时，customers 中每位客户的 name 必须填写本条微信提供的真实称呼（如“李总”）；不得固定写某个人名，也不得把星号或占位符作为 name。
-下发工具时必须填写 invitation_content，用一句简洁短语概括事项、时间和地点（如“今晚 8:30 莲花河跑步”），不要包含收信人或发起人姓名。
-全程使用热情、自然、口语化的真人助理口吻，适当使用“好的呀、明白了、没问题”等语气词，避免冷漠机械。
-客户明确答复后，Prompt 必须要求立即调用 save_call_result 保存业务结论，再调用 end_call；摘要写清客户已同意、未同意或待确认的具体事项和必要提示，不得写沉默计时或系统挂机原因。
-Prompt 控制在 1500 个汉字以内，使用简洁分段规则，不嵌套复杂引号或重复大段示例，降低工具参数 JSON 损坏概率。
-立即通过 tool_describe 加载 audioagent_submit_outbound_task，再通过 tool_call 下发；不得等待用户再次回复。
-工具返回后不自行组织回复；Hermes 插件会根据工具返回值强制生成确定性回执。成功时只能显示“拨号中...”，失败时只显示工具返回的未拨出原因。
-任务提交回复只发送简洁文字，不生成、引用或发送图片和其他附件；严禁输出 MEDIA: 指令、本地文件路径或 [Sent image attachment] 等附件占位文字。
-通话结果由 AudioAgent 结果转发器另行发送 Markdown 文字，不要预测、模拟或重复结果消息。
-"""
+_DIRECT_TASK_SYSTEM_PROMPT = """你是微信外呼任务生成器，只处理下面这一条用户消息，禁止参考任何历史对话或补造信息。
+必须通过唯一可用的 tool_call 调用 audioagent_submit_outbound_task，不能输出普通文本；tool_call.name 固定为 audioagent_submit_outbound_task。工具参数要求：
+1. customers 只使用本条消息明确给出的电话号码和称呼；不得猜测号码。
+2. invitation_content 用一句短语概括事项、时间、地点，不含收信人和发起人姓名。
+3. prompt 是给电话 AI 的完整指令，1500 个汉字以内；身份固定为李宝祥的智能助理，第一句固定为“您好，我是李宝祥的智能助理，请问您是{{customer_name}}吗？”，客户确认身份后再说明事情。
+4. prompt 只使用用户提供的事实，语气热情自然；任何一句最多说一次，禁止复述或循环。
+5. 客户明确答复或说“再见”后，立即调用 save_call_result 保存具体业务结论，再调用 end_call；不得继续确认，也不得把沉默计时或系统挂机写成业务结论。
+不要预览，不要追问，不要预测通话状态或结果。"""
+
+_ADDRESS_BOOK_TASK_SYSTEM_PROMPT = """你是微信通讯录外呼任务生成器，只处理下面这一条用户消息，禁止参考任何历史对话或猜测电话号码。
+必须通过唯一可用的 tool_call 调用 audioagent_resolve_outbound_contact，不能输出普通文本；tool_call.name 固定为 audioagent_resolve_outbound_contact。query 使用消息中的联系人称呼；工具会在数据库中确定电话号码以及是否需要用户确认。
+task_name 和 invitation_content 简洁概括当前事项。prompt 是给电话 AI 的完整指令，1500 个汉字以内：身份固定为李宝祥的智能助理，第一句固定为“您好，我是李宝祥的智能助理，请问您是{{customer_name}}吗？”，确认身份后再说明事情；只使用当前消息事实；任何一句最多说一次；客户明确答复或说“再见”后立即调用 save_call_result，再调用 end_call。"""
+
+_ADDRESS_BOOK_CONFIRM_SYSTEM_PROMPT = """这是一个独立的通讯录候选确认任务。上下文只包含本次原始拨号指令、通讯录候选回复和用户当前选择，禁止参考其他历史。
+用户可能用序号、中文顺序、姓名、电话号码或其他自然说法选择候选。选择明确时，必须通过唯一可用的 tool_call 调用 audioagent_confirm_address_book_contact；tool_call.name 固定为 audioagent_confirm_address_book_contact。选择不明确或用户说候选都不对时，不得调用工具，只回复“请明确选择候选编号、姓名或电话号码。”。不能重新查询、猜测联系人、修改原始拨号事项或生成新任务。"""
 
 _CALL_ARTIFACT_DIRECTIVE = """[本轮 AudioAgent 通话资料发送规则（最高优先级）]
 这是微信用户要求立即获取最近通话资料的请求，必须由 Hermes 的 audioagent 插件执行，不得让 Codex、shell 或数据库客户端代替。
@@ -52,22 +58,6 @@ _CALL_ARTIFACT_DIRECTIVE = """[本轮 AudioAgent 通话资料发送规则（最�
 通话录音：最终回复必须把工具返回的 media_directive 原样放在独立一行，不加反引号、不放进代码块、不改成本地路径说明或链接；微信网关会据此上传真实音频附件。
 不要只告诉用户文件已准备好；必须在同一轮完成文字回复或 MEDIA 附件交付。
 """
-
-_ADDRESS_BOOK_RESOLVE_DIRECTIVE = """[本轮通讯录外呼规则（最高优先级）]
-本条微信消息要求拨打联系人，但没有提供电话号码。必须由 Hermes 的 audioagent 插件查询通讯录，严禁猜测、补全或编造电话号码。
-联系人查询词已经由 Hermes 确定为“{query}”，输入方式为 {input_mode}；工具侧会再次使用该确定值，不接受模型改写。
-仅使用本条消息生成简洁的 task_name、invitation_content 和完整 prompt；身份、开场、业务结果保存及结束通话规则与直接外呼一致。
-立即通过 tool_describe 加载 audioagent_resolve_outbound_contact，再通过 tool_call 调用；不要调用 audioagent_submit_outbound_task，也不要向用户自行展示候选或编写回执。
-工具会执行以下确定性策略：文字消息唯一精确命中全称、简称、全拼或简拼时立即拨号；模糊匹配、歧义匹配及所有微信语音匹配都先确认；无候选时索要姓名和电话号码。
-工具返回后不要自行组织回复；Hermes 插件会强制发送工具生成的确定性文字。
-"""
-
-_ADDRESS_BOOK_CONFIRM_DIRECTIVE = """[本轮通讯录确认规则（最高优先级）]
-用户正在确认上一轮由 Hermes audioagent 插件返回的通讯录候选。
-立即通过 tool_describe 加载 audioagent_confirm_address_book_contact，再通过 tool_call 调用；不得重新查询、不得重新生成任务、不得猜测姓名或电话号码。
-工具返回后不要自行组织回复；Hermes 插件会强制发送工具生成的确定性文字。
-"""
-
 
 def _message_text(content: Any) -> str:
     if isinstance(content, str):
@@ -96,17 +86,86 @@ def is_wechat_outbound_request(text: str) -> bool:
     )
 
 
-def _with_directive(
-    message: dict[str, Any], *, directive: str = _DIRECT_EXECUTION_DIRECTIVE
-) -> dict[str, Any]:
+def _tool_definition(schema: dict[str, Any]) -> dict[str, Any]:
+    """Expose one deferred plugin tool through Hermes' executable bridge."""
+
+    target_name = str(schema["name"])
+    return {
+        "type": "function",
+        "function": {
+            "name": "tool_call",
+            # Keep the target name out of the top-level bridge description.
+            # DeepSeek streaming otherwise substitutes it for `tool_call`.
+            "description": "调用系统指令中指定的唯一 Hermes 延迟工具。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        # DeepSeek's thinking-mode streaming endpoint promotes
+                        # a nested single-value enum to the top-level function
+                        # name. A fixed pattern preserves the same constraint
+                        # while keeping the emitted function name `tool_call`.
+                        "pattern": f"^{re.escape(target_name)}$",
+                        "description": f"必须固定为 {target_name}。",
+                    },
+                    "arguments": deepcopy(schema["parameters"]),
+                },
+                "required": ["name", "arguments"],
+            },
+        },
+    }
+
+
+def _with_directive(message: dict[str, Any], *, directive: str) -> dict[str, Any]:
     updated = deepcopy(message)
     content = updated.get("content")
     if isinstance(content, str):
         updated["content"] = content.rstrip() + "\n\n" + directive
     elif isinstance(content, list):
-        updated["content"] = list(content) + [
-            {"type": "text", "text": directive}
-        ]
+        updated["content"] = list(content) + [{"type": "text", "text": directive}]
+    return updated
+
+
+def _minimal_tool_request(
+    request: dict[str, Any],
+    *,
+    field: str,
+    current_turn: list[dict[str, Any]],
+    system_prompt: str,
+    tool_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one isolated DeepSeek request with exactly one visible tool."""
+
+    updated = deepcopy(request)
+    updated[field] = [
+        {"role": "system", "content": system_prompt},
+        *deepcopy(current_turn),
+    ]
+    has_tool_result = any(
+        str(item.get("role") or "") == "tool"
+        or (
+            str(item.get("role") or "") == "assistant"
+            and bool(item.get("tool_calls"))
+        )
+        for item in current_turn[1:]
+        if isinstance(item, dict)
+    )
+    if has_tool_result:
+        # The execution middleware returns the tool-backed acknowledgement
+        # before another provider request is made.
+        updated["tools"] = []
+        updated.pop("tool_choice", None)
+        updated.pop("parallel_tool_calls", None)
+    else:
+        updated["tools"] = [_tool_definition(tool_schema)]
+        # DeepSeek thinking mode rejects a forced named tool_choice. Keeping
+        # only Hermes' executable bridge, narrowed to one plugin target, gives
+        # the model an unambiguous route without the incompatible parameter.
+        updated.pop("tool_choice", None)
+        updated.pop("parallel_tool_calls", None)
+        updated["max_tokens"] = min(int(updated.get("max_tokens") or 1800), 1800)
     return updated
 
 
@@ -155,10 +214,19 @@ def guide_wechat_address_book_request(**kwargs: Any) -> dict[str, Any] | None:
     is_voice = address_book.VOICE_MARKER in text
     clean_text = text.replace(address_book.VOICE_MARKER, "").strip()
     session_id = kwargs.get("session_id") or kwargs.get("task_id")
-    directive = ""
+    pending_task = address_book.pending(session_id)
+    system_prompt = ""
+    tool_schema: dict[str, Any] | None = None
     source = ""
-    if address_book.note_confirmation(session_id, clean_text):
-        directive = _ADDRESS_BOOK_CONFIRM_DIRECTIVE
+    if pending_task is not None:
+        # A pending address-book choice defines a small task-local context.
+        # Route every follow-up through it so natural selection wording never
+        # falls back to the full Hermes conversation. Deterministic forms are
+        # recorded here; other clear forms can supply `choice` through the
+        # tool schema, while ambiguous replies are explicitly not executed.
+        address_book.note_confirmation(session_id, clean_text)
+        system_prompt = _ADDRESS_BOOK_CONFIRM_SYSTEM_PROMPT
+        tool_schema = schemas.CONFIRM_ADDRESS_BOOK_CONTACT
         source = "audioagent_wechat_address_book_confirmation"
     elif (
         not _PHONE_PATTERN.search(clean_text)
@@ -168,30 +236,43 @@ def guide_wechat_address_book_request(**kwargs: Any) -> dict[str, Any] | None:
         if query:
             input_mode = "voice" if is_voice else "text"
             address_book.mark_resolution_context(
-                session_id, query=query, input_mode=input_mode
-            )
-            directive = _ADDRESS_BOOK_RESOLVE_DIRECTIVE.format(
+                session_id,
                 query=query,
-                input_mode="微信语音" if is_voice else "文字消息",
+                input_mode=input_mode,
+                request_text=clean_text,
             )
+            system_prompt = _ADDRESS_BOOK_TASK_SYSTEM_PROMPT
+            tool_schema = schemas.RESOLVE_OUTBOUND_CONTACT
             source = "audioagent_wechat_address_book_resolution"
 
-    if not directive and not is_voice:
+    if tool_schema is None and not is_voice:
         return None
-    system_messages = [
-        deepcopy(item)
-        for item in messages[:current_user_index]
-        if isinstance(item, dict) and str(item.get("role") or "") == "system"
-    ]
     current_turn = [deepcopy(item) for item in messages[current_user_index:]]
     current_turn[0] = _without_voice_marker(current_turn[0])
-    if directive:
-        current_turn[0] = _with_directive(current_turn[0], directive=directive)
-        updated_messages = system_messages + current_turn
+    if source == "audioagent_wechat_address_book_confirmation":
+        pending = pending_task or {}
+        scoped_turn: list[dict[str, Any]] = []
+        original_request = str(pending.get("request_text") or "").strip()
+        candidate_response = str(pending.get("user_response") or "").strip()
+        if original_request:
+            scoped_turn.append({"role": "user", "content": original_request})
+        if candidate_response:
+            scoped_turn.append({"role": "assistant", "content": candidate_response})
+        scoped_turn.append(current_turn[0])
+        current_turn = scoped_turn
+    if tool_schema is not None:
+        updated_request = _minimal_tool_request(
+            request,
+            field=field,
+            current_turn=current_turn,
+            system_prompt=system_prompt,
+            tool_schema=tool_schema,
+        )
+        return {"request": updated_request, "source": source}
     else:
         # Voice commands that already contain a phone still use the existing
         # direct-submit path; only remove the private transport marker.
-        updated_messages = [deepcopy(item) for item in messages]
+        updated_messages = deepcopy(messages)
         updated_messages[current_user_index] = current_turn[0]
         source = "audioagent_wechat_voice_marker_removed"
     updated_request = deepcopy(request)
@@ -223,19 +304,98 @@ def isolate_wechat_outbound_request(**kwargs: Any) -> dict[str, Any] | None:
     if not is_wechat_outbound_request(_message_text(current.get("content"))):
         return None
 
-    system_messages = [
-        deepcopy(item)
-        for item in messages[:current_user_index]
-        if isinstance(item, dict) and str(item.get("role") or "") == "system"
-    ]
     current_turn = [deepcopy(item) for item in messages[current_user_index:]]
-    current_turn[0] = _with_directive(current_turn[0])
-    updated_request = deepcopy(request)
-    updated_request[field] = system_messages + current_turn
+    current_turn[0] = _without_voice_marker(current_turn[0])
+    updated_request = _minimal_tool_request(
+        request,
+        field=field,
+        current_turn=current_turn,
+        system_prompt=_DIRECT_TASK_SYSTEM_PROMPT,
+        tool_schema=schemas.SUBMIT_OUTBOUND_TASK,
+    )
     return {
         "request": updated_request,
         "source": "audioagent_wechat_outbound_isolation",
     }
+
+
+def _synthetic_chat_response(text: str, model: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        id="audioagent-deterministic-response",
+        object="chat.completion",
+        created=int(time.time()),
+        model=str(model or "audioagent"),
+        choices=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=text,
+                    tool_calls=None,
+                    function_call=None,
+                    reasoning_content=None,
+                ),
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+        ),
+    )
+
+
+def return_tool_backed_wechat_response(**kwargs: Any) -> Any:
+    """Skip the post-tool DeepSeek call and return the deterministic result."""
+
+    next_call = kwargs["next_call"]
+    if str(kwargs.get("platform") or "").strip().lower() != "weixin":
+        return next_call(kwargs["request"])
+    request = kwargs.get("request")
+    if not isinstance(request, dict):
+        return next_call(request)
+    messages = request.get("messages") or request.get("input")
+    if not isinstance(messages, list) or not any(
+        isinstance(item, dict) and str(item.get("role") or "") == "tool"
+        for item in messages
+    ):
+        return next_call(request)
+    response = response_policy.pending_user_response(kwargs.get("session_id"))
+    if response is None:
+        # Never make a second provider call with a failed fast-path tool
+        # result. Besides adding latency, models can leak their internal tool
+        # syntax as plain chat. No stored response means no call was accepted.
+        system_text = next(
+            (
+                _message_text(item.get("content"))
+                for item in messages
+                if isinstance(item, dict) and item.get("role") == "system"
+            ),
+            "",
+        )
+        if system_text in {
+            _DIRECT_TASK_SYSTEM_PROMPT,
+            _ADDRESS_BOOK_TASK_SYSTEM_PROMPT,
+            _ADDRESS_BOOK_CONFIRM_SYSTEM_PROMPT,
+        }:
+            tool_content = next(
+                (
+                    _message_text(item.get("content"))
+                    for item in reversed(messages)
+                    if isinstance(item, dict) and item.get("role") == "tool"
+                ),
+                "",
+            )
+            logger.warning(
+                "AudioAgent fast-path tool produced no verified response: %s",
+                tool_content[:1000] or "empty tool result",
+            )
+            return _synthetic_chat_response(
+                "电话未拨出：外呼工具执行失败。", kwargs.get("model")
+            )
+        return next_call(request)
+    return _synthetic_chat_response(response, kwargs.get("model"))
 
 
 def _artifact_actions(text: str) -> list[str]:

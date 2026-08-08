@@ -382,6 +382,31 @@ def _is_short_wechat_acknowledgement(text: str) -> bool:
     }
 
 
+def _is_customer_goodbye(text: str) -> bool:
+    """Match explicit customer endings without treating incidental prose as hangup."""
+
+    compact = re.sub(r"[\s，。！？、,.!?]", "", text)
+    return compact in {
+        "再见",
+        "好再见",
+        "好的再见",
+        "嗯再见",
+        "那再见",
+        "行再见",
+        "拜拜",
+        "好拜拜",
+        "好的拜拜",
+        "先这样再见",
+        "挂了",
+        "先挂了",
+        "我先挂了",
+    }
+
+
+def _normalized_spoken_text(text: str) -> str:
+    return re.sub(r"[\s，。！？、,.!?]", "", str(text or "")).lower()
+
+
 def _function_call_requests_wechat_notice(function_call: Any) -> bool:
     return str(getattr(function_call, "name", "")) == "complete_wechat_followup"
 
@@ -2829,7 +2854,7 @@ async def entrypoint(ctx: JobContext) -> None:
     else:
         logger.info(
             "Voice pipeline selected: mode=realtime model=%s",
-            os.getenv("QWEN_AUDIO_REALTIME_MODEL", "qwen-audio-3.0-realtime-flash"),
+            os.getenv("QWEN_AUDIO_REALTIME_MODEL", "qwen-audio-3.0-realtime-plus"),
         )
 
     hangup_task: asyncio.Task[None] | None = None
@@ -2999,11 +3024,13 @@ async def entrypoint(ctx: JobContext) -> None:
     wechat_close_task: asyncio.Task[None] | None = None
     wechat_notice_task: asyncio.Task[None] | None = None
     final_goodbye_task: asyncio.Task[None] | None = None
+    customer_goodbye_task: asyncio.Task[None] | None = None
     customer_silence_task: asyncio.Task[None] | None = None
     programmatic_turn_tasks: set[asyncio.Task[None]] = set()
     programmatic_turn_lock = asyncio.Lock()
     awaiting_wechat_acknowledgement = False
     assistant_business_turns = 0
+    last_assistant_utterance = ""
     max_conversation_turns = max(
         1, min(_env_int("QWEN_MAX_CONVERSATION_TURNS", 8), 8)
     )
@@ -3170,6 +3197,27 @@ async def entrypoint(ctx: JobContext) -> None:
             name="realtime-final-goodbye",
         )
         await asyncio.shield(final_goodbye_task)
+
+    async def finish_after_customer_goodbye(text: str) -> None:
+        """Persist transcript-derived facts and close without another model turn."""
+
+        cancel_customer_silence_timer("customer said goodbye")
+        if not phone_agent._business_result_saved:
+            result = await PhoneAgent.save_call_result.__wrapped__(
+                phone_agent,
+                summary=text,
+            )
+            logger.info("Customer-goodbye result persistence: %s", result)
+        await play_final_goodbye(
+            "customer explicitly ended the conversation",
+            interrupt_model=True,
+        )
+
+    async def interrupt_duplicate_assistant_response() -> None:
+        try:
+            await session.interrupt(force=True)
+        except Exception:
+            logger.debug("No active response to interrupt for duplicate suppression")
 
     async def close_wechat_followup_after_silence() -> None:
         timeout_seconds = _configured_float(
@@ -3363,7 +3411,8 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("conversation_item_added")
     def _on_conversation_item_added(ev) -> None:
         nonlocal awaiting_wechat_acknowledgement, wechat_close_task
-        nonlocal assistant_business_turns
+        nonlocal assistant_business_turns, customer_goodbye_task
+        nonlocal last_assistant_utterance
         item = getattr(ev, "item", None)
         role = str(getattr(item, "role", ""))
         text = str(getattr(item, "text_content", "") or "").strip()
@@ -3374,6 +3423,17 @@ async def entrypoint(ctx: JobContext) -> None:
             phone_agent.note_user_transcript(text)
             cancel_customer_silence_timer("customer transcript received")
             if (
+                selected_pipeline == REALTIME_PIPELINE
+                and task_prompt_override
+                and outbound_job
+                and _is_customer_goodbye(text)
+            ):
+                customer_goodbye_task = _start_single_flight_task(
+                    customer_goodbye_task,
+                    lambda: finish_after_customer_goodbye(text),
+                    name="realtime-customer-goodbye",
+                )
+            if (
                 task_prompt_override
                 and assistant_business_turns >= max_conversation_turns - 1
             ):
@@ -3382,8 +3442,26 @@ async def entrypoint(ctx: JobContext) -> None:
                     name="conversation-turn-limit",
                 )
         else:
+            normalized_assistant_text = _normalized_spoken_text(text)
+            if (
+                task_prompt_override
+                and text != FINAL_GOODBYE_TEXT
+                and normalized_assistant_text
+                and normalized_assistant_text == last_assistant_utterance
+            ):
+                logger.warning(
+                    "Suppressing duplicate assistant response: call_id=%s text=%s",
+                    str((outbound_job or {}).get("call_id") or ""),
+                    text,
+                )
+                asyncio.create_task(
+                    interrupt_duplicate_assistant_response(),
+                    name="interrupt-duplicate-assistant-response",
+                )
+                return
             phone_agent.note_assistant_transcript(text)
             if task_prompt_override and text != FINAL_GOODBYE_TEXT:
+                last_assistant_utterance = normalized_assistant_text
                 assistant_business_turns += 1
                 if assistant_business_turns >= max_conversation_turns:
                     asyncio.create_task(

@@ -98,7 +98,8 @@ _FIXED_CALLER_POLICY = """# 固定身份与信息规则（最高优先级）
 - 第一句开场必须说“您好，我是李宝祥的智能助理，请问您是{{customer_name}}吗？”。
 - {{customer_name}} 运行时必须使用当前 customers[].name 动态替换；不得固定为某位客户，也不得朗读花括号、星号或占位符。
 - 客户确认身份后再说明事情；语气要热情、自然、口语化，像真人助理沟通。
-- 客户明确答复后立即保存业务结论并结束；摘要写清同意、不同意或待确认的事项和必要提示，不写沉默计时或系统挂机原因。
+- 任何一句面向客户的话最多说一次；严禁原样重复、换词复述或循环播放已经说过的邀约、确认、致谢和结束语。
+- 客户明确答复或说“再见”后，不再生成新的业务确认句；立即保存业务结论并结束。摘要写清同意、不同意或待确认的事项和必要提示，不写沉默计时或系统挂机原因。
 - 仅使用微信任务已经提供的信息；缺失信息直接省略，不询问任务发起人。
 - 不朗读 XXX、方括号等未填写占位符，也不得编造缺失信息。
 
@@ -797,11 +798,14 @@ def resolve_outbound_contact(
     if candidates:
         if not session_id:
             raise AudioAgentError("Hermes 会话标识缺失，无法安全确认联系人")
+        user_response = _confirmation_text(candidates, input_mode=input_mode)
         address_book.store_pending(
             session_id,
             {
                 "query": query,
                 "input_mode": input_mode,
+                "request_text": str(context.get("request_text") or "").strip(),
+                "user_response": user_response,
                 "submission": submission,
                 "candidates": candidates,
             },
@@ -811,7 +815,7 @@ def resolve_outbound_contact(
             "requires_confirmation": True,
             "match_type": match_type,
             "candidates": candidates,
-            "user_response": _confirmation_text(candidates, input_mode=input_mode),
+            "user_response": user_response,
         }
 
     return {

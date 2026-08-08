@@ -75,6 +75,9 @@ def register(ctx) -> None:
     ctx.register_middleware(
         "llm_request", middleware.guide_wechat_call_artifact_request
     )
+    ctx.register_middleware(
+        "llm_execution", middleware.return_tool_backed_wechat_response
+    )
     ctx.register_hook(
         "transform_llm_output", response_policy.transform_submission_response
     )

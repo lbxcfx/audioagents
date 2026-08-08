@@ -80,6 +80,24 @@ def transform_submission_response(**kwargs: Any) -> str | None:
     return response
 
 
+def pending_user_response(session_id: Any) -> str | None:
+    """Return a fresh deterministic response without consuming it."""
+
+    identifier = _session_id(session_id)
+    if not identifier:
+        return None
+    with _LOCK:
+        stored = _RESPONSES.get(identifier)
+    if stored is None:
+        return None
+    created_at, response = stored
+    if time.monotonic() - created_at > _RESPONSE_TTL_SECONDS:
+        with _LOCK:
+            _RESPONSES.pop(identifier, None)
+        return None
+    return response
+
+
 def clear_submission_responses() -> None:
     """Clear process-local state for tests and controlled reloads."""
 

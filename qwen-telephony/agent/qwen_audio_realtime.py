@@ -23,7 +23,7 @@ DEFAULT_REALTIME_URL = (
     "wss://llm-vfnjvqxp5829jfc6.cn-beijing.maas.aliyuncs.com/"
     "api-ws/v1/realtime"
 )
-DEFAULT_REALTIME_MODEL = "qwen-audio-3.0-realtime-flash"
+DEFAULT_REALTIME_MODEL = "qwen-audio-3.0-realtime-plus"
 DEFAULT_REALTIME_VOICE = "longanqian"
 QWEN_INPUT_SAMPLE_RATE = 16000
 DEFAULT_REALTIME_OPENINGS = (

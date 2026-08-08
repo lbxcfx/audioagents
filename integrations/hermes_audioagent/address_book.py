@@ -20,7 +20,13 @@ _QUERY_PATTERNS = (
     re.compile(r"(?:拨打|致电|电话联系)\s*([\u3400-\u9fff·]{2,20}|[A-Za-z]{2,40})"),
     re.compile(r"联系\s*([\u3400-\u9fff·]{2,20}|[A-Za-z]{2,40})\s*(?:，|,|。|\s|$)"),
 )
-_CONFIRM_PATTERN = re.compile(r"^\s*(?:确认|确定|是的|对)(?:\s*([1-9]))?\s*[。.!！]?$", re.I)
+_CONFIRM_PATTERN = re.compile(
+    r"^(?:我)?(?:确认|确定|选择?|选|就选|就|我要|要|用|拨打?|打)?"
+    r"(?:第)?([1-3一二三])(?:个联系人|个号码|个|位|号|联系人|号码)?(?:吧|了)?$",
+    re.I,
+)
+_DEFAULT_CONFIRM_PATTERN = re.compile(r"^(?:确认|确定|是的|对|可以|没错)(?:了)?$", re.I)
+_CHOICE_NUMBERS = {"1": 1, "一": 1, "2": 2, "二": 2, "3": 3, "三": 3}
 
 
 def _session_id(value: Any) -> str:
@@ -45,7 +51,7 @@ def extract_query(text: str) -> str:
 
 
 def mark_resolution_context(
-    session_id: Any, *, query: str, input_mode: str
+    session_id: Any, *, query: str, input_mode: str, request_text: str = ""
 ) -> None:
     identifier = _session_id(session_id)
     if not identifier:
@@ -55,7 +61,11 @@ def mark_resolution_context(
         _prune(now)
         _RESOLUTION_CONTEXT[identifier] = (
             now,
-            {"query": query.strip(), "input_mode": input_mode},
+            {
+                "query": query.strip(),
+                "input_mode": input_mode,
+                "request_text": str(request_text or "").strip(),
+            },
         )
 
 
@@ -96,11 +106,52 @@ def pop_pending(session_id: Any) -> dict[str, Any] | None:
     return dict(stored[1]) if stored else None
 
 
+def _selection_choice(text: str, payload: dict[str, Any]) -> int | None:
+    candidates = [
+        item for item in payload.get("candidates") or [] if isinstance(item, dict)
+    ]
+    if not candidates:
+        return None
+    compact = re.sub(r"[\s，,。.!！?？:：]+", "", str(text or "")).strip()
+    match = _CONFIRM_PATTERN.fullmatch(compact)
+    if match:
+        choice = _CHOICE_NUMBERS[match.group(1)]
+        return choice if choice <= len(candidates) else None
+    if _DEFAULT_CONFIRM_PATTERN.fullmatch(compact):
+        return 1
+    if compact in {"最前一个", "最前面的", "前一个", "前面的", "首个"}:
+        return 1
+    if compact in {"最后一个", "最后面的", "后一个", "后面的", "末个"}:
+        return len(candidates)
+    if len(candidates) == 3 and compact in {"中间一个", "中间那个", "中间的"}:
+        return 2
+
+    matched: set[int] = set()
+    input_digits = re.sub(r"\D", "", compact)
+    for index, candidate in enumerate(candidates, start=1):
+        names = {
+            str(candidate.get("full_name") or "").strip(),
+            str(candidate.get("short_name") or "").strip(),
+        }
+        if any(name and name in compact for name in names):
+            matched.add(index)
+        phone_digits = re.sub(r"\D", "", str(candidate.get("phone_number") or ""))
+        if input_digits and phone_digits and (
+            input_digits == phone_digits or (
+                len(input_digits) >= 4 and phone_digits.endswith(input_digits)
+            )
+        ):
+            matched.add(index)
+    return next(iter(matched)) if len(matched) == 1 else None
+
+
 def note_confirmation(session_id: Any, text: str) -> bool:
-    match = _CONFIRM_PATTERN.fullmatch(str(text or ""))
-    if not match or pending(session_id) is None:
+    payload = pending(session_id)
+    if payload is None:
         return False
-    choice = int(match.group(1) or "1")
+    choice = _selection_choice(text, payload)
+    if choice is None:
+        return False
     now = time.monotonic()
     with _LOCK:
         _prune(now)

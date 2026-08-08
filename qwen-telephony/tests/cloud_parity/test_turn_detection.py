@@ -374,6 +374,14 @@ def test_outbound_identity_opening_uses_customer_name_exactly() -> None:
     )
 
 
+def test_customer_goodbye_detection_is_explicit_and_normalized() -> None:
+    assert phone_agent._is_customer_goodbye("好的，再见。") is True
+    assert phone_agent._is_customer_goodbye("我先挂了") is True
+    assert phone_agent._is_customer_goodbye("拜拜！") is True
+    assert phone_agent._is_customer_goodbye("请不要说再见，继续讲") is False
+    assert phone_agent._is_customer_goodbye("明天再见面讨论") is False
+
+
 def test_realtime_audio_io_gate_controls_input_and_output() -> None:
     class AudioIO:
         def __init__(self) -> None:
@@ -848,10 +856,13 @@ def test_endpointing_rejects_an_inverted_delay_range(monkeypatch) -> None:
         phone_agent._turn_endpointing_options()
 
 
-def test_agent_image_bakes_models_outside_the_runtime_cache_volume() -> None:
+def test_agent_image_can_bake_models_outside_the_runtime_cache_volume() -> None:
     dockerfile = (PROJECT_DIR / "Dockerfile.agent").read_text(encoding="utf-8")
 
     assert "HF_HOME=/app/models/huggingface" in dockerfile
     assert "ARG HF_ENDPOINT=https://huggingface.co" in dockerfile
-    assert "RUN python -m livekit.agents download-files" in dockerfile
+    assert "ARG DOWNLOAD_LIVEKIT_MODELS=true" in dockerfile
+    assert 'if [ "$DOWNLOAD_LIVEKIT_MODELS" = "true" ]' in dockerfile
+    assert "python -m livekit.agents download-files" in dockerfile
+    assert "Skipping optional LiveKit model download" in dockerfile
     assert "HF_HOME=/app/qwen-telephony/cache" not in dockerfile
